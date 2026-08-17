@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import { Bell, CloudSun, Mail, RefreshCw, Save, Send, Smartphone } from "lucide-react"
+import Link from "next/link"
 import { useSession } from "next-auth/react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -881,9 +882,9 @@ export function ReglagesNotifications() {
             </p>
           </div>
 
-          <p className="text-sm text-amber-700">
-            Régénérer les clés invalide les abonnements push existants : les navigateurs déjà
-            abonnés devront réactiver les notifications.
+          <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700">
+            Régénérer les clés invalide les abonnements push existants. Après enregistrement des
+            nouvelles clés, chaque navigateur déjà abonné devra se rendre sur <Link href="/parametres" className="underline font-medium">la page Paramètres</Link> (section « Notifications push »), désactiver puis réactiver les notifications push pour que le changement soit pris en compte.
           </p>
 
           <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
