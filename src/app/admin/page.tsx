@@ -171,7 +171,7 @@ export default async function AdminPage() {
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <Link href="/admin/settings">
+              <Link href="/admin/notifications">
                 <Button variant="outline" className="w-full">
                   <Bell className="mr-2 h-4 w-4" />
                   Configurer les notifications

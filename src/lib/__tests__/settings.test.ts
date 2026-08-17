@@ -18,7 +18,9 @@ import prisma from "@/lib/prisma"
 import {
   clearSettingsCache,
   getSetting,
+  getSettingsWithProvenance,
   setSetting,
+  SettingValidationError,
 } from "../settings"
 
 const mockedPrisma = prisma as unknown as {
@@ -33,6 +35,11 @@ const envKeys = [
   "NOTIF_RESUME_HEURE",
   "NOTIF_METEO_INTERVAL_MIN",
   "TZ",
+  "SMTP_HOST",
+  "SMTP_PORT",
+  "SMTP_USER",
+  "SMTP_PASS",
+  "SMTP_FROM",
 ] as const
 
 describe("réglages globaux", () => {
@@ -105,5 +112,50 @@ describe("réglages globaux", () => {
       create: { id: "notif.enabled", valeur: "false" },
       update: { valeur: "false" },
     })
+  })
+
+  it("renvoie le port SMTP par défaut et privilégie la base sur l'environnement", async () => {
+    await expect(getSetting("smtp.port")).resolves.toBe(587)
+
+    clearSettingsCache()
+    process.env.SMTP_PORT = "465"
+    mockedPrisma.parametre.findUnique.mockResolvedValue({ valeur: "25" })
+
+    await expect(getSetting("smtp.port")).resolves.toBe(25)
+  })
+
+  it("masque le mot de passe SMTP dans getSettingsWithProvenance quand une valeur est présente", async () => {
+    mockedPrisma.parametre.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
+      if (where.id === "smtp.pass") return { valeur: "mon_mot_de_passe_db" }
+      return null
+    })
+
+    const resultatsDb = await getSettingsWithProvenance()
+    expect(resultatsDb["smtp.pass"].valeur).toBe("••••••••")
+    expect(resultatsDb["smtp.pass"].provenance).toBe("db")
+
+    clearSettingsCache()
+    mockedPrisma.parametre.findUnique.mockResolvedValue(null)
+    process.env.SMTP_PASS = "mon_mot_de_passe_env"
+
+    const resultatsEnv = await getSettingsWithProvenance()
+    expect(resultatsEnv["smtp.pass"].valeur).toBe("••••••••")
+    expect(resultatsEnv["smtp.pass"].provenance).toBe("env")
+
+    clearSettingsCache()
+    delete process.env.SMTP_PASS
+
+    const resultatsDefaut = await getSettingsWithProvenance()
+    expect(resultatsDefaut["smtp.pass"].valeur).toBe("")
+    expect(resultatsDefaut["smtp.pass"].provenance).toBe("defaut")
+  })
+
+  it("rejette l'enregistrement de la valeur masquée pour le mot de passe SMTP", async () => {
+    await expect(setSetting("smtp.pass", "••••••••")).rejects.toThrow(
+      SettingValidationError
+    )
+    await expect(setSetting("smtp.pass", "••••••••")).rejects.toThrow(
+      "Le mot de passe SMTP masqué ne peut pas être enregistré — saisissez la valeur réelle"
+    )
   })
 })

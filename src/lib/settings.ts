@@ -14,6 +14,7 @@ type SettingDefinition<T extends SettingValue = SettingValue> = {
   min?: number
   max?: number
   integer?: boolean
+  secret?: boolean
 }
 
 type SettingsRegistry = {
@@ -25,6 +26,11 @@ type SettingsRegistry = {
   "seuil.canicule": SettingDefinition<number>
   "seuil.ventFort": SettingDefinition<number>
   "seuil.pluieAbondante": SettingDefinition<number>
+  "smtp.host": SettingDefinition<string>
+  "smtp.port": SettingDefinition<number>
+  "smtp.user": SettingDefinition<string>
+  "smtp.pass": SettingDefinition<string>
+  "smtp.from": SettingDefinition<string>
 }
 
 /** Registre des réglages exposables par l'interface d'administration. */
@@ -75,6 +81,40 @@ export const settingsRegistry: SettingsRegistry = {
     name: "seuil.pluieAbondante",
     type: "nombre",
     defaultValue: 20,
+  },
+  "smtp.host": {
+    name: "smtp.host",
+    type: "texte",
+    defaultValue: "",
+    envKey: "SMTP_HOST",
+  },
+  "smtp.port": {
+    name: "smtp.port",
+    type: "nombre",
+    defaultValue: 587,
+    envKey: "SMTP_PORT",
+    min: 1,
+    max: 65535,
+    integer: true,
+  },
+  "smtp.user": {
+    name: "smtp.user",
+    type: "texte",
+    defaultValue: "",
+    envKey: "SMTP_USER",
+  },
+  "smtp.pass": {
+    name: "smtp.pass",
+    type: "texte",
+    defaultValue: "",
+    envKey: "SMTP_PASS",
+    secret: true,
+  },
+  "smtp.from": {
+    name: "smtp.from",
+    type: "texte",
+    defaultValue: "",
+    envKey: "SMTP_FROM",
   },
 }
 
@@ -219,8 +259,18 @@ export async function getSettingsWithProvenance(): Promise<
 > {
   const entries = await Promise.all(
     (Object.keys(settingsRegistry) as SettingKey[]).map(async (cle) => {
+      const definition = settingsRegistry[cle]
       const resolved = await resolveSetting(cle)
-      return [cle, { valeur: resolved.value, provenance: resolved.provenance }] as const
+      let valeur = resolved.value
+      if (
+        definition.secret &&
+        typeof valeur === "string" &&
+        valeur !== "" &&
+        (resolved.provenance === "db" || resolved.provenance === "env")
+      ) {
+        valeur = "••••••••"
+      }
+      return [cle, { valeur, provenance: resolved.provenance }] as const
     })
   )
   return Object.fromEntries(entries) as Record<SettingKey, SettingDetails>
@@ -234,6 +284,11 @@ export function setSetting<K extends SettingKey>(
 export function setSetting(cle: string, valeur: unknown): Promise<SettingValue>
 export async function setSetting(cle: string, valeur: unknown): Promise<SettingValue> {
   const definition = getSettingDefinition(cle)
+  if (definition.secret && valeur === "••••••••") {
+    throw new SettingValidationError(
+      "Le mot de passe SMTP masqué ne peut pas être enregistré — saisissez la valeur réelle"
+    )
+  }
   const normalizedValue = parseSettingValue(definition, valeur, false)
   if (normalizedValue === null) {
     throw new SettingValidationError(`Valeur invalide pour le réglage ${cle}`)

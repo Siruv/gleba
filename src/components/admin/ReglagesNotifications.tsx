@@ -1,7 +1,8 @@
 "use client"
 
 import * as React from "react"
-import { Bell, CloudSun, Save } from "lucide-react"
+import { Bell, CloudSun, Mail, Save, Send } from "lucide-react"
+import { useSession } from "next-auth/react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -40,6 +41,11 @@ type SettingKey =
   | "seuil.canicule"
   | "seuil.ventFort"
   | "seuil.pluieAbondante"
+  | "smtp.host"
+  | "smtp.port"
+  | "smtp.user"
+  | "smtp.pass"
+  | "smtp.from"
 type Reglages = Record<SettingKey, SettingDetails>
 
 const clesNotifications: SettingKey[] = [
@@ -158,11 +164,18 @@ function validerReglages(reglages: Reglages, cles: SettingKey[]): string | null 
 
 export function ReglagesNotifications() {
   const { toast } = useToast()
+  const { data: session } = useSession()
+  const emailSession = session?.user?.email
+
   const [reglages, setReglages] = React.useState<Reglages | null>(null)
   const [reglagesInitiaux, setReglagesInitiaux] = React.useState<Reglages | null>(null)
   const [loading, setLoading] = React.useState(true)
-  const [saving, setSaving] = React.useState<"notifications" | "seuils" | null>(null)
+  const [saving, setSaving] = React.useState<"notifications" | "seuils" | "smtp" | null>(null)
   const [erreur, setErreur] = React.useState<string | null>(null)
+
+  const [motDePasseSaisi, setMotDePasseSaisi] = React.useState("")
+  const [emailTestInput, setEmailTestInput] = React.useState("")
+  const [sendingTest, setSendingTest] = React.useState(false)
 
   const chargerReglages = React.useCallback(async (afficherChargement = true): Promise<boolean> => {
     if (afficherChargement) setLoading(true)
@@ -177,6 +190,7 @@ export function ReglagesNotifications() {
       const valeurs = data as Reglages
       setReglages(valeurs)
       setReglagesInitiaux(valeurs)
+      setMotDePasseSaisi("")
       setErreur(null)
       return true
     } catch (error) {
@@ -259,6 +273,122 @@ export function ReglagesNotifications() {
       })
     } finally {
       setSaving(null)
+    }
+  }
+
+  const validerSmtp = (r: Reglages): string | null => {
+    const port = typeof r["smtp.port"].valeur === "number"
+      ? r["smtp.port"].valeur
+      : Number(r["smtp.port"].valeur)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return "Le port SMTP doit être un nombre entier entre 1 et 65535."
+    }
+
+    const fromVal = String(r["smtp.from"].valeur).trim()
+    if (fromVal) {
+      const matchAngle = fromVal.match(/<([^>]+)>/)
+      const emailToTest = matchAngle ? matchAngle[1].trim() : fromVal
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailToTest)) {
+        return "L'adresse d'expéditeur (From) doit être une adresse email valide."
+      }
+    }
+
+    return null
+  }
+
+  const enregistrerSmtp = async () => {
+    if (!reglages || !reglagesInitiaux) return
+
+    const messageValidation = validerSmtp(reglages)
+    if (messageValidation) {
+      toast({
+        variant: "destructive",
+        title: "Réglages invalides",
+        description: messageValidation,
+      })
+      return
+    }
+
+    const clesSmtpSansPass: SettingKey[] = ["smtp.host", "smtp.port", "smtp.user", "smtp.from"]
+    const modifiees = clesSmtpSansPass.filter(
+      (cle) => !valeursEgales(reglages[cle].valeur, reglagesInitiaux[cle].valeur)
+    )
+    const passModifie = motDePasseSaisi !== ""
+
+    if (modifiees.length === 0 && !passModifie) {
+      toast({ title: "Aucune modification à enregistrer" })
+      return
+    }
+
+    setSaving("smtp")
+    try {
+      for (const cle of modifiees) {
+        const response = await fetch("/api/admin/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cle, valeur: reglages[cle].valeur }),
+        })
+        const data: unknown = await response.json().catch(() => null)
+        if (!response.ok) {
+          throw new Error(extraireMessageErreur(data, "Impossible d'enregistrer les réglages."))
+        }
+      }
+
+      if (passModifie) {
+        const response = await fetch("/api/admin/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cle: "smtp.pass", valeur: motDePasseSaisi }),
+        })
+        const data: unknown = await response.json().catch(() => null)
+        if (!response.ok) {
+          throw new Error(extraireMessageErreur(data, "Impossible d'enregistrer le mot de passe."))
+        }
+      }
+
+      const actualises = await chargerReglages(false)
+      if (actualises) {
+        toast({ title: "Réglages enregistrés" })
+      }
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Échec de l'enregistrement",
+        description: error instanceof Error ? error.message : "Impossible d'enregistrer les réglages.",
+      })
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  const envoyerEmailTestHandler = async () => {
+    setSendingTest(true)
+    try {
+      const response = await fetch("/api/admin/settings/test-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ destinataire: emailTestInput.trim() || undefined }),
+      })
+      const data: unknown = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(extraireMessageErreur(data, "Impossible d'envoyer l'email de test."))
+      }
+      const message =
+        typeof data === "object" && data !== null && "message" in data && typeof data.message === "string"
+          ? data.message
+          : `Email de test envoyé`
+      toast({
+        title: "Email de test envoyé",
+        description: message,
+      })
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Échec de l'envoi",
+        description: error instanceof Error ? error.message : "Impossible d'envoyer l'email de test.",
+      })
+    } finally {
+      setSendingTest(false)
     }
   }
 
@@ -440,6 +570,143 @@ export function ReglagesNotifications() {
               <Save className="h-4 w-4" />
               {saving === "seuils" ? "Enregistrement…" : "Enregistrer"}
             </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Mail className="h-5 w-5 text-emerald-600" />
+            Envoi des emails (SMTP)
+          </CardTitle>
+          <CardDescription>
+            Configurez le serveur d&apos;envoi de courriels pour l&apos;application.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div className="grid gap-6 md:grid-cols-2">
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label htmlFor="smtp-host">Serveur hôte (SMTP)</Label>
+                <ProvenanceBadge provenance={reglages["smtp.host"].provenance} />
+              </div>
+              <Input
+                id="smtp-host"
+                type="text"
+                placeholder="smtp.exemple.fr"
+                value={String(reglages["smtp.host"].valeur)}
+                onChange={(event) => modifierValeur("smtp.host", event.target.value)}
+                disabled={saving !== null}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label htmlFor="smtp-port">Port</Label>
+                <ProvenanceBadge provenance={reglages["smtp.port"].provenance} />
+              </div>
+              <Input
+                id="smtp-port"
+                type="number"
+                min={1}
+                max={65535}
+                value={String(reglages["smtp.port"].valeur)}
+                onChange={(event) => modifierValeur("smtp.port", event.target.value)}
+                disabled={saving !== null}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label htmlFor="smtp-user">Nom d&apos;utilisateur</Label>
+                <ProvenanceBadge provenance={reglages["smtp.user"].provenance} />
+              </div>
+              <Input
+                id="smtp-user"
+                type="text"
+                placeholder="utilisateur@exemple.fr"
+                value={String(reglages["smtp.user"].valeur)}
+                onChange={(event) => modifierValeur("smtp.user", event.target.value)}
+                disabled={saving !== null}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label htmlFor="smtp-pass">Mot de passe</Label>
+                <ProvenanceBadge provenance={reglages["smtp.pass"].provenance} />
+              </div>
+              <Input
+                id="smtp-pass"
+                type="password"
+                placeholder={
+                  reglages["smtp.pass"].valeur === "••••••••"
+                    ? "•••••••• (configuré)"
+                    : "Mot de passe SMTP"
+                }
+                value={motDePasseSaisi}
+                onChange={(event) => setMotDePasseSaisi(event.target.value)}
+                disabled={saving !== null}
+              />
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Label htmlFor="smtp-from">Adresse d&apos;expéditeur (From)</Label>
+              <ProvenanceBadge provenance={reglages["smtp.from"].provenance} />
+            </div>
+            <Input
+              id="smtp-from"
+              type="text"
+              placeholder="Gleba <noreply@exemple.fr>"
+              value={String(reglages["smtp.from"].valeur)}
+              onChange={(event) => modifierValeur("smtp.from", event.target.value)}
+              disabled={saving !== null}
+            />
+            <p className="text-sm text-muted-foreground">
+              Nom et adresse affichés aux destinataires (ex. Gleba &lt;noreply@exemple.fr&gt;)
+            </p>
+          </div>
+
+          <div className="flex justify-end">
+            <Button
+              onClick={() => void enregistrerSmtp()}
+              disabled={saving !== null}
+            >
+              <Save className="h-4 w-4" />
+              {saving === "smtp" ? "Enregistrement…" : "Enregistrer"}
+            </Button>
+          </div>
+
+          <div className="space-y-4 border-t pt-6">
+            <div className="space-y-1">
+              <h3 className="text-sm font-medium">Email de test</h3>
+              <p className="text-sm text-muted-foreground">
+                Envoyez un email de test pour vérifier la configuration SMTP.
+              </p>
+            </div>
+            <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center">
+              <Input
+                type="email"
+                placeholder={emailSession || "destinataire@exemple.fr"}
+                value={emailTestInput}
+                onChange={(event) => setEmailTestInput(event.target.value)}
+                disabled={sendingTest || saving !== null}
+                className="flex-1"
+              />
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => void envoyerEmailTestHandler()}
+                disabled={sendingTest || saving !== null}
+                className="shrink-0"
+              >
+                <Send className="h-4 w-4" />
+                {sendingTest ? "Envoi…" : "Envoyer un email de test"}
+              </Button>
+            </div>
           </div>
         </CardContent>
       </Card>

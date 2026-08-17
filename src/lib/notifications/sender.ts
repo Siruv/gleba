@@ -49,9 +49,14 @@ async function chargerPrefsNotifAvecFallback(user: DestinataireNotification): Pr
 }
 
 /** Les notifications sont-elles activées ? (défaut : oui si SMTP configuré). */
-export function notificationsEnabled(): boolean {
-  if (process.env.NOTIF_ENABLED === "false") return false
-  return Boolean(process.env.SMTP_HOST && process.env.SMTP_USER)
+export async function notificationsEnabled(): Promise<boolean> {
+  const enabled = await getSetting("notif.enabled")
+  if (!enabled) return false
+  const [host, user] = await Promise.all([
+    getSetting("smtp.host"),
+    getSetting("smtp.user"),
+  ])
+  return Boolean(host && user)
 }
 
 /**
@@ -59,7 +64,7 @@ export function notificationsEnabled(): boolean {
  * dangereuses sur les 48 h à venir et email chaque nouvelle alerte.
  */
 export async function envoyerAlertesMeteoTempsReel(): Promise<number> {
-  if (!notificationsEnabled()) return 0
+  if (!(await notificationsEnabled())) return 0
   nettoyerAlertesEnvoyees()
   const users = await getDestinatairesNotifications()
   let total = 0
@@ -136,7 +141,7 @@ async function traiterMeteoUtilisateur(user: DestinataireNotification): Promise<
  * associations incompatibles, tâches en retard.
  */
 export async function envoyerAlertesUrgentes(): Promise<number> {
-  if (!notificationsEnabled()) return 0
+  if (!(await notificationsEnabled())) return 0
   const users = await getDestinatairesNotifications()
   let total = 0
   for (const user of users) {
@@ -186,7 +191,7 @@ export async function envoyerAlertesUrgentes(): Promise<number> {
 
 /** Résumé quotidien « Quoi faire ce matin ? » pour chaque utilisateur. */
 export async function envoyerResumeQuotidien(): Promise<number> {
-  if (!notificationsEnabled()) return 0
+  if (!(await notificationsEnabled())) return 0
   const users = await getDestinatairesNotifications()
   let total = 0
   for (const user of users) {
