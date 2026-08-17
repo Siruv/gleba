@@ -1,0 +1,423 @@
+"use client"
+
+import * as React from "react"
+import { Bot, Save, Send } from "lucide-react"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
+import { useToast } from "@/hooks/use-toast"
+
+type Provenance = "db" | "env" | "defaut"
+type SettingValue = boolean | number | string
+type SettingDetails = {
+  valeur: SettingValue
+  provenance: Provenance
+}
+type ChatProvider = "ollama" | "openai" | "anthropic" | "custom"
+type SettingKey =
+  | "chat.provider"
+  | "chat.model"
+  | "chat.apiKey"
+  | "chat.baseUrl"
+  | "chat.ollamaHost"
+type Reglages = Record<SettingKey, SettingDetails>
+
+const valeurMasquee = "••••••••"
+const clesChat: SettingKey[] = [
+  "chat.provider",
+  "chat.model",
+  "chat.baseUrl",
+  "chat.ollamaHost",
+]
+
+const providers: Array<{ value: ChatProvider; label: string }> = [
+  { value: "ollama", label: "Ollama (local)" },
+  { value: "openai", label: "OpenAI" },
+  { value: "anthropic", label: "Anthropic" },
+  { value: "custom", label: "Personnalisé (compatible OpenAI)" },
+]
+
+const placeholdersModeles: Record<ChatProvider, string> = {
+  ollama: "glm-4.7",
+  openai: "gpt-4o-mini",
+  anthropic: "claude-sonnet-4-5",
+  custom: "nom du modèle",
+}
+
+const provenanceLabels: Record<Provenance, string> = {
+  db: "base",
+  env: "variable d'environnement",
+  defaut: "défaut",
+}
+
+function extraireMessageErreur(data: unknown, messageParDefaut: string): string {
+  if (
+    typeof data === "object" &&
+    data !== null &&
+    "error" in data &&
+    typeof data.error === "string"
+  ) {
+    return data.error
+  }
+  return messageParDefaut
+}
+
+function ProvenanceBadge({ provenance }: { provenance: Provenance }) {
+  return (
+    <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal text-muted-foreground">
+      {provenanceLabels[provenance]}
+    </Badge>
+  )
+}
+
+function valeursEgales(gauche: SettingValue, droite: SettingValue): boolean {
+  return String(gauche) === String(droite)
+}
+
+export function ReglagesChat() {
+  const { toast } = useToast()
+  const [reglages, setReglages] = React.useState<Reglages | null>(null)
+  const [reglagesInitiaux, setReglagesInitiaux] = React.useState<Reglages | null>(null)
+  const [loading, setLoading] = React.useState(true)
+  const [saving, setSaving] = React.useState(false)
+  const [testing, setTesting] = React.useState(false)
+  const [erreur, setErreur] = React.useState<string | null>(null)
+  const [cleApiSaisie, setCleApiSaisie] = React.useState("")
+
+  const chargerReglages = React.useCallback(async (afficherChargement = true): Promise<boolean> => {
+    if (afficherChargement) setLoading(true)
+
+    try {
+      const response = await fetch("/api/admin/settings", { cache: "no-store" })
+      const data: unknown = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(extraireMessageErreur(data, "Impossible de charger les réglages du chat."))
+      }
+
+      const valeurs = data as Reglages
+      setReglages(valeurs)
+      setReglagesInitiaux(valeurs)
+      setCleApiSaisie("")
+      setErreur(null)
+      return true
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Impossible de charger les réglages du chat."
+      setErreur(message)
+      if (afficherChargement) {
+        toast({
+          variant: "destructive",
+          title: "Réglages non chargés",
+          description: message,
+        })
+      }
+      return false
+    } finally {
+      if (afficherChargement) setLoading(false)
+    }
+  }, [toast])
+
+  React.useEffect(() => {
+    void chargerReglages()
+  }, [chargerReglages])
+
+  const modifierValeur = (cle: SettingKey, valeur: SettingValue) => {
+    setReglages((precedent) => {
+      if (!precedent) return precedent
+      return {
+        ...precedent,
+        [cle]: { ...precedent[cle], valeur },
+      }
+    })
+  }
+
+  const enregistrer = async () => {
+    if (!reglages || !reglagesInitiaux) return
+
+    const provider = String(reglages["chat.provider"].valeur) as ChatProvider
+    const baseUrl = String(reglages["chat.baseUrl"].valeur).trim()
+    if (provider === "custom" && baseUrl === "") {
+      toast({
+        variant: "destructive",
+        title: "Réglages invalides",
+        description: "L'URL de base est obligatoire pour le provider personnalisé.",
+      })
+      return
+    }
+
+    const apiKeyInitialisee =
+      reglagesInitiaux["chat.apiKey"].valeur === valeurMasquee ||
+      String(reglagesInitiaux["chat.apiKey"].valeur).trim() !== ""
+    if (provider !== "ollama" && cleApiSaisie.trim() === "" && !apiKeyInitialisee) {
+      toast({
+        variant: "destructive",
+        title: "Réglages invalides",
+        description: "Une clé API est obligatoire pour ce provider.",
+      })
+      return
+    }
+
+    const clesModifiees = clesChat.filter((cle) =>
+      !valeursEgales(reglages[cle].valeur, reglagesInitiaux[cle].valeur)
+    )
+    if (clesModifiees.length === 0 && cleApiSaisie.trim() === "") {
+      toast({ title: "Aucune modification à enregistrer" })
+      return
+    }
+
+    setSaving(true)
+    try {
+      for (const cle of clesModifiees) {
+        const response = await fetch("/api/admin/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cle, valeur: reglages[cle].valeur }),
+        })
+        const data: unknown = await response.json().catch(() => null)
+        if (!response.ok) {
+          throw new Error(extraireMessageErreur(data, "Impossible d'enregistrer les réglages du chat."))
+        }
+      }
+
+      if (cleApiSaisie.trim() !== "") {
+        const response = await fetch("/api/admin/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cle: "chat.apiKey", valeur: cleApiSaisie }),
+        })
+        const data: unknown = await response.json().catch(() => null)
+        if (!response.ok) {
+          throw new Error(extraireMessageErreur(data, "Impossible d'enregistrer la clé API."))
+        }
+      }
+
+      if (await chargerReglages(false)) {
+        toast({ title: "Réglages du chat enregistrés" })
+      }
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Échec de l'enregistrement",
+        description: error instanceof Error ? error.message : "Impossible d'enregistrer les réglages du chat.",
+      })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const testerConnexion = async () => {
+    setTesting(true)
+    try {
+      const response = await fetch("/api/chat/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      })
+      const data: unknown = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(extraireMessageErreur(data, "Impossible de tester la connexion au chat."))
+      }
+      const reponse =
+        typeof data === "object" && data !== null && "reponse" in data && typeof data.reponse === "string"
+          ? data.reponse
+          : "Connexion établie."
+      toast({ title: "Connexion au chat IA réussie", description: reponse })
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Échec du test",
+        description: error instanceof Error ? error.message : "Impossible de tester la connexion au chat.",
+      })
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="space-y-6" aria-live="polite" aria-busy="true">
+        <Skeleton className="h-8 w-64" />
+        <Skeleton className="h-[32rem] w-full" />
+        <span className="sr-only">Chargement…</span>
+      </div>
+    )
+  }
+
+  if (!reglages) {
+    return (
+      <Card>
+        <CardContent className="flex flex-col items-center gap-4 p-8 text-center">
+          <p className="text-sm text-muted-foreground">{erreur || "Impossible de charger les réglages."}</p>
+          <Button onClick={() => void chargerReglages()}>Réessayer</Button>
+        </CardContent>
+      </Card>
+    )
+  }
+
+  const provider = String(reglages["chat.provider"].valeur) as ChatProvider
+  const providerValide = providers.some((option) => option.value === provider) ? provider : "ollama"
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-2xl font-semibold text-amber-900">Réglages du chat IA</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Configurez le provider utilisé par l&apos;assistant conversationnel de Gleba.
+        </p>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Bot className="h-5 w-5 text-amber-600" />
+            Chat IA (multi-providers)
+          </CardTitle>
+          <CardDescription>
+            Choisissez un service local ou distant pour répondre aux utilisateurs.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Label htmlFor="chat-provider">Provider</Label>
+              <ProvenanceBadge provenance={reglages["chat.provider"].provenance} />
+            </div>
+            <Select
+              value={providerValide}
+              onValueChange={(value) => modifierValeur("chat.provider", value)}
+              disabled={saving || testing}
+            >
+              <SelectTrigger id="chat-provider">
+                <SelectValue placeholder="Choisir un provider" />
+              </SelectTrigger>
+              <SelectContent>
+                {providers.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Label htmlFor="chat-model">Modèle</Label>
+              <ProvenanceBadge provenance={reglages["chat.model"].provenance} />
+            </div>
+            <Input
+              id="chat-model"
+              type="text"
+              placeholder={placeholdersModeles[providerValide]}
+              value={String(reglages["chat.model"].valeur)}
+              onChange={(event) => modifierValeur("chat.model", event.target.value)}
+              disabled={saving || testing}
+            />
+            <p className="text-sm text-muted-foreground">
+              Laissez vide pour utiliser le modèle par défaut du provider (sauf personnalisé).
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Label htmlFor="chat-api-key">Clé API</Label>
+              <ProvenanceBadge provenance={reglages["chat.apiKey"].provenance} />
+            </div>
+            <Input
+              id="chat-api-key"
+              type="password"
+              placeholder={
+                reglages["chat.apiKey"].valeur === valeurMasquee
+                  ? "•••••••• (configuré)"
+                  : "Clé API du provider"
+              }
+              value={cleApiSaisie}
+              onChange={(event) => setCleApiSaisie(event.target.value)}
+              disabled={saving || testing}
+            />
+            <p className="text-sm text-muted-foreground">Inutile pour Ollama.</p>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Label htmlFor="chat-base-url">URL de base</Label>
+              <ProvenanceBadge provenance={reglages["chat.baseUrl"].provenance} />
+            </div>
+            <Input
+              id="chat-base-url"
+              type="text"
+              placeholder="https://api.exemple.fr/v1"
+              value={String(reglages["chat.baseUrl"].valeur)}
+              onChange={(event) => modifierValeur("chat.baseUrl", event.target.value)}
+              disabled={saving || testing}
+            />
+            <p className="text-sm text-muted-foreground">
+              Pour le provider personnalisé : adresse d&apos;un point d&apos;entrée compatible OpenAI
+              (OpenRouter, LM Studio, vLLM…).
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Label htmlFor="chat-ollama-host">Hôte Ollama</Label>
+              <ProvenanceBadge provenance={reglages["chat.ollamaHost"].provenance} />
+            </div>
+            <Input
+              id="chat-ollama-host"
+              type="text"
+              placeholder="http://localhost:11434"
+              value={String(reglages["chat.ollamaHost"].valeur)}
+              onChange={(event) => modifierValeur("chat.ollamaHost", event.target.value)}
+              disabled={saving || testing}
+            />
+            <p className="text-sm text-muted-foreground">
+              Adresse du serveur Ollama. Depuis Docker, utilisez l&apos;adresse IP de la machine hôte
+              (pas localhost).
+            </p>
+          </div>
+
+          <div className="flex justify-end">
+            <Button onClick={() => void enregistrer()} disabled={saving || testing}>
+              <Save className="h-4 w-4" />
+              {saving ? "Enregistrement…" : "Enregistrer"}
+            </Button>
+          </div>
+
+          <div className="space-y-4 border-t pt-6">
+            <div className="space-y-1">
+              <h3 className="text-sm font-medium">Test</h3>
+              <p className="text-sm text-muted-foreground">
+                Vérifiez que la configuration permet de joindre le provider sélectionné.
+              </p>
+            </div>
+            <div className="flex justify-end">
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => void testerConnexion()}
+                disabled={testing || saving}
+              >
+                <Send className="h-4 w-4" />
+                {testing ? "Test en cours…" : "Tester la connexion"}
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}

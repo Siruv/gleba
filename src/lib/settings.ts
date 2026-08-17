@@ -34,6 +34,11 @@ type SettingsRegistry = {
   "vapid.publicKey": SettingDefinition<string>
   "vapid.privateKey": SettingDefinition<string>
   "vapid.subject": SettingDefinition<string>
+  "chat.provider": SettingDefinition<string>
+  "chat.model": SettingDefinition<string>
+  "chat.apiKey": SettingDefinition<string>
+  "chat.baseUrl": SettingDefinition<string>
+  "chat.ollamaHost": SettingDefinition<string>
 }
 
 /** Registre des réglages exposables par l'interface d'administration. */
@@ -137,6 +142,37 @@ export const settingsRegistry: SettingsRegistry = {
     type: "texte",
     defaultValue: "mailto:contact@gleba.fr",
     envKey: "VAPID_SUBJECT",
+  },
+  "chat.provider": {
+    name: "chat.provider",
+    type: "texte",
+    defaultValue: "ollama",
+    envKey: "CHAT_PROVIDER",
+  },
+  "chat.model": {
+    name: "chat.model",
+    type: "texte",
+    defaultValue: "",
+    envKey: "CHAT_MODEL",
+  },
+  "chat.apiKey": {
+    name: "chat.apiKey",
+    type: "texte",
+    defaultValue: "",
+    envKey: "CHAT_API_KEY",
+    secret: true,
+  },
+  "chat.baseUrl": {
+    name: "chat.baseUrl",
+    type: "texte",
+    defaultValue: "",
+    envKey: "CHAT_BASE_URL",
+  },
+  "chat.ollamaHost": {
+    name: "chat.ollamaHost",
+    type: "texte",
+    defaultValue: "http://localhost:11434",
+    envKey: "OLLAMA_HOST",
   },
 }
 
@@ -307,9 +343,10 @@ export function setSetting(cle: string, valeur: unknown): Promise<SettingValue>
 export async function setSetting(cle: string, valeur: unknown): Promise<SettingValue> {
   const definition = getSettingDefinition(cle)
   if (definition.secret && valeur === "••••••••") {
-    throw new SettingValidationError(
-      "Le mot de passe SMTP masqué ne peut pas être enregistré — saisissez la valeur réelle"
-    )
+    const message = cle === "smtp.pass"
+      ? "Le mot de passe SMTP masqué ne peut pas être enregistré — saisissez la valeur réelle"
+      : "La valeur masquée ne peut pas être enregistrée — saisissez la valeur réelle"
+    throw new SettingValidationError(message)
   }
   const normalizedValue = parseSettingValue(definition, valeur, false)
   if (normalizedValue === null) {

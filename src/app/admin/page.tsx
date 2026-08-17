@@ -7,7 +7,7 @@ import prisma from "@/lib/prisma"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import Link from "next/link"
-import { Users, UserPlus, Shield, Activity, Database, MessageSquare, Bug, TrendingUp, Flag, Bell } from "lucide-react"
+import { Users, UserPlus, Shield, Activity, Database, MessageSquare, Bug, TrendingUp, Flag, Bell, Bot } from "lucide-react"
 import { AdminTabs } from "@/components/admin/AdminTabs"
 
 export default async function AdminPage() {
@@ -175,6 +175,26 @@ export default async function AdminPage() {
                 <Button variant="outline" className="w-full">
                   <Bell className="mr-2 h-4 w-4" />
                   Configurer les notifications
+                </Button>
+              </Link>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Bot className="h-5 w-5 text-amber-600" />
+                Réglages du chat IA
+              </CardTitle>
+              <CardDescription>
+                Provider, modèle, clé API — Ollama, OpenAI, Anthropic ou personnalisé
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Link href="/admin/chat">
+                <Button variant="outline" className="w-full">
+                  <Bot className="mr-2 h-4 w-4" />
+                  Configurer le chat IA
                 </Button>
               </Link>
             </CardContent>

@@ -43,6 +43,11 @@ const envKeys = [
   "VAPID_PUBLIC_KEY",
   "VAPID_PRIVATE_KEY",
   "VAPID_SUBJECT",
+  "CHAT_PROVIDER",
+  "CHAT_MODEL",
+  "CHAT_API_KEY",
+  "CHAT_BASE_URL",
+  "OLLAMA_HOST",
 ] as const
 
 describe("réglages globaux", () => {
@@ -129,6 +134,21 @@ describe("réglages globaux", () => {
 
   it("renvoie le sujet VAPID par défaut", async () => {
     await expect(getSetting("vapid.subject")).resolves.toBe("mailto:contact@gleba.fr")
+  })
+
+  it("renvoie Ollama comme provider de chat par défaut", async () => {
+    await expect(getSetting("chat.provider")).resolves.toBe("ollama")
+  })
+
+  it("masque la clé API du chat dans getSettingsWithProvenance", async () => {
+    mockedPrisma.parametre.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
+      if (where.id === "chat.apiKey") return { valeur: "clé-de-test-non-réelle" }
+      return null
+    })
+
+    const resultats = await getSettingsWithProvenance()
+    expect(resultats["chat.apiKey"].valeur).toBe("••••••••")
+    expect(resultats["chat.apiKey"].provenance).toBe("db")
   })
 
   it("masque la clé privée VAPID dans getSettingsWithProvenance quand une valeur est présente", async () => {
