@@ -70,20 +70,11 @@ PROMPT_AI_ENRICHMENT.md
 # Junk: artefacts de redirection shell ratés (ex: `> et)` au lieu de `| cat`)
 et)
 
-# AI / MCP (proprietary)
-# Le dossier /src/components/chat/ est ignoré SAUF les stubs publics
-# (ChatPanel.tsx, ChatBubble.tsx). Le vrai code de ces 2 composants
-# reste sur le VPS via `git update-index --skip-worktree` — cf.
-# docs/private-stubs.md.
-/src/components/chat/*
-!/src/components/chat/ChatPanel.tsx
-!/src/components/chat/ChatBubble.tsx
-/src/lib/chat/
-/src/lib/ollama.ts
-/src/app/api/chat/
+# AI / MCP
+# Le chat IA est désormais open source (Phase 5). Seuls les endpoints MCP
+# et les tokens API restent privés.
 /src/app/api/mcp/
 /src/app/api/user/api-token/
-/src/hooks/use-chat.ts
 /mcp-server/
 
 # Boutique en ligne (proprietary)
