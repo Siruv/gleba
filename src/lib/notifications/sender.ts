@@ -8,6 +8,7 @@
  */
 
 import { sendMail } from "@/lib/mail"
+import { getSetting } from "@/lib/settings"
 import {
   chargerStocksBas,
   chargerTachesDuJour,
@@ -78,12 +79,30 @@ async function traiterMeteoUtilisateur(user: DestinataireNotification): Promise<
   const coords = await getCoordsUtilisateur(user.id)
   if (coords.length === 0) return 0
 
+  const [seuilGel, seuilCanicule, seuilVentFort, seuilPluieAbondante] = await Promise.all([
+    getSetting("seuil.gel"),
+    getSetting("seuil.canicule"),
+    getSetting("seuil.ventFort"),
+    getSetting("seuil.pluieAbondante"),
+  ])
+  const seuils = {
+    gel: seuilGel,
+    canicule: seuilCanicule,
+    ventFort: seuilVentFort,
+    pluieAbondante: seuilPluieAbondante,
+  }
+
   const alertes: AlerteMeteoNotification[] = []
   for (const { lat, lng } of coords) {
     try {
       const { current, daily } = await fetchOpenMeteoForecast(lat, lng)
       // Temps réel = conditions actuelles + 48 h (gel de la nuit, canicule du lendemain…)
-      alertes.push(...detecterAlertesMeteo(daily, current, { horizonJours: 2 }))
+      alertes.push(
+        ...detecterAlertesMeteo(daily, current, {
+          horizonJours: 2,
+          seuils,
+        })
+      )
     } catch (error) {
       console.warn(`[notifications] Prévisions indisponibles (${lat},${lng}):`, error)
     }
