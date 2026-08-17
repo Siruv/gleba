@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Bot, Save, Send } from "lucide-react"
+import { Bot, Loader2, LogIn, LogOut, Save, Send } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -29,13 +29,15 @@ type SettingDetails = {
   valeur: SettingValue
   provenance: Provenance
 }
-type ChatProvider = "ollama" | "openai" | "anthropic" | "custom"
+type ChatProvider = "ollama" | "openai" | "anthropic" | "custom" | "openai-codex"
 type SettingKey =
   | "chat.provider"
   | "chat.model"
   | "chat.apiKey"
   | "chat.baseUrl"
   | "chat.ollamaHost"
+  | "chat.codexAccessToken"
+  | "chat.codexRefreshToken"
 type Reglages = Record<SettingKey, SettingDetails>
 
 const valeurMasquee = "••••••••"
@@ -51,6 +53,7 @@ const providers: Array<{ value: ChatProvider; label: string }> = [
   { value: "openai", label: "OpenAI" },
   { value: "anthropic", label: "Anthropic" },
   { value: "custom", label: "Personnalisé (compatible OpenAI)" },
+  { value: "openai-codex", label: "ChatGPT (compte OpenAI)" },
 ]
 
 const placeholdersModeles: Record<ChatProvider, string> = {
@@ -58,6 +61,7 @@ const placeholdersModeles: Record<ChatProvider, string> = {
   openai: "gpt-4o-mini",
   anthropic: "claude-sonnet-4-5",
   custom: "nom du modèle",
+  "openai-codex": "gpt-4o-mini",
 }
 
 const urlsParDefaut: Record<ChatProvider, string> = {
@@ -65,6 +69,7 @@ const urlsParDefaut: Record<ChatProvider, string> = {
   openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com/v1",
   custom: "",
+  "openai-codex": "",
 }
 
 const presetsBaseUrlCustom: Array<{ value: string; label: string }> = [
@@ -112,6 +117,14 @@ export function ReglagesChat() {
   const [testing, setTesting] = React.useState(false)
   const [erreur, setErreur] = React.useState<string | null>(null)
   const [cleApiSaisie, setCleApiSaisie] = React.useState("")
+  const [codexConnexion, setCodexConnexion] = React.useState<{
+    userCode: string
+    deviceAuthId: string
+    verificationUrl: string
+  } | null>(null)
+  const [codexPolling, setCodexPolling] = React.useState(false)
+  const codexPollingRef = React.useRef<ReturnType<typeof setInterval> | null>(null)
+  const codexTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const chargerReglages = React.useCallback(async (afficherChargement = true): Promise<boolean> => {
     if (afficherChargement) setLoading(true)
@@ -145,9 +158,125 @@ export function ReglagesChat() {
     }
   }, [toast])
 
+  const arreterPollingCodex = React.useCallback(() => {
+    if (codexPollingRef.current) clearInterval(codexPollingRef.current)
+    if (codexTimeoutRef.current) clearTimeout(codexTimeoutRef.current)
+    codexPollingRef.current = null
+    codexTimeoutRef.current = null
+    setCodexPolling(false)
+  }, [])
+
   React.useEffect(() => {
     void chargerReglages()
-  }, [chargerReglages])
+    return arreterPollingCodex
+  }, [arreterPollingCodex, chargerReglages])
+
+  const demarrerConnexionCodex = async () => {
+    if (codexPolling) return
+
+    try {
+      const response = await fetch("/api/admin/chat/codex-login", { method: "POST" })
+      const data: unknown = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(extraireMessageErreur(data, "Impossible de démarrer la connexion à ChatGPT."))
+      }
+      const connexionData = data as {
+        userCode?: unknown
+        deviceAuthId?: unknown
+        verificationUrl?: unknown
+      }
+      if (
+        typeof data !== "object" ||
+        data === null ||
+        typeof connexionData.userCode !== "string" ||
+        typeof connexionData.deviceAuthId !== "string" ||
+        typeof connexionData.verificationUrl !== "string"
+      ) {
+        throw new Error("Réponse invalide du serveur de connexion à ChatGPT.")
+      }
+      const connexion = {
+        userCode: connexionData.userCode,
+        deviceAuthId: connexionData.deviceAuthId,
+        verificationUrl: connexionData.verificationUrl,
+      }
+      setCodexConnexion(connexion)
+      setCodexPolling(true)
+      codexPollingRef.current = setInterval(() => {
+        void (async () => {
+          try {
+            const responsePoll = await fetch("/api/admin/chat/codex-login/poll", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                deviceAuthId: connexion.deviceAuthId,
+                userCode: connexion.userCode,
+              }),
+            })
+            const dataPoll: unknown = await responsePoll.json().catch(() => null)
+            if (!responsePoll.ok) {
+              throw new Error(extraireMessageErreur(dataPoll, "Impossible de vérifier la connexion à ChatGPT."))
+            }
+            if (
+              typeof dataPoll === "object" &&
+              dataPoll !== null &&
+              "status" in dataPoll &&
+              dataPoll.status === "connected"
+            ) {
+              arreterPollingCodex()
+              setCodexConnexion(null)
+              await chargerReglages(false)
+              toast({ title: "Connecté à ChatGPT !" })
+            }
+          } catch (error) {
+            arreterPollingCodex()
+            toast({
+              variant: "destructive",
+              title: "Échec de la connexion à ChatGPT",
+              description: error instanceof Error ? error.message : "Impossible de vérifier la connexion à ChatGPT.",
+            })
+          }
+        })()
+      }, 5_000)
+      codexTimeoutRef.current = setTimeout(() => {
+        arreterPollingCodex()
+        toast({
+          variant: "destructive",
+          title: "Délai dépassé",
+          description: "Réessayez.",
+        })
+      }, 5 * 60_000)
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Échec de la connexion à ChatGPT",
+        description: error instanceof Error ? error.message : "Impossible de démarrer la connexion à ChatGPT.",
+      })
+    }
+  }
+
+  const annulerConnexionCodex = () => {
+    arreterPollingCodex()
+    setCodexConnexion(null)
+  }
+
+  const deconnecterCodex = async () => {
+    arreterPollingCodex()
+    try {
+      const response = await fetch("/api/admin/chat/codex-logout", { method: "POST" })
+      const data: unknown = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(extraireMessageErreur(data, "Impossible de déconnecter ChatGPT."))
+      }
+      await chargerReglages(false)
+      toast({ title: "Déconnecté de ChatGPT" })
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Échec de la déconnexion",
+        description: error instanceof Error ? error.message : "Impossible de déconnecter ChatGPT.",
+      })
+    }
+  }
 
   const modifierValeur = (cle: SettingKey, valeur: SettingValue) => {
     setReglages((precedent) => {
@@ -176,7 +305,12 @@ export function ReglagesChat() {
     const apiKeyInitialisee =
       reglagesInitiaux["chat.apiKey"].valeur === valeurMasquee ||
       String(reglagesInitiaux["chat.apiKey"].valeur).trim() !== ""
-    if (provider !== "ollama" && cleApiSaisie.trim() === "" && !apiKeyInitialisee) {
+    if (
+      provider !== "ollama" &&
+      provider !== "openai-codex" &&
+      cleApiSaisie.trim() === "" &&
+      !apiKeyInitialisee
+    ) {
       toast({
         variant: "destructive",
         title: "Réglages invalides",
@@ -283,6 +417,7 @@ export function ReglagesChat() {
 
   const provider = String(reglages["chat.provider"].valeur) as ChatProvider
   const providerValide = providers.some((option) => option.value === provider) ? provider : "ollama"
+  const codexConnecte = String(reglages["chat.codexAccessToken"].valeur).trim() !== ""
   const baseUrl = String(reglages["chat.baseUrl"].valeur)
   const presetBaseUrlCustom = presetsBaseUrlCustom.some((preset) => preset.value === baseUrl)
     ? baseUrl
@@ -315,8 +450,14 @@ export function ReglagesChat() {
             </div>
             <Select
               value={providerValide}
-              onValueChange={(value) => modifierValeur("chat.provider", value)}
-              disabled={saving || testing}
+              onValueChange={(value) => {
+                if (value !== "openai-codex") {
+                  arreterPollingCodex()
+                  setCodexConnexion(null)
+                }
+                modifierValeur("chat.provider", value as ChatProvider)
+              }}
+              disabled={saving || testing || codexPolling}
             >
               <SelectTrigger id="chat-provider">
                 <SelectValue placeholder="Choisir un provider" />
@@ -349,27 +490,29 @@ export function ReglagesChat() {
             </p>
           </div>
 
-          <div className="space-y-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <Label htmlFor="chat-api-key">Clé API</Label>
-              <ProvenanceBadge provenance={reglages["chat.apiKey"].provenance} />
+          {providerValide !== "ollama" && providerValide !== "openai-codex" && (
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label htmlFor="chat-api-key">Clé API</Label>
+                <ProvenanceBadge provenance={reglages["chat.apiKey"].provenance} />
+              </div>
+              <Input
+                id="chat-api-key"
+                type="password"
+                placeholder={
+                  reglages["chat.apiKey"].valeur === valeurMasquee
+                    ? "•••••••• (configuré)"
+                    : "Clé API du provider"
+                }
+                value={cleApiSaisie}
+                onChange={(event) => setCleApiSaisie(event.target.value)}
+                disabled={saving || testing}
+              />
+              <p className="text-sm text-muted-foreground">Inutile pour Ollama.</p>
             </div>
-            <Input
-              id="chat-api-key"
-              type="password"
-              placeholder={
-                reglages["chat.apiKey"].valeur === valeurMasquee
-                  ? "•••••••• (configuré)"
-                  : "Clé API du provider"
-              }
-              value={cleApiSaisie}
-              onChange={(event) => setCleApiSaisie(event.target.value)}
-              disabled={saving || testing}
-            />
-            <p className="text-sm text-muted-foreground">Inutile pour Ollama.</p>
-          </div>
+          )}
 
-          {providerValide !== "ollama" && (
+          {providerValide !== "ollama" && providerValide !== "openai-codex" && (
             <div className="space-y-2">
               <div className="flex flex-wrap items-center gap-2">
                 <Label htmlFor="chat-base-url">URL de base</Label>
@@ -415,24 +558,100 @@ export function ReglagesChat() {
             </div>
           )}
 
-          <div className="space-y-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <Label htmlFor="chat-ollama-host">Hôte Ollama</Label>
-              <ProvenanceBadge provenance={reglages["chat.ollamaHost"].provenance} />
+          {providerValide === "openai-codex" && (
+            <div className="space-y-4 rounded-md border border-amber-200 bg-amber-50/50 p-4">
+              {codexConnecte ? (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge className="bg-green-600 text-white hover:bg-green-600">
+                      Connecté à ChatGPT
+                    </Badge>
+                    <span className="text-sm text-muted-foreground">
+                      Les tokens sont stockés de façon sécurisée.
+                    </span>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    onClick={() => void deconnecterCodex()}
+                    disabled={saving || testing || codexPolling}
+                  >
+                    <LogOut className="h-4 w-4" />
+                    Se déconnecter
+                  </Button>
+                </div>
+              ) : codexConnexion ? (
+                <div className="space-y-3" aria-live="polite">
+                  <p className="text-sm">
+                    Ouvrez cette page dans votre navigateur :{" "}
+                    <a
+                      href={codexConnexion.verificationUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-medium text-amber-800 underline"
+                    >
+                      {codexConnexion.verificationUrl}
+                    </a>
+                  </p>
+                  <p className="text-sm">
+                    Entrez le code : <strong>{codexConnexion.userCode}</strong>
+                  </p>
+                  <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    En attente de validation…
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={annulerConnexionCodex}
+                    disabled={!codexPolling}
+                  >
+                    Annuler
+                  </Button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <p className="text-sm">
+                    Connectez-vous avec votre compte ChatGPT (abonnement Plus, Pro ou Team requis).
+                    Aucune clé API nécessaire.
+                  </p>
+                  <Button
+                    type="button"
+                    onClick={() => void demarrerConnexionCodex()}
+                    disabled={saving || testing || codexPolling}
+                  >
+                    <LogIn className="h-4 w-4" />
+                    Se connecter à ChatGPT
+                  </Button>
+                </div>
+              )}
+              <p className="text-sm text-amber-800">
+                Ce provider utilise des endpoints internes d&apos;OpenAI liés à votre abonnement ChatGPT.
+                Il peut cesser de fonctionner si OpenAI modifie ses services.
+              </p>
             </div>
-            <Input
-              id="chat-ollama-host"
-              type="text"
-              placeholder={urlsParDefaut.ollama}
-              value={String(reglages["chat.ollamaHost"].valeur) || urlsParDefaut.ollama}
-              onChange={(event) => modifierValeur("chat.ollamaHost", event.target.value)}
-              disabled={saving || testing}
-            />
-            <p className="text-sm text-muted-foreground">
-              Adresse du serveur Ollama. Depuis Docker, utilisez l&apos;adresse IP de la machine hôte
-              (pas localhost).
-            </p>
-          </div>
+          )}
+
+          {providerValide === "ollama" && (
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label htmlFor="chat-ollama-host">Hôte Ollama</Label>
+                <ProvenanceBadge provenance={reglages["chat.ollamaHost"].provenance} />
+              </div>
+              <Input
+                id="chat-ollama-host"
+                type="text"
+                placeholder={urlsParDefaut.ollama}
+                value={String(reglages["chat.ollamaHost"].valeur) || urlsParDefaut.ollama}
+                onChange={(event) => modifierValeur("chat.ollamaHost", event.target.value)}
+                disabled={saving || testing}
+              />
+              <p className="text-sm text-muted-foreground">
+                Adresse du serveur Ollama. Depuis Docker, utilisez l&apos;adresse IP de la machine hôte
+                (pas localhost).
+              </p>
+            </div>
+          )}
 
           <div className="flex justify-end">
             <Button onClick={() => void enregistrer()} disabled={saving || testing}>

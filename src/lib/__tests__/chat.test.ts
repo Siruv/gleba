@@ -74,6 +74,21 @@ describe("service de chat IA", () => {
     await expect(chatActif()).resolves.toBe(true)
   })
 
+  it("indique que ChatGPT est actif quand le token Codex est présent", async () => {
+    configurerReglages({
+      "chat.provider": "openai-codex",
+      "chat.codexAccessToken": "jeton-de-test-non-réel",
+    })
+
+    await expect(chatActif()).resolves.toBe(true)
+  })
+
+  it("indique que ChatGPT est inactif sans token Codex", async () => {
+    configurerReglages({ "chat.provider": "openai-codex" })
+
+    await expect(chatActif()).resolves.toBe(false)
+  })
+
   it("retourne les modèles par défaut de chaque provider", () => {
     expect(modeleEffectif("ollama", "")).toBe("glm-4.7")
     expect(modeleEffectif("openai", "")).toBe("gpt-4o-mini")

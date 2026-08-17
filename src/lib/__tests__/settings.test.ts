@@ -140,6 +140,21 @@ describe("réglages globaux", () => {
     await expect(getSetting("chat.provider")).resolves.toBe("ollama")
   })
 
+  it("renvoie un token Codex vide par défaut", async () => {
+    await expect(getSetting("chat.codexAccessToken")).resolves.toBe("")
+  })
+
+  it("masque le token Codex dans getSettingsWithProvenance", async () => {
+    mockedPrisma.parametre.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
+      if (where.id === "chat.codexAccessToken") return { valeur: "jeton-de-test-non-réel" }
+      return null
+    })
+
+    const resultats = await getSettingsWithProvenance()
+    expect(resultats["chat.codexAccessToken"].valeur).toBe("••••••••")
+    expect(resultats["chat.codexAccessToken"].provenance).toBe("db")
+  })
+
   it("masque la clé API du chat dans getSettingsWithProvenance", async () => {
     mockedPrisma.parametre.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
       if (where.id === "chat.apiKey") return { valeur: "clé-de-test-non-réelle" }

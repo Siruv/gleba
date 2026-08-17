@@ -1,4 +1,4 @@
-export type ChatProvider = "ollama" | "openai" | "anthropic" | "custom"
+export type ChatProvider = "ollama" | "openai" | "anthropic" | "custom" | "openai-codex"
 
 export interface ChatMessage {
   role: "user" | "assistant"
@@ -15,7 +15,7 @@ const texteSystemeBase =
 const reponseMaximaleErreur = 1000
 
 function estProvider(value: string): value is ChatProvider {
-  return value === "ollama" || value === "openai" || value === "anthropic" || value === "custom"
+  return value === "ollama" || value === "openai" || value === "anthropic" || value === "custom" || value === "openai-codex"
 }
 
 function detailErreur(error: unknown): string {
@@ -47,6 +47,10 @@ export async function chatActif(): Promise<boolean> {
     return apiKey !== ""
   }
 
+  if (provider === "openai-codex") {
+    return (await getSetting("chat.codexAccessToken")).trim() !== ""
+  }
+
   if (provider === "custom") {
     return apiKey !== "" && (await getSetting("chat.baseUrl")).trim() !== ""
   }
@@ -67,6 +71,8 @@ export function modeleEffectif(provider: ChatProvider, modelConfig: string): str
       return "claude-sonnet-4-5"
     case "custom":
       throw new Error("Indiquez le modèle à utiliser pour le provider personnalisé")
+    case "openai-codex":
+      return "gpt-4o-mini"
   }
 }
 
@@ -213,6 +219,11 @@ export async function envoyerMessageChat(
     } catch (error) {
       throw new Error(`Erreur réseau/API avec le provider ollama : ${tronquerDetail(detailErreur(error))}`)
     }
+  }
+
+  if (provider === "openai-codex") {
+    const { envoyerMessageCodex } = await import("@/lib/chat-codex")
+    return envoyerMessageCodex(historique, model, systeme)
   }
 
   const apiKey = (await getSetting("chat.apiKey")).trim()

@@ -39,6 +39,8 @@ type SettingsRegistry = {
   "chat.apiKey": SettingDefinition<string>
   "chat.baseUrl": SettingDefinition<string>
   "chat.ollamaHost": SettingDefinition<string>
+  "chat.codexAccessToken": SettingDefinition<string>
+  "chat.codexRefreshToken": SettingDefinition<string>
 }
 
 /** Registre des réglages exposables par l'interface d'administration. */
@@ -173,6 +175,18 @@ export const settingsRegistry: SettingsRegistry = {
     type: "texte",
     defaultValue: "http://localhost:11434",
     envKey: "OLLAMA_HOST",
+  },
+  "chat.codexAccessToken": {
+    name: "chat.codexAccessToken",
+    type: "texte",
+    defaultValue: "",
+    secret: true,
+  },
+  "chat.codexRefreshToken": {
+    name: "chat.codexRefreshToken",
+    type: "texte",
+    defaultValue: "",
+    secret: true,
   },
 }
 
