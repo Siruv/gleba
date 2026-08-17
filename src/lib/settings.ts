@@ -31,6 +31,9 @@ type SettingsRegistry = {
   "smtp.user": SettingDefinition<string>
   "smtp.pass": SettingDefinition<string>
   "smtp.from": SettingDefinition<string>
+  "vapid.publicKey": SettingDefinition<string>
+  "vapid.privateKey": SettingDefinition<string>
+  "vapid.subject": SettingDefinition<string>
 }
 
 /** Registre des réglages exposables par l'interface d'administration. */
@@ -115,6 +118,25 @@ export const settingsRegistry: SettingsRegistry = {
     type: "texte",
     defaultValue: "",
     envKey: "SMTP_FROM",
+  },
+  "vapid.publicKey": {
+    name: "vapid.publicKey",
+    type: "texte",
+    defaultValue: "",
+    envKey: "VAPID_PUBLIC_KEY",
+  },
+  "vapid.privateKey": {
+    name: "vapid.privateKey",
+    type: "texte",
+    defaultValue: "",
+    envKey: "VAPID_PRIVATE_KEY",
+    secret: true,
+  },
+  "vapid.subject": {
+    name: "vapid.subject",
+    type: "texte",
+    defaultValue: "mailto:contact@gleba.fr",
+    envKey: "VAPID_SUBJECT",
   },
 }
 

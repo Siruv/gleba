@@ -40,6 +40,9 @@ const envKeys = [
   "SMTP_USER",
   "SMTP_PASS",
   "SMTP_FROM",
+  "VAPID_PUBLIC_KEY",
+  "VAPID_PRIVATE_KEY",
+  "VAPID_SUBJECT",
 ] as const
 
 describe("réglages globaux", () => {
@@ -122,6 +125,21 @@ describe("réglages globaux", () => {
     mockedPrisma.parametre.findUnique.mockResolvedValue({ valeur: "25" })
 
     await expect(getSetting("smtp.port")).resolves.toBe(25)
+  })
+
+  it("renvoie le sujet VAPID par défaut", async () => {
+    await expect(getSetting("vapid.subject")).resolves.toBe("mailto:contact@gleba.fr")
+  })
+
+  it("masque la clé privée VAPID dans getSettingsWithProvenance quand une valeur est présente", async () => {
+    mockedPrisma.parametre.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
+      if (where.id === "vapid.privateKey") return { valeur: "private" }
+      return null
+    })
+
+    const resultats = await getSettingsWithProvenance()
+    expect(resultats["vapid.privateKey"].valeur).toBe("••••••••")
+    expect(resultats["vapid.privateKey"].provenance).toBe("db")
   })
 
   it("masque le mot de passe SMTP dans getSettingsWithProvenance quand une valeur est présente", async () => {

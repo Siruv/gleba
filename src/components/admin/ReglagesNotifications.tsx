@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Bell, CloudSun, Mail, Save, Send } from "lucide-react"
+import { Bell, CloudSun, Mail, RefreshCw, Save, Send, Smartphone } from "lucide-react"
 import { useSession } from "next-auth/react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -46,6 +46,9 @@ type SettingKey =
   | "smtp.user"
   | "smtp.pass"
   | "smtp.from"
+  | "vapid.publicKey"
+  | "vapid.privateKey"
+  | "vapid.subject"
 type Reglages = Record<SettingKey, SettingDetails>
 
 const clesNotifications: SettingKey[] = [
@@ -131,6 +134,14 @@ function valeursEgales(gauche: SettingValue, droite: SettingValue): boolean {
   return String(gauche) === String(droite)
 }
 
+function validerVapid(reglages: Reglages): string | null {
+  const sujet = String(reglages["vapid.subject"].valeur).trim()
+  if (sujet && !sujet.startsWith("mailto:")) {
+    return "Le sujet VAPID doit commencer par mailto:."
+  }
+  return null
+}
+
 function validerReglages(reglages: Reglages, cles: SettingKey[]): string | null {
   for (const cle of cles) {
     const valeur = reglages[cle].valeur
@@ -170,10 +181,12 @@ export function ReglagesNotifications() {
   const [reglages, setReglages] = React.useState<Reglages | null>(null)
   const [reglagesInitiaux, setReglagesInitiaux] = React.useState<Reglages | null>(null)
   const [loading, setLoading] = React.useState(true)
-  const [saving, setSaving] = React.useState<"notifications" | "seuils" | "smtp" | null>(null)
+  const [saving, setSaving] = React.useState<"notifications" | "seuils" | "smtp" | "vapid" | null>(null)
   const [erreur, setErreur] = React.useState<string | null>(null)
 
   const [motDePasseSaisi, setMotDePasseSaisi] = React.useState("")
+  const [clePriveeVapidSaisie, setClePriveeVapidSaisie] = React.useState("")
+  const [generationVapidEnCours, setGenerationVapidEnCours] = React.useState(false)
   const [emailTestInput, setEmailTestInput] = React.useState("")
   const [sendingTest, setSendingTest] = React.useState(false)
 
@@ -191,6 +204,7 @@ export function ReglagesNotifications() {
       setReglages(valeurs)
       setReglagesInitiaux(valeurs)
       setMotDePasseSaisi("")
+      setClePriveeVapidSaisie("")
       setErreur(null)
       return true
     } catch (error) {
@@ -355,6 +369,99 @@ export function ReglagesNotifications() {
         variant: "destructive",
         title: "Échec de l'enregistrement",
         description: error instanceof Error ? error.message : "Impossible d'enregistrer les réglages.",
+      })
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  const genererVapid = async () => {
+    setGenerationVapidEnCours(true)
+    try {
+      const response = await fetch("/api/admin/settings/generate-vapid-keys", { method: "POST" })
+      const data: unknown = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(extraireMessageErreur(data, "Impossible de générer les clés VAPID."))
+      }
+
+      const reponse = data as { publicKey?: unknown; privateKey?: unknown }
+      if (typeof reponse.publicKey !== "string" || typeof reponse.privateKey !== "string") {
+        throw new Error("Réponse invalide lors de la génération des clés VAPID.")
+      }
+
+      modifierValeur("vapid.publicKey", reponse.publicKey)
+      setClePriveeVapidSaisie(reponse.privateKey)
+      toast({ title: "Nouvelles clés générées — enregistrez-les pour les activer" })
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Échec de la génération",
+        description: error instanceof Error ? error.message : "Impossible de générer les clés VAPID.",
+      })
+    } finally {
+      setGenerationVapidEnCours(false)
+    }
+  }
+
+  const enregistrerVapid = async () => {
+    if (!reglages || !reglagesInitiaux) return
+
+    const messageValidation = validerVapid(reglages)
+    if (messageValidation) {
+      toast({
+        variant: "destructive",
+        title: "Réglages invalides",
+        description: messageValidation,
+      })
+      return
+    }
+
+    const clesVapidSansPrivee: SettingKey[] = ["vapid.publicKey", "vapid.subject"]
+    const modifiees = clesVapidSansPrivee.filter(
+      (cle) => !valeursEgales(reglages[cle].valeur, reglagesInitiaux[cle].valeur)
+    )
+    const clePriveeModifiee = clePriveeVapidSaisie !== ""
+
+    if (modifiees.length === 0 && !clePriveeModifiee) {
+      toast({ title: "Aucune modification à enregistrer" })
+      return
+    }
+
+    setSaving("vapid")
+    try {
+      for (const cle of modifiees) {
+        const response = await fetch("/api/admin/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cle, valeur: reglages[cle].valeur }),
+        })
+        const data: unknown = await response.json().catch(() => null)
+        if (!response.ok) {
+          throw new Error(extraireMessageErreur(data, "Impossible d'enregistrer les réglages VAPID."))
+        }
+      }
+
+      if (clePriveeModifiee) {
+        const response = await fetch("/api/admin/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cle: "vapid.privateKey", valeur: clePriveeVapidSaisie }),
+        })
+        const data: unknown = await response.json().catch(() => null)
+        if (!response.ok) {
+          throw new Error(extraireMessageErreur(data, "Impossible d'enregistrer la clé privée VAPID."))
+        }
+      }
+
+      const actualises = await chargerReglages(false)
+      if (actualises) {
+        toast({ title: "Réglages VAPID enregistrés" })
+      }
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Échec de l'enregistrement",
+        description: error instanceof Error ? error.message : "Impossible d'enregistrer les réglages VAPID.",
       })
     } finally {
       setSaving(null)
@@ -707,6 +814,95 @@ export function ReglagesNotifications() {
                 {sendingTest ? "Envoi…" : "Envoyer un email de test"}
               </Button>
             </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Smartphone className="h-5 w-5 text-amber-600" />
+            Notifications push (VAPID)
+          </CardTitle>
+          <CardDescription>
+            Configurez les clés utilisées pour les notifications push dans les navigateurs.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div className="grid gap-6 md:grid-cols-2">
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label htmlFor="vapid-public-key">Clé publique</Label>
+                <ProvenanceBadge provenance={reglages["vapid.publicKey"].provenance} />
+              </div>
+              <Input
+                id="vapid-public-key"
+                type="text"
+                value={String(reglages["vapid.publicKey"].valeur)}
+                onChange={(event) => modifierValeur("vapid.publicKey", event.target.value)}
+                disabled={saving !== null || generationVapidEnCours}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label htmlFor="vapid-private-key">Clé privée</Label>
+                <ProvenanceBadge provenance={reglages["vapid.privateKey"].provenance} />
+              </div>
+              <Input
+                id="vapid-private-key"
+                type="password"
+                placeholder={
+                  reglages["vapid.privateKey"].valeur === "••••••••"
+                    ? "•••••••• (configurée)"
+                    : "Clé privée VAPID"
+                }
+                value={clePriveeVapidSaisie}
+                onChange={(event) => setClePriveeVapidSaisie(event.target.value)}
+                disabled={saving !== null || generationVapidEnCours}
+              />
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Label htmlFor="vapid-subject">Sujet VAPID</Label>
+              <ProvenanceBadge provenance={reglages["vapid.subject"].provenance} />
+            </div>
+            <Input
+              id="vapid-subject"
+              type="text"
+              value={String(reglages["vapid.subject"].valeur)}
+              onChange={(event) => modifierValeur("vapid.subject", event.target.value)}
+              disabled={saving !== null || generationVapidEnCours}
+            />
+            <p className="text-sm text-muted-foreground">
+              Adresse de contact au format mailto: utilisée par les serveurs push
+            </p>
+          </div>
+
+          <p className="text-sm text-amber-700">
+            Régénérer les clés invalide les abonnements push existants : les navigateurs déjà
+            abonnés devront réactiver les notifications.
+          </p>
+
+          <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void genererVapid()}
+              disabled={saving !== null || generationVapidEnCours}
+            >
+              <RefreshCw className="h-4 w-4" />
+              {generationVapidEnCours ? "Génération…" : "Générer de nouvelles clés"}
+            </Button>
+            <Button
+              onClick={() => void enregistrerVapid()}
+              disabled={saving !== null || generationVapidEnCours}
+            >
+              <Save className="h-4 w-4" />
+              {saving === "vapid" ? "Enregistrement…" : "Enregistrer"}
+            </Button>
           </div>
         </CardContent>
       </Card>

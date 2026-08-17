@@ -74,7 +74,7 @@ function getJourDansTimezone(date: Date, timezone: string): string {
  * Initialise le scheduler. Appelé une seule fois (module-level flag) depuis
  * instrumentation.register(). Ne lève jamais.
  */
-export function initNotifScheduler(): void {
+export async function initNotifScheduler(): Promise<void> {
   if (initialized) return
   // Pendant `next build`, register() peut être exécuté par le serveur de
   // compilation : on ne planifie rien.
@@ -82,8 +82,12 @@ export function initNotifScheduler(): void {
 
   initialized = true
   try {
-    if (!pushConfigure()) {
-      console.log("[notifications] Push désactivé — définir VAPID_PUBLIC_KEY et VAPID_PRIVATE_KEY")
+    try {
+      if (!(await pushConfigure())) {
+        console.log("[notifications] Push désactivé — définir VAPID_PUBLIC_KEY et VAPID_PRIVATE_KEY")
+      }
+    } catch (error) {
+      console.error("[notifications] Vérification de la configuration push impossible:", error)
     }
 
     // Premier scan au démarrage (météo + urgences), après un court délai.

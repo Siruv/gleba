@@ -94,6 +94,7 @@ export {
   PenNib as PenTool,
   ChartPie as PieChart,
   ArrowCounterClockwise as RefreshCw,
+  DeviceMobile as Smartphone,
   ArrowCounterClockwise as RotateCcw,
   ArrowClockwise as RotateCw,
   Path as Route,
