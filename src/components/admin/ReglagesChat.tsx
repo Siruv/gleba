@@ -60,6 +60,19 @@ const placeholdersModeles: Record<ChatProvider, string> = {
   custom: "nom du modèle",
 }
 
+const urlsParDefaut: Record<ChatProvider, string> = {
+  ollama: "http://localhost:11434",
+  openai: "https://api.openai.com/v1",
+  anthropic: "https://api.anthropic.com/v1",
+  custom: "",
+}
+
+const presetsBaseUrlCustom: Array<{ value: string; label: string }> = [
+  { value: "https://openrouter.ai/api/v1", label: "OpenRouter" },
+  { value: "http://localhost:1234/v1", label: "LM Studio (local)" },
+  { value: "http://localhost:8000/v1", label: "vLLM (local)" },
+]
+
 const provenanceLabels: Record<Provenance, string> = {
   db: "base",
   env: "variable d'environnement",
@@ -270,6 +283,10 @@ export function ReglagesChat() {
 
   const provider = String(reglages["chat.provider"].valeur) as ChatProvider
   const providerValide = providers.some((option) => option.value === provider) ? provider : "ollama"
+  const baseUrl = String(reglages["chat.baseUrl"].valeur)
+  const presetBaseUrlCustom = presetsBaseUrlCustom.some((preset) => preset.value === baseUrl)
+    ? baseUrl
+    : "autre"
 
   return (
     <div className="space-y-6">
@@ -352,24 +369,51 @@ export function ReglagesChat() {
             <p className="text-sm text-muted-foreground">Inutile pour Ollama.</p>
           </div>
 
-          <div className="space-y-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <Label htmlFor="chat-base-url">URL de base</Label>
-              <ProvenanceBadge provenance={reglages["chat.baseUrl"].provenance} />
+          {providerValide !== "ollama" && (
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label htmlFor="chat-base-url">URL de base</Label>
+                <ProvenanceBadge provenance={reglages["chat.baseUrl"].provenance} />
+              </div>
+              {providerValide === "custom" && (
+                <div className="space-y-2">
+                  <Label htmlFor="chat-base-url-preset">Préréglages</Label>
+                  <Select
+                    value={presetBaseUrlCustom}
+                    onValueChange={(value) => {
+                      if (value !== "autre") modifierValeur("chat.baseUrl", value)
+                    }}
+                    disabled={saving || testing}
+                  >
+                    <SelectTrigger id="chat-base-url-preset">
+                      <SelectValue placeholder="Préréglages" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {presetsBaseUrlCustom.map((preset) => (
+                        <SelectItem key={preset.value} value={preset.value}>
+                          {preset.label}
+                        </SelectItem>
+                      ))}
+                      <SelectItem value="autre">Autre (saisir l&apos;URL)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+              <Input
+                id="chat-base-url"
+                type="text"
+                placeholder={urlsParDefaut[providerValide]}
+                value={baseUrl}
+                onChange={(event) => modifierValeur("chat.baseUrl", event.target.value)}
+                disabled={saving || testing}
+              />
+              <p className="text-sm text-muted-foreground">
+                {providerValide === "custom"
+                  ? "Adresse d'un point d'entrée compatible OpenAI (OpenRouter, LM Studio, vLLM…)."
+                  : `Laissez vide pour utiliser l'URL par défaut : ${urlsParDefaut[providerValide]}`}
+              </p>
             </div>
-            <Input
-              id="chat-base-url"
-              type="text"
-              placeholder="https://api.exemple.fr/v1"
-              value={String(reglages["chat.baseUrl"].valeur)}
-              onChange={(event) => modifierValeur("chat.baseUrl", event.target.value)}
-              disabled={saving || testing}
-            />
-            <p className="text-sm text-muted-foreground">
-              Pour le provider personnalisé : adresse d&apos;un point d&apos;entrée compatible OpenAI
-              (OpenRouter, LM Studio, vLLM…).
-            </p>
-          </div>
+          )}
 
           <div className="space-y-2">
             <div className="flex flex-wrap items-center gap-2">
@@ -379,8 +423,8 @@ export function ReglagesChat() {
             <Input
               id="chat-ollama-host"
               type="text"
-              placeholder="http://localhost:11434"
-              value={String(reglages["chat.ollamaHost"].valeur)}
+              placeholder={urlsParDefaut.ollama}
+              value={String(reglages["chat.ollamaHost"].valeur) || urlsParDefaut.ollama}
               onChange={(event) => modifierValeur("chat.ollamaHost", event.target.value)}
               disabled={saving || testing}
             />
