@@ -1448,6 +1448,9 @@ function NotificationsSection() {
             />
           </div>
         ))}
+        <p className="text-xs text-muted-foreground italic pt-2">
+          Ces réglages s&apos;appliquent aux emails envoyés par Gleba. Les emails transactionnels (mot de passe, vérification) ne sont pas concernés.
+        </p>
         <div className="border-t pt-4 mt-4 space-y-3">
           <div>
             <h4 className="text-sm font-medium text-slate-900">Notifications push (navigateur)</h4>
@@ -1476,9 +1479,6 @@ function NotificationsSection() {
             </Button>
           )}
         </div>
-        <p className="text-xs text-muted-foreground italic pt-2">
-          Ces réglages s&apos;appliquent aux emails envoyés par Gleba. Les emails transactionnels (mot de passe, vérification) ne sont pas concernés.
-        </p>
       </CardContent>
     </Card>
   )
