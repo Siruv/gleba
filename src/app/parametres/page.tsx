@@ -6,7 +6,7 @@
 
 import * as React from 'react'
 import Link from 'next/link'
-import { ArrowLeft, Settings, Save, Download, Upload, Loader2, ImageIcon, Trash2, Key, Copy, Check, RefreshCw, Bot, CloudSun, Layers, Building2, PawPrint, Bell } from 'lucide-react'
+import { ArrowLeft, Settings, Save, Download, Upload, Loader2, ImageIcon, Trash2, Key, Copy, Check, RefreshCw, Bot, CloudSun, Layers, Building2, PawPrint, Bell, DeviceMobile as Smartphone } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
@@ -1404,60 +1404,68 @@ function NotificationsSection() {
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Bell className="h-5 w-5 text-emerald-600" />
-          Notifications
-        </CardTitle>
-        <CardDescription>
-          Choisissez les types de notifications métier que vous souhaitez recevoir par email ou par push.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {loading ? (
-          notifPreferenceRows.map((row) => (
+    <>
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Bell className="h-5 w-5 text-emerald-600" />
+            Notifications par email
+          </CardTitle>
+          <CardDescription>
+            Choisissez les types d&apos;alertes métier que vous souhaitez recevoir par email.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {loading ? (
+            notifPreferenceRows.map((row) => (
+              <div
+                key={row.key}
+                className="flex items-center justify-between gap-4 p-3 border rounded-lg animate-pulse"
+              >
+                <div className="flex-1 min-w-0 space-y-2">
+                  <div className="h-4 w-40 bg-slate-200 rounded" />
+                  <div className="h-3 w-64 bg-slate-100 rounded" />
+                </div>
+                <div className="h-5 w-9 bg-slate-200 rounded-full" />
+              </div>
+            ))
+          ) : notifPreferenceRows.map((row) => (
             <div
               key={row.key}
-              className="flex items-center justify-between gap-4 p-3 border rounded-lg animate-pulse"
+              className="flex items-center justify-between gap-4 p-3 border rounded-lg hover:bg-slate-50/50 transition-colors"
             >
-              <div className="flex-1 min-w-0 space-y-2">
-                <div className="h-4 w-40 bg-slate-200 rounded" />
-                <div className="h-3 w-64 bg-slate-100 rounded" />
+              <div className="flex-1 min-w-0">
+                <Label htmlFor={`notif-${row.key}`} className="font-medium text-sm cursor-pointer">
+                  {row.label}
+                </Label>
+                <p className="text-xs text-muted-foreground mt-0.5">{row.description}</p>
               </div>
-              <div className="h-5 w-9 bg-slate-200 rounded-full" />
+              <Switch
+                id={`notif-${row.key}`}
+                checked={prefs[row.key]}
+                disabled={saving}
+                onCheckedChange={(checked) => toggle(row.key, checked)}
+                data-testid={`notif-toggle-${row.key}`}
+              />
             </div>
-          ))
-        ) : notifPreferenceRows.map((row) => (
-          <div
-            key={row.key}
-            className="flex items-center justify-between gap-4 p-3 border rounded-lg hover:bg-slate-50/50 transition-colors"
-          >
-            <div className="flex-1 min-w-0">
-              <Label htmlFor={`notif-${row.key}`} className="font-medium text-sm cursor-pointer">
-                {row.label}
-              </Label>
-              <p className="text-xs text-muted-foreground mt-0.5">{row.description}</p>
-            </div>
-            <Switch
-              id={`notif-${row.key}`}
-              checked={prefs[row.key]}
-              disabled={saving}
-              onCheckedChange={(checked) => toggle(row.key, checked)}
-              data-testid={`notif-toggle-${row.key}`}
-            />
-          </div>
-        ))}
-        <p className="text-xs text-muted-foreground italic pt-2">
-          Ces réglages s&apos;appliquent aux emails envoyés par Gleba. Les emails transactionnels (mot de passe, vérification) ne sont pas concernés.
-        </p>
-        <div className="border-t pt-4 mt-4 space-y-3">
-          <div>
-            <h4 className="text-sm font-medium text-slate-900">Notifications push (navigateur)</h4>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              Recevez les alertes urgentes directement dans ce navigateur.
-            </p>
-          </div>
+          ))}
+          <p className="text-xs text-muted-foreground italic pt-2">
+            Ces réglages s&apos;appliquent aux emails envoyés par Gleba. Les emails transactionnels (mot de passe, vérification) ne sont pas concernés.
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Smartphone className="h-5 w-5 text-emerald-600" />
+            Notifications push
+          </CardTitle>
+          <CardDescription>
+            Recevez les alertes urgentes directement dans ce navigateur.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
           {pushEtat === 'chargement' && <p className="text-sm text-muted-foreground">Vérification du support…</p>}
           {pushEtat === 'non-supporte' && (
             <p className="text-sm text-muted-foreground">Les notifications push ne sont pas supportées par ce navigateur.</p>
@@ -1478,9 +1486,9 @@ function NotificationsSection() {
               {pushLoading ? 'Activation…' : 'Activer les notifications push'}
             </Button>
           )}
-        </div>
-      </CardContent>
-    </Card>
+        </CardContent>
+      </Card>
+    </>
   )
 }
 
