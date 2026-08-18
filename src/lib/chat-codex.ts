@@ -6,7 +6,15 @@ const CODEX_OAUTH_TOKEN_URL = `${CODEX_ISSUER}/oauth/token`
 const CODEX_REDIRECT_URI = `${CODEX_ISSUER}/deviceauth/callback`
 const CODEX_VERIFICATION_URL = `${CODEX_ISSUER}/codex/device`
 const CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
+const CODEX_MODELS_URL = `${CODEX_API_BASE}/models`
+const CODEX_CLIENT_VERSION = "0.250.0"
 const CODEX_MODEL_DEFAUT = "gpt-5.6-luna"
+
+export type ModeleCodex = {
+  slug: string
+  displayName: string
+  description: string
+}
 
 type ReponseJson = Record<string, unknown>
 type MessageCodex = { role: string; content: string }
@@ -131,6 +139,37 @@ export async function rafraichirTokenCodex(refreshToken: string): Promise<Tokens
   } catch {
     throw new Error(messageErreur)
   }
+}
+
+export async function listerModelesCodex(accessToken: string): Promise<ModeleCodex[]> {
+  const response = await fetch(`${CODEX_MODELS_URL}?client_version=${CODEX_CLIENT_VERSION}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(10_000),
+  })
+  if (!response.ok) {
+    throw new Error(`Impossible de récupérer les modèles ChatGPT (HTTP ${response.status}).`)
+  }
+
+  const data: unknown = await response.json()
+  if (typeof data !== "object" || data === null || Array.isArray(data) || !("models" in data)) {
+    return []
+  }
+
+  const modeles = data.models
+  if (!Array.isArray(modeles)) return []
+
+  return modeles.flatMap((modele): ModeleCodex[] => {
+    if (typeof modele !== "object" || modele === null || Array.isArray(modele)) return []
+    const donnees = modele as ReponseJson
+    const slug = typeof donnees.slug === "string" ? donnees.slug : ""
+    if (donnees.visibility !== "list" || slug.trim() === "") return []
+    const displayName = typeof donnees.display_name === "string" && donnees.display_name !== ""
+      ? donnees.display_name
+      : slug
+    const description = typeof donnees.description === "string" ? donnees.description : ""
+    return [{ slug, displayName, description }]
+  })
 }
 
 export async function appelerBackendCodex(

@@ -128,6 +128,31 @@ describe("service de chat IA", () => {
     )
   })
 
+  it("injecte le contexte fourni dans le prompt système", async () => {
+    configurerReglages({
+      "chat.provider": "openai",
+      "chat.apiKey": "clé-de-test-non-réelle",
+      "chat.model": "gpt-test",
+    })
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: { content: "Réponse OpenAI" } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    )
+
+    await envoyerMessageChat(
+      [{ role: "user", content: "Quel temps fera-t-il ?" }],
+      undefined,
+      "Météo de la parcelle « Nord » : 18°C."
+    )
+
+    const options = vi.mocked(fetch).mock.calls[0]?.[1]
+    const body = JSON.parse(String(options?.body)) as { messages: Array<{ role: string; content: string }> }
+    expect(body.messages[0]).toMatchObject({ role: "system" })
+    expect(body.messages[0]?.content).toContain("Météo de la parcelle « Nord » : 18°C.")
+  })
+
   it("envoie un message à Anthropic avec son en-tête API", async () => {
     configurerReglages({
       "chat.provider": "anthropic",

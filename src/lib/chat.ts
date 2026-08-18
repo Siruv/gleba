@@ -76,9 +76,12 @@ export function modeleEffectif(provider: ChatProvider, modelConfig: string): str
   }
 }
 
-function construireMessageSysteme(section?: string): string {
-  if (!section) return texteSystemeBase
-  return `${texteSystemeBase} Contexte actuel de l'utilisateur : section ${section}.`
+function construireMessageSysteme(section?: string, contexte?: string): string {
+  const messageBase = section
+    ? `${texteSystemeBase} Contexte actuel de l'utilisateur : section ${section}.`
+    : texteSystemeBase
+  if (!contexte) return messageBase
+  return `${messageBase}\n\nDonnées réelles de l'exploitation :\n${contexte}\nUtilise ces données pour répondre précisément aux questions concernées (météo, irrigation, etc.).`
 }
 
 async function lireJsonProvider(response: Response, provider: ChatProvider): Promise<unknown> {
@@ -185,7 +188,8 @@ async function appelerAnthropic(
 /** Envoie un historique de conversation au provider IA configuré. */
 export async function envoyerMessageChat(
   messages: ChatMessage[],
-  section?: string
+  section?: string,
+  contexte?: string
 ): Promise<string> {
   if (!(await chatActif())) {
     throw new Error("Le chat IA n'est pas configuré. Renseignez la configuration dans l'administration.")
@@ -200,7 +204,7 @@ export async function envoyerMessageChat(
   const provider: ChatProvider = providerValue
   const model = modeleEffectif(provider, await getSetting("chat.model"))
   const historique = messages.slice(-20)
-  const systeme = construireMessageSysteme(section)
+  const systeme = construireMessageSysteme(section, contexte)
   const messagesAvecSysteme: MessageAvecSysteme[] = [
     { role: "system", content: systeme },
     ...historique,

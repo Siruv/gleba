@@ -23,8 +23,9 @@ function validerMessages(value: unknown): value is ChatMessage[] {
 }
 
 export async function POST(request: NextRequest) {
-  const { error } = await requireAuthApi(request)
+  const { error, session } = await requireAuthApi(request)
   if (error) return error
+  const userId = session!.user.id
 
   let body: unknown
   try {
@@ -51,8 +52,16 @@ export async function POST(request: NextRequest) {
     )
   }
 
+  let contexte: string | null = null
   try {
-    const reply = await envoyerMessageChat(messages, section as string | undefined)
+    const { construireContexteMeteo } = await import("@/lib/chat-contexte")
+    contexte = await construireContexteMeteo(userId)
+  } catch {
+    contexte = null
+  }
+
+  try {
+    const reply = await envoyerMessageChat(messages, section as string | undefined, contexte ?? undefined)
     return NextResponse.json({ reply })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)

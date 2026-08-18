@@ -19,6 +19,7 @@ import {
   demarrerConnexionCodex,
   echangerCodeCodex,
   envoyerMessageCodex,
+  listerModelesCodex,
   parserReponseSSE,
   sonderConnexionCodex,
 } from "../chat-codex"
@@ -108,6 +109,31 @@ describe("provider ChatGPT Codex", () => {
     const corps = 'event: error\ndata: {"type":"error","error":{"message":"server_error: error occurred"}}'
 
     expect(() => parserReponseSSE(corps)).toThrow("server_error: error occurred")
+  })
+
+  it("récupère uniquement les modèles Codex visibles dans la liste", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          models: [
+            { slug: "gpt-test", display_name: "GPT test", description: "Modèle visible", visibility: "list" },
+            { slug: "codex-auto-review", display_name: "Auto review", description: "Modèle caché", visibility: "hide" },
+          ],
+        }),
+        { status: 200 }
+      )
+    )
+
+    await expect(listerModelesCodex("access-test")).resolves.toEqual([
+      { slug: "gpt-test", displayName: "GPT test", description: "Modèle visible" },
+    ])
+    expect(fetch).toHaveBeenCalledWith(
+      "https://chatgpt.com/backend-api/codex/models?client_version=0.250.0",
+      expect.objectContaining({
+        method: "GET",
+        headers: { Authorization: "Bearer access-test" },
+      })
+    )
   })
 
   it("envoie le body Codex en streaming avec le header Authorization", async () => {

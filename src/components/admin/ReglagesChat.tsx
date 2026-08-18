@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useToast } from "@/hooks/use-toast"
+import type { ModeleCodex } from "@/lib/chat-codex"
 
 type Provenance = "db" | "env" | "defaut"
 type SettingValue = boolean | number | string
@@ -112,6 +113,9 @@ export function ReglagesChat() {
   const { toast } = useToast()
   const [reglages, setReglages] = React.useState<Reglages | null>(null)
   const [reglagesInitiaux, setReglagesInitiaux] = React.useState<Reglages | null>(null)
+  const [modelesCodex, setModelesCodex] = React.useState<ModeleCodex[] | null>(null)
+  const [modelesCodexChargement, setModelesCodexChargement] = React.useState(false)
+  const [modeleCodexAutreSelectionne, setModeleCodexAutreSelectionne] = React.useState(false)
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
   const [testing, setTesting] = React.useState(false)
@@ -125,6 +129,11 @@ export function ReglagesChat() {
   const [codexPolling, setCodexPolling] = React.useState(false)
   const codexPollingRef = React.useRef<ReturnType<typeof setInterval> | null>(null)
   const codexTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const provider = reglages ? String(reglages["chat.provider"].valeur) as ChatProvider : "ollama"
+  const providerValide = providers.some((option) => option.value === provider) ? provider : "ollama"
+  const codexConnecte = reglages
+    ? String(reglages["chat.codexAccessToken"].valeur).trim() !== ""
+    : false
 
   const chargerReglages = React.useCallback(async (afficherChargement = true): Promise<boolean> => {
     if (afficherChargement) setLoading(true)
@@ -170,6 +179,42 @@ export function ReglagesChat() {
     void chargerReglages()
     return arreterPollingCodex
   }, [arreterPollingCodex, chargerReglages])
+
+  React.useEffect(() => {
+    if (providerValide !== "openai-codex") {
+      setModelesCodex(null)
+      setModelesCodexChargement(false)
+      setModeleCodexAutreSelectionne(false)
+      return
+    }
+
+    let annule = false
+    setModelesCodexChargement(true)
+    void fetch("/api/admin/chat/codex-models", { cache: "no-store" })
+      .then(async (response) => {
+        const data: unknown = await response.json().catch(() => null)
+        if (!response.ok) throw new Error(extraireMessageErreur(data, "Impossible de charger les modèles Codex."))
+        if (
+          typeof data !== "object" ||
+          data === null ||
+          !("modeles" in data) ||
+          !Array.isArray(data.modeles)
+        ) {
+          throw new Error("Réponse invalide du serveur des modèles Codex.")
+        }
+        if (!annule) setModelesCodex(data.modeles as ModeleCodex[])
+      })
+      .catch(() => {
+        if (!annule) setModelesCodex(null)
+      })
+      .finally(() => {
+        if (!annule) setModelesCodexChargement(false)
+      })
+
+    return () => {
+      annule = true
+    }
+  }, [codexConnecte, providerValide])
 
   const demarrerConnexionCodex = async () => {
     if (codexPolling) return
@@ -411,9 +456,11 @@ export function ReglagesChat() {
     )
   }
 
-  const provider = String(reglages["chat.provider"].valeur) as ChatProvider
-  const providerValide = providers.some((option) => option.value === provider) ? provider : "ollama"
-  const codexConnecte = String(reglages["chat.codexAccessToken"].valeur).trim() !== ""
+  const modeleActuel = String(reglages["chat.model"].valeur)
+  const modeleCodexSlugs = modelesCodex?.map((modele) => modele.slug) ?? []
+  const modeleCodexEstAutre =
+    modeleCodexAutreSelectionne ||
+    (modeleActuel.trim() !== "" && !modeleCodexSlugs.includes(modeleActuel))
   const baseUrl = String(reglages["chat.baseUrl"].valeur)
   const presetBaseUrlCustom = presetsBaseUrlCustom.some((preset) => preset.value === baseUrl)
     ? baseUrl
@@ -473,14 +520,60 @@ export function ReglagesChat() {
               <Label htmlFor="chat-model">Modèle</Label>
               <ProvenanceBadge provenance={reglages["chat.model"].provenance} />
             </div>
-            <Input
-              id="chat-model"
-              type="text"
-              placeholder={placeholdersModeles[providerValide]}
-              value={String(reglages["chat.model"].valeur)}
-              onChange={(event) => modifierValeur("chat.model", event.target.value)}
-              disabled={saving || testing}
-            />
+            {providerValide === "openai-codex" && modelesCodexChargement ? (
+              <p className="text-sm text-muted-foreground">Chargement des modèles disponibles…</p>
+            ) : providerValide === "openai-codex" && modelesCodex && modelesCodex.length > 0 ? (
+              <div className="space-y-2">
+                <Select
+                  value={modeleCodexEstAutre ? "autre" : modeleActuel}
+                  onValueChange={(value) => {
+                    if (value === "autre") {
+                      setModeleCodexAutreSelectionne(true)
+                    } else {
+                      setModeleCodexAutreSelectionne(false)
+                      modifierValeur("chat.model", value)
+                    }
+                  }}
+                  disabled={saving || testing}
+                >
+                  <SelectTrigger id="chat-model">
+                    <SelectValue placeholder="Choisir un modèle" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {modelesCodex.map((modele) => {
+                      const description = modele.description.length > 60
+                        ? `${modele.description.slice(0, 60)}…`
+                        : modele.description
+                      return (
+                        <SelectItem key={modele.slug} value={modele.slug}>
+                          {`${modele.displayName} — ${description}`}
+                        </SelectItem>
+                      )
+                    })}
+                    <SelectItem value="autre">Autre modèle (saisir manuellement)</SelectItem>
+                  </SelectContent>
+                </Select>
+                {modeleCodexEstAutre && (
+                  <Input
+                    id="chat-model-autre"
+                    type="text"
+                    placeholder={placeholdersModeles[providerValide]}
+                    value={modeleActuel}
+                    onChange={(event) => modifierValeur("chat.model", event.target.value)}
+                    disabled={saving || testing}
+                  />
+                )}
+              </div>
+            ) : (
+              <Input
+                id="chat-model"
+                type="text"
+                placeholder={placeholdersModeles[providerValide]}
+                value={modeleActuel}
+                onChange={(event) => modifierValeur("chat.model", event.target.value)}
+                disabled={saving || testing}
+              />
+            )}
             <p className="text-sm text-muted-foreground">
               {providerValide === "openai-codex"
                 ? "Modèles disponibles avec un compte ChatGPT : gpt-5.6-luna (fonctionne aussi avec un compte gratuit), gpt-5.5."
