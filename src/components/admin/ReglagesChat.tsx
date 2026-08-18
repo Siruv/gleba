@@ -494,6 +494,9 @@ export function ReglagesChat() {
             <Select
               value={providerValide}
               onValueChange={(value) => {
+                if (value !== providerValide) {
+                  modifierValeur("chat.model", "")
+                }
                 if (value !== "openai-codex") {
                   arreterPollingCodex()
                   setCodexConnexion(null)

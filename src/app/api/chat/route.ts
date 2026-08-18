@@ -61,7 +61,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const reply = await envoyerMessageChat(messages, section as string | undefined, contexte ?? undefined)
+    const reply = await envoyerMessageChat(messages, section as string | undefined, contexte ?? undefined, userId)
     return NextResponse.json({ reply })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)

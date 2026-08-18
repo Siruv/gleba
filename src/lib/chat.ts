@@ -189,7 +189,8 @@ async function appelerAnthropic(
 export async function envoyerMessageChat(
   messages: ChatMessage[],
   section?: string,
-  contexte?: string
+  contexte?: string,
+  userId?: string
 ): Promise<string> {
   if (!(await chatActif())) {
     throw new Error("Le chat IA n'est pas configuré. Renseignez la configuration dans l'administration.")
@@ -227,7 +228,7 @@ export async function envoyerMessageChat(
 
   if (provider === "openai-codex") {
     const { envoyerMessageCodex } = await import("@/lib/chat-codex")
-    return envoyerMessageCodex(historique, model, systeme)
+    return envoyerMessageCodex(historique, model, systeme, userId)
   }
 
   const apiKey = (await getSetting("chat.apiKey")).trim()

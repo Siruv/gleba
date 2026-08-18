@@ -1,14 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
-  parcelleFindFirst: vi.fn(),
+  parcelleFindMany: vi.fn(),
   fetchOpenMeteoForecast: vi.fn(),
 }))
 
 vi.mock("@/lib/prisma", () => ({
   default: {
     parcelleGeo: {
-      findFirst: mocks.parcelleFindFirst,
+      findMany: mocks.parcelleFindMany,
     },
   },
 }))
@@ -25,18 +25,16 @@ describe("contexte météo du chat", () => {
   })
 
   it("retourne null quand l'utilisateur n'a pas de parcelle géolocalisée", async () => {
-    mocks.parcelleFindFirst.mockResolvedValue(null)
+    mocks.parcelleFindMany.mockResolvedValue([])
 
     await expect(construireContexteMeteo("user-test")).resolves.toBeNull()
   })
 
-  it("formate la météo actuelle et les prévisions de la parcelle", async () => {
-    mocks.parcelleFindFirst.mockResolvedValue({
-      id: "parcelle-test",
-      nom: "Parcelle Nord",
-      centroidLat: 45.12,
-      centroidLng: 2.34,
-    })
+  it("concatène la météo de toutes les parcelles récupérées", async () => {
+    mocks.parcelleFindMany.mockResolvedValue([
+      { id: "parcelle-nord", nom: "Parcelle Nord", centroidLat: 45.12, centroidLng: 2.34 },
+      { id: "parcelle-sud", nom: "Parcelle Sud", centroidLat: 44.12, centroidLng: 1.34 },
+    ])
     mocks.fetchOpenMeteoForecast.mockResolvedValue({
       current: {
         temperature: 18.4,
@@ -70,18 +68,23 @@ describe("contexte météo du chat", () => {
     expect(contexte).toContain("Parcelle Nord")
     expect(contexte).toContain("18°C")
     expect(contexte).toContain("- 2026-06-01 : 11°C / 25°C, précipitations 1.3 mm (probabilité 30%)")
-    expect(mocks.fetchOpenMeteoForecast).toHaveBeenCalledWith(45.12, 2.34)
+    expect(contexte).toContain("Parcelle Nord")
+    expect(contexte).toContain("Parcelle Sud")
+    expect(mocks.fetchOpenMeteoForecast).toHaveBeenCalledTimes(2)
   })
 
-  it("retourne null si la récupération météo échoue", async () => {
-    mocks.parcelleFindFirst.mockResolvedValue({
-      id: "parcelle-test",
-      nom: "Parcelle Nord",
-      centroidLat: 45.12,
-      centroidLng: 2.34,
-    })
-    mocks.fetchOpenMeteoForecast.mockRejectedValue(new Error("Open-Meteo indisponible"))
+  it("conserve les autres parcelles si une récupération météo échoue", async () => {
+    mocks.parcelleFindMany.mockResolvedValue([
+      { id: "parcelle-nord", nom: "Parcelle Nord", centroidLat: 45.12, centroidLng: 2.34 },
+      { id: "parcelle-sud", nom: "Parcelle Sud", centroidLat: 44.12, centroidLng: 1.34 },
+    ])
+    mocks.fetchOpenMeteoForecast
+      .mockRejectedValueOnce(new Error("Open-Meteo indisponible"))
+      .mockResolvedValueOnce({ current: null, daily: [] })
 
-    await expect(construireContexteMeteo("user-test")).resolves.toBeNull()
+    const contexte = await construireContexteMeteo("user-test")
+
+    expect(contexte).toContain("Parcelle Sud")
+    expect(contexte).not.toContain("Parcelle Nord")
   })
 })

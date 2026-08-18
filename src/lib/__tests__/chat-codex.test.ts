@@ -21,6 +21,7 @@ import {
   envoyerMessageCodex,
   listerModelesCodex,
   parserReponseSSE,
+  parserReponseSSEComplete,
   sonderConnexionCodex,
 } from "../chat-codex"
 import { clearSettingsCache } from "../settings"
@@ -103,6 +104,21 @@ describe("provider ChatGPT Codex", () => {
     ].join("\n\n")
 
     expect(parserReponseSSE(corps)).toBe("Bonjour le monde !")
+  })
+
+  it("parse un appel d'outil dans un événement SSE complet", () => {
+    const corps = 'event: response.output_item.done\\ndata: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"get_cultures","arguments":"{}"}}'
+
+    expect(parserReponseSSEComplete(corps)).toMatchObject({
+      texte: "",
+      functionCalls: [{ call_id: "call-1", name: "get_cultures", arguments: "{}" }],
+    })
+  })
+
+  it("retourne le texte et aucun appel pour un flux texte seul", () => {
+    const corps = 'event: response.output_text.delta\\ndata: {"type":"response.output_text.delta","delta":"Bonjour"}'
+
+    expect(parserReponseSSEComplete(corps)).toEqual({ texte: "Bonjour", functionCalls: [] })
   })
 
   it("lève l'erreur transmise par un événement SSE error", () => {

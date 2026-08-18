@@ -174,9 +174,10 @@ export async function listerModelesCodex(accessToken: string): Promise<ModeleCod
 
 export async function appelerBackendCodex(
   accessToken: string,
-  messages: MessageCodex[],
+  input: unknown[],
   model: string,
-  systeme: string
+  systeme: string,
+  tools?: unknown[]
 ): Promise<Response> {
   return fetch(`${CODEX_API_BASE}/responses`, {
     method: "POST",
@@ -189,13 +190,8 @@ export async function appelerBackendCodex(
       store: false,
       stream: true,
       instructions: systeme,
-      input: messages.map((message) => ({
-        role: message.role,
-        content: [{
-          type: message.role === "assistant" ? "output_text" : "input_text",
-          text: message.content,
-        }],
-      })),
+      input,
+      ...(tools && tools.length ? { tools } : {}),
     }),
     signal: AbortSignal.timeout(60_000),
   })
@@ -230,20 +226,106 @@ export function parserReponseSSE(corpsTexte: string): string {
   return texte
 }
 
+/**
+ * Parse une réponse SSE complète incluant les appels de fonctions
+ */
+/**
+ * Convertit les messages au format attendu par l'API Codex
+ */
+export function messagesVersInput(messages: MessageCodex[]): unknown[] {
+  return messages.map((message) => ({
+    role: message.role,
+    content: [{
+      type: message.role === "assistant" ? "output_text" : "input_text",
+      text: message.content,
+    }],
+  }))
+}
+
+/**
+ * Parse une réponse SSE complète incluant les appels de fonctions
+ */
+export function parserReponseSSEComplete(corpsTexte: string): {
+  texte: string
+  functionCalls: Array<{
+    call_id: string
+    name: string
+    arguments: string
+    item: Record<string, unknown>
+  }>
+} {
+  let texte = ""
+  const functionCalls: Array<{
+    call_id: string
+    name: string
+    arguments: string
+    item: Record<string, unknown>
+  }> = []
+
+  for (const ligne of corpsTexte.split(/\r?\n/)) {
+    if (!ligne.startsWith("data: ")) continue
+
+    const evenement: unknown = JSON.parse(ligne.slice("data: ".length))
+    if (typeof evenement !== "object" || evenement === null) continue
+
+    const donnees = evenement as ReponseJson
+    
+    if (donnees.type === "response.output_text.delta" && typeof donnees.delta === "string") {
+      texte += donnees.delta
+      continue
+    }
+
+    if (donnees.type === "response.output_item.done") {
+      const item = donnees.item as Record<string, unknown> | undefined
+      if (item && item.type === "function_call") {
+        functionCalls.push({
+          call_id: item.call_id as string,
+          name: item.name as string,
+          arguments: item.arguments as string,
+          item: item,
+        })
+      }
+      continue
+    }
+
+    if (donnees.type === "error") {
+      const erreur = donnees.error
+      const message =
+        typeof erreur === "object" && erreur !== null && typeof (erreur as ReponseJson).message === "string"
+          ? (erreur as ReponseJson).message as string
+          : "Erreur du backend ChatGPT."
+      throw new Error(message)
+    }
+  }
+
+  return { texte, functionCalls }
+}
+
 export async function envoyerMessageCodex(
   messages: MessageCodex[],
   model: string,
-  systeme: string
+  systeme: string,
+  userId?: string
 ): Promise<string> {
   const { getSetting, setSetting } = await import("@/lib/settings")
   let accessToken = (await getSetting("chat.codexAccessToken")).trim()
   if (accessToken === "") throw new Error("Non connecté à ChatGPT.")
 
+  // Charger les outils si userId est fourni (pour le tool-calling)
+  const tools = userId ? (await import("@/lib/chat-tools")).outilsPourBackend() : undefined
+
+  // Convertir les messages au format input
+  let input = messagesVersInput(messages)
+
   let aRafraichiToken = false
   let aReessayeErreurServeur = false
+  let iteration = 0
+  const maxIterations = 5
 
-  while (true) {
-    let response = await appelerBackendCodex(accessToken, messages, model, systeme)
+  while (iteration < maxIterations) {
+    iteration++
+    
+    let response = await appelerBackendCodex(accessToken, input, model, systeme, tools)
     if (response.status === 401 && !aRafraichiToken) {
       const refreshToken = (await getSetting("chat.codexRefreshToken")).trim()
       const tokens = await rafraichirTokenCodex(refreshToken)
@@ -251,7 +333,7 @@ export async function envoyerMessageCodex(
       await setSetting("chat.codexAccessToken", tokens.accessToken)
       await setSetting("chat.codexRefreshToken", tokens.refreshToken)
       aRafraichiToken = true
-      response = await appelerBackendCodex(accessToken, messages, model, systeme)
+      response = await appelerBackendCodex(accessToken, input, model, systeme, tools)
     }
 
     if (response.status !== 200) {
@@ -260,7 +342,55 @@ export async function envoyerMessageCodex(
     }
 
     try {
-      return parserReponseSSE(await response.text())
+      const corpsTexte = await response.text()
+      
+      // Si tools est défini, utiliser le parser complet pour détecter les appels de fonctions
+      if (tools && tools.length > 0) {
+        const { texte, functionCalls } = parserReponseSSEComplete(corpsTexte)
+        
+        // Si des appels de fonctions sont détectés, les exécuter et continuer la boucle
+        if (functionCalls.length > 0) {
+          const { executerOutil } = await import("@/lib/chat-tools")
+          
+          // Exécuter chaque appel de fonction
+          const results = await Promise.all(
+            functionCalls.map(async (fc) => {
+              try {
+                const resultat = await executerOutil(fc.name, fc.arguments, userId!)
+                return {
+                  type: "function_call_output" as const,
+                  call_id: fc.call_id,
+                  output: resultat,
+                }
+              } catch (error) {
+                return {
+                  type: "function_call_output" as const,
+                  call_id: fc.call_id,
+                  output: JSON.stringify({ erreur: "Erreur lors de l'exécution de l'outil" }),
+                }
+              }
+            })
+          )
+          
+          // Ajouter les appels de fonction et leurs résultats à l'historique
+          input = [
+            ...input,
+            ...functionCalls.map((fc) => fc.item),
+            ...results,
+          ]
+          
+          continue // Continuer la boucle pour obtenir la réponse finale
+        }
+        
+        // Si pas d'appels de fonctions, retourner le texte
+        if (texte !== "") {
+          return texte
+        }
+      } else {
+        // Mode sans tools (compatibilité descendante)
+        const texte = parserReponseSSE(corpsTexte)
+        return texte
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const estErreurServeur = message.includes("server_error") || message.includes("error occurred")
@@ -268,4 +398,7 @@ export async function envoyerMessageCodex(
       aReessayeErreurServeur = true
     }
   }
+  
+  // Si on atteint le nombre maximum d'itérations
+  throw new Error("Trop d'appels d'outils consécutifs.")
 }
