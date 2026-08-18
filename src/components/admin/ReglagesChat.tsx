@@ -61,7 +61,7 @@ const placeholdersModeles: Record<ChatProvider, string> = {
   openai: "gpt-4o-mini",
   anthropic: "claude-sonnet-4-5",
   custom: "nom du modèle",
-  "openai-codex": "gpt-5.5",
+  "openai-codex": "gpt-5.6-luna",
 }
 
 const urlsParDefaut: Record<ChatProvider, string> = {
@@ -482,7 +482,9 @@ export function ReglagesChat() {
               disabled={saving || testing}
             />
             <p className="text-sm text-muted-foreground">
-              Laissez vide pour utiliser le modèle par défaut du provider (sauf personnalisé).
+              {providerValide === "openai-codex"
+                ? "Modèles disponibles avec un compte ChatGPT : gpt-5.6-luna (fonctionne aussi avec un compte gratuit), gpt-5.5."
+                : "Laissez vide pour utiliser le modèle par défaut du provider (sauf personnalisé)."}
             </p>
           </div>
 

@@ -6,7 +6,7 @@ const CODEX_OAUTH_TOKEN_URL = `${CODEX_ISSUER}/oauth/token`
 const CODEX_REDIRECT_URI = `${CODEX_ISSUER}/deviceauth/callback`
 const CODEX_VERIFICATION_URL = `${CODEX_ISSUER}/codex/device`
 const CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
-const CODEX_MODEL_DEFAUT = "gpt-5.5"
+const CODEX_MODEL_DEFAUT = "gpt-5.6-luna"
 
 type ReponseJson = Record<string, unknown>
 type MessageCodex = { role: string; content: string }

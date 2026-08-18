@@ -131,7 +131,7 @@ describe("provider ChatGPT Codex", () => {
       store: boolean
       stream: boolean
     }
-    expect(body).toMatchObject({ model: "gpt-5.5", store: false, stream: true })
+    expect(body).toMatchObject({ model: "gpt-5.6-luna", store: false, stream: true })
   })
 
   it("envoie un message au backend Codex et extrait le texte de réponse SSE", async () => {
