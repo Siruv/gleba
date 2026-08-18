@@ -7,6 +7,7 @@
 
 import prisma from "@/lib/prisma"
 import { fetchOpenMeteoForecast } from "@/lib/meteo"
+import type { Prisma } from "@prisma/client"
 
 // ============================================================
 // INTERFACES
@@ -81,7 +82,7 @@ export const outilsChat: OutilChat[] = [
 
         const parcellesFiltrees = parcellesAvecMeteo.filter((p): p is NonNullable<typeof p> => p !== null)
         return { parcelles: parcellesFiltrees }
-      } catch (error) {
+      } catch {
         return { erreur: "Impossible de récupérer les données météo" }
       }
     },
@@ -99,7 +100,7 @@ export const outilsChat: OutilChat[] = [
     },
     handler: async (args: Record<string, unknown>, userId: string) => {
       try {
-        const where: any = { userId }
+        const where: Prisma.CultureWhereInput = { userId }
         
         if (args.annee) {
           where.annee = Number(args.annee)
@@ -167,7 +168,7 @@ export const outilsChat: OutilChat[] = [
           dateRecolte: culture.dateRecolte,
           notes: culture.notes,
         }))
-      } catch (error) {
+      } catch {
         return { erreur: "Impossible de récupérer les cultures" }
       }
     },
@@ -183,7 +184,7 @@ export const outilsChat: OutilChat[] = [
     },
     handler: async (args: Record<string, unknown>, userId: string) => {
       try {
-        const where: any = { userId }
+        const where: Prisma.PlancheWhereInput = { userId }
         
         if (args.search) {
           where.OR = [
@@ -206,7 +207,7 @@ export const outilsChat: OutilChat[] = [
           largeur: planche.largeur,
           longueur: planche.longueur,
         }))
-      } catch (error) {
+      } catch {
         return { erreur: "Impossible de récupérer les planches" }
       }
     },
@@ -224,7 +225,7 @@ export const outilsChat: OutilChat[] = [
     },
     handler: async (args: Record<string, unknown>, userId: string) => {
       try {
-        const where: any = { userId }
+        const where: Prisma.RecolteWhereInput = { userId }
         
         if (args.annee) {
           const annee = Number(args.annee)
@@ -255,7 +256,7 @@ export const outilsChat: OutilChat[] = [
           quantiteKg: recolte.quantite,
           statut: recolte.statut,
         }))
-      } catch (error) {
+      } catch {
         return { erreur: "Impossible de récupérer les récoltes" }
       }
     },
@@ -270,9 +271,11 @@ export const outilsChat: OutilChat[] = [
         type: { type: "string", description: "Type d'espèce (legume, aromatique, etc.)" },
       },
     },
-    handler: async (args: Record<string, unknown>, userId: string) => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    handler: async (args: Record<string, unknown>, _userId: string) => {
+      
       try {
-        const where: any = {}
+        const where: Prisma.EspeceWhereInput = {}
         
         if (args.search) {
           where.nom = { contains: String(args.search), mode: "insensitive" }
@@ -294,7 +297,7 @@ export const outilsChat: OutilChat[] = [
           famille: espece.familleId,
           type: espece.type,
         }))
-      } catch (error) {
+      } catch {
         return { erreur: "Impossible de récupérer les espèces" }
       }
     },
@@ -337,17 +340,18 @@ export const outilsChat: OutilChat[] = [
           const stocks = await prisma.userStockFertilisant.findMany({
             where: { userId },
             take: 50,
+            include: { fertilisant: true },
           })
 
           return {
             fertilisants: stocks.map((stock) => ({
-              nom: stock.fertilisantId, // Using ID as name since we don't have direct access to fertilisant
+              nom: stock.fertilisant?.id ?? stock.fertilisantId,
               quantite: stock.stock,
               unite: "kg",
             })),
           }
         }
-      } catch (error) {
+      } catch {
         return { erreur: "Impossible de récupérer les stocks" }
       }
     },
@@ -363,8 +367,6 @@ export const outilsChat: OutilChat[] = [
     },
     handler: async (args: Record<string, unknown>, userId: string) => {
       try {
-        const annee = args.annee ? Number(args.annee) : new Date().getFullYear()
-        
         const itps = await prisma.iTP.findMany({
           where: { userId },
           include: {
@@ -381,7 +383,7 @@ export const outilsChat: OutilChat[] = [
           semaineRecolte: itp.semaineRecolte,
           dureeCulture: itp.dureeCulture,
         }))
-      } catch (error) {
+      } catch {
         return { erreur: "Impossible de récupérer la planification" }
       }
     },
@@ -393,8 +395,6 @@ export const outilsChat: OutilChat[] = [
     handler: async (args: Record<string, unknown>, userId: string) => {
       try {
         const now = new Date()
-        const startOfWeek = new Date(now)
-        startOfWeek.setDate(now.getDate() - now.getDay())
         const startOfYear = new Date(now.getFullYear(), 0, 1)
 
         const [culturesActives, surfaceCultivee, recoltesAnnee, tachesSemaine] = await Promise.all([
@@ -433,7 +433,7 @@ export const outilsChat: OutilChat[] = [
           recoltesAnneeKg: recoltesAnnee._sum.quantite || 0,
           tachesSemaine,
         }
-      } catch (error) {
+      } catch {
         return { erreur: "Impossible de récupérer les statistiques" }
       }
     },
@@ -479,8 +479,8 @@ export async function executerOutil(
     
     const resultat = await outil.handler(args, userId)
     return JSON.stringify(resultat)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+  } catch (caughtError) {
+    const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
     return JSON.stringify({ erreur: message })
   }
 }

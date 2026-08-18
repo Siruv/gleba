@@ -71,10 +71,7 @@ PROMPT_AI_ENRICHMENT.md
 et)
 
 # AI / MCP
-# Le chat IA est désormais open source (Phase 5). Seuls les endpoints MCP
-# et les tokens API restent privés.
-/src/app/api/mcp/
-/src/app/api/user/api-token/
+# Le chat IA et les endpoints MCP sont open source (Phase 6).
 /mcp-server/
 
 # Boutique en ligne (proprietary)

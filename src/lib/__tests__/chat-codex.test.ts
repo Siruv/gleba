@@ -107,7 +107,10 @@ describe("provider ChatGPT Codex", () => {
   })
 
   it("parse un appel d'outil dans un événement SSE complet", () => {
-    const corps = 'event: response.output_item.done\\ndata: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"get_cultures","arguments":"{}"}}'
+    const corps = [
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"get_cultures","arguments":"{}"}}',
+    ].join("\n")
 
     expect(parserReponseSSEComplete(corps)).toMatchObject({
       texte: "",
@@ -116,7 +119,10 @@ describe("provider ChatGPT Codex", () => {
   })
 
   it("retourne le texte et aucun appel pour un flux texte seul", () => {
-    const corps = 'event: response.output_text.delta\\ndata: {"type":"response.output_text.delta","delta":"Bonjour"}'
+    const corps = [
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","delta":"Bonjour"}',
+    ].join("\n")
 
     expect(parserReponseSSEComplete(corps)).toEqual({ texte: "Bonjour", functionCalls: [] })
   })

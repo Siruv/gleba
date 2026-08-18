@@ -362,7 +362,7 @@ export async function envoyerMessageCodex(
                   call_id: fc.call_id,
                   output: resultat,
                 }
-              } catch (error) {
+              } catch {
                 return {
                   type: "function_call_output" as const,
                   call_id: fc.call_id,
@@ -391,10 +391,10 @@ export async function envoyerMessageCodex(
         const texte = parserReponseSSE(corpsTexte)
         return texte
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+    } catch (caughtError) {
+      const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
       const estErreurServeur = message.includes("server_error") || message.includes("error occurred")
-      if (aReessayeErreurServeur || !estErreurServeur) throw error
+      if (aReessayeErreurServeur || !estErreurServeur) throw caughtError
       aReessayeErreurServeur = true
     }
   }
