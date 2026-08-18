@@ -1,4 +1,4 @@
-export type ChatProvider = "ollama" | "openai" | "anthropic" | "custom" | "openai-codex"
+export type ChatProvider = "ollama" | "openai" | "anthropic" | "custom" | "openai-codex" | "mistral"
 
 export interface ChatMessage {
   role: "user" | "assistant"
@@ -32,6 +32,12 @@ function urlAvecChemin(baseUrl: string, chemin: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/${chemin}`
 }
 
+const urlsParDefaut: Record<string, string> = {
+  openai: "https://api.openai.com/v1",
+  mistral: "https://api.mistral.ai/v1",
+  custom: "",
+}
+
 /** Indique si la configuration actuelle permet d'utiliser le chat IA. */
 export async function chatActif(): Promise<boolean> {
   const { getSetting } = await import("@/lib/settings")
@@ -43,7 +49,7 @@ export async function chatActif(): Promise<boolean> {
     return (await getSetting("chat.ollamaHost")).trim() !== ""
   }
 
-  if (provider === "openai" || provider === "anthropic") {
+  if (provider === "openai" || provider === "anthropic" || provider === "mistral") {
     return apiKey !== ""
   }
 
@@ -67,6 +73,8 @@ export function modeleEffectif(provider: ChatProvider, modelConfig: string): str
       return process.env.OLLAMA_MODEL || "glm-4.7"
     case "openai":
       return "gpt-4o-mini"
+    case "mistral":
+      return "mistral-small-latest"
     case "anthropic":
       return "claude-sonnet-4-5"
     case "custom":
@@ -232,11 +240,18 @@ export async function envoyerMessageChat(
   }
 
   const apiKey = (await getSetting("chat.apiKey")).trim()
+
+  if (provider === "mistral" || provider === "openai" || provider === "custom") {
+    const baseUrl = (await getSetting("chat.baseUrl")).trim() || urlsParDefaut[provider]
+    const { envoyerMessageAvecOutils } = await import("@/lib/chat-openai-tools")
+    return envoyerMessageAvecOutils(baseUrl, apiKey, model, systeme, historique, userId)
+  }
+
   if (provider === "anthropic") {
     const baseUrl = (await getSetting("chat.baseUrl")).trim() || "https://api.anthropic.com/v1"
     return appelerAnthropic(baseUrl, apiKey, model, systeme, historique)
   }
 
-  const baseUrl = (await getSetting("chat.baseUrl")).trim() || "https://api.openai.com/v1"
+  const baseUrl = (await getSetting("chat.baseUrl")).trim() || urlsParDefaut[provider]
   return appelerApiCompatibleOpenai(provider, baseUrl, apiKey, model, messagesAvecSysteme)
 }

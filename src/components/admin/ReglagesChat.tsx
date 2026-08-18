@@ -30,7 +30,7 @@ type SettingDetails = {
   valeur: SettingValue
   provenance: Provenance
 }
-type ChatProvider = "ollama" | "openai" | "anthropic" | "custom" | "openai-codex"
+type ChatProvider = "ollama" | "openai" | "anthropic" | "custom" | "openai-codex" | "mistral"
 type SettingKey =
   | "chat.provider"
   | "chat.model"
@@ -53,6 +53,7 @@ const providers: Array<{ value: ChatProvider; label: string }> = [
   { value: "ollama", label: "Ollama (local)" },
   { value: "openai", label: "OpenAI" },
   { value: "anthropic", label: "Anthropic" },
+  { value: "mistral", label: "Mistral AI" },
   { value: "custom", label: "Personnalisé (compatible OpenAI)" },
   { value: "openai-codex", label: "ChatGPT (compte OpenAI)" },
 ]
@@ -61,6 +62,7 @@ const placeholdersModeles: Record<ChatProvider, string> = {
   ollama: "glm-4.7",
   openai: "gpt-4o-mini",
   anthropic: "claude-sonnet-4-5",
+  mistral: "mistral-small-latest",
   custom: "nom du modèle",
   "openai-codex": "gpt-5.6-luna",
 }
@@ -69,6 +71,7 @@ const urlsParDefaut: Record<ChatProvider, string> = {
   ollama: "http://localhost:11434",
   openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com/v1",
+  mistral: "https://api.mistral.ai/v1",
   custom: "",
   "openai-codex": "",
 }
@@ -116,6 +119,8 @@ export function ReglagesChat() {
   const [modelesCodex, setModelesCodex] = React.useState<ModeleCodex[] | null>(null)
   const [modelesCodexChargement, setModelesCodexChargement] = React.useState(false)
   const [modeleCodexAutreSelectionne, setModeleCodexAutreSelectionne] = React.useState(false)
+  const [modelesMistral, setModelesMistral] = React.useState<Array<{id: string; nom: string; description: string; functionCalling: boolean}> | null>(null)
+  const [modelesMistralChargement, setModelesMistralChargement] = React.useState(false)
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
   const [testing, setTesting] = React.useState(false)
@@ -215,6 +220,29 @@ export function ReglagesChat() {
       annule = true
     }
   }, [codexConnecte, providerValide])
+
+  React.useEffect(() => {
+    if (providerValide !== "mistral") {
+      setModelesMistral(null)
+      return
+    }
+    const apiKeyInitiale = String(reglagesInitiaux?.["chat.apiKey"]?.valeur ?? "")
+    if (apiKeyInitiale === "" || apiKeyInitiale === valeurMasquee) return
+
+    setModelesMistralChargement(true)
+    let annule = false
+    fetch("/api/admin/chat/mistral-models", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((data) => {
+        if (annule) return
+        if (data && Array.isArray(data.modeles)) {
+          setModelesMistral(data.modeles)
+        }
+      })
+      .catch(() => {})
+      .finally(() => { if (!annule) setModelesMistralChargement(false) })
+    return () => { annule = true }
+  }, [providerValide, reglagesInitiaux])
 
   const demarrerConnexionCodex = async () => {
     if (codexPolling) return
@@ -557,6 +585,41 @@ export function ReglagesChat() {
                   </SelectContent>
                 </Select>
                 {modeleCodexEstAutre && (
+                  <Input
+                    id="chat-model-autre"
+                    type="text"
+                    placeholder={placeholdersModeles[providerValide]}
+                    value={modeleActuel}
+                    onChange={(event) => modifierValeur("chat.model", event.target.value)}
+                    disabled={saving || testing}
+                  />
+                )}
+              </div>
+            ) : providerValide === "mistral" && modelesMistralChargement ? (
+              <p className="text-sm text-muted-foreground">Chargement des modèles disponibles…</p>
+            ) : providerValide === "mistral" && modelesMistral && modelesMistral.length > 0 ? (
+              <div className="space-y-2">
+                <Select
+                  value={modeleActuel}
+                  onValueChange={(value) => modifierValeur("chat.model", value)}
+                  disabled={saving || testing}
+                >
+                  <SelectTrigger id="chat-model">
+                    <SelectValue placeholder="Choisir un modèle" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {modelesMistral.map((modele) => (
+                      <SelectItem key={modele.id} value={modele.id}>
+                        {`${modele.nom} — ${modele.description}`}
+                        {modele.functionCalling && (
+                          <Badge className="ml-2">Tool-calling</Badge>
+                        )}
+                      </SelectItem>
+                    ))}
+                    <SelectItem value="autre">Autre modèle (saisir manuellement)</SelectItem>
+                  </SelectContent>
+                </Select>
+                {modeleActuel === "autre" && (
                   <Input
                     id="chat-model-autre"
                     type="text"
