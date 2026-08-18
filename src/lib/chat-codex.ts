@@ -6,7 +6,7 @@ const CODEX_OAUTH_TOKEN_URL = `${CODEX_ISSUER}/oauth/token`
 const CODEX_REDIRECT_URI = `${CODEX_ISSUER}/deviceauth/callback`
 const CODEX_VERIFICATION_URL = `${CODEX_ISSUER}/codex/device`
 const CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
-const CODEX_MODEL_DEFAUT = "gpt-4o-mini"
+const CODEX_MODEL_DEFAUT = "gpt-5.5"
 
 type ReponseJson = Record<string, unknown>
 type MessageCodex = { role: string; content: string }
@@ -133,7 +133,7 @@ export async function rafraichirTokenCodex(refreshToken: string): Promise<Tokens
   }
 }
 
-async function appelerBackendCodex(
+export async function appelerBackendCodex(
   accessToken: string,
   messages: MessageCodex[],
   model: string,
@@ -147,6 +147,8 @@ async function appelerBackendCodex(
     },
     body: JSON.stringify({
       model: model.trim() || CODEX_MODEL_DEFAUT,
+      store: false,
+      stream: true,
       instructions: systeme,
       input: messages.map((message) => ({
         role: message.role,
@@ -160,27 +162,33 @@ async function appelerBackendCodex(
   })
 }
 
-function extraireTexteCodex(data: unknown): string {
-  if (typeof data !== "object" || data === null || !Array.isArray((data as ReponseJson).output)) {
-    throw new Error("Réponse invalide du backend ChatGPT.")
-  }
+export function parserReponseSSE(corpsTexte: string): string {
+  let texte = ""
 
-  const output = (data as ReponseJson).output as unknown[]
-  for (const item of output) {
-    if (typeof item !== "object" || item === null) continue
-    const contenu = (item as ReponseJson).content
-    if ((item as ReponseJson).type !== "message" || !Array.isArray(contenu)) continue
-    for (const element of contenu) {
-      if (typeof element !== "object" || element === null) continue
-      if (
-        (element as ReponseJson).type === "output_text" &&
-        typeof (element as ReponseJson).text === "string"
-      ) {
-        return (element as ReponseJson).text as string
-      }
+  for (const ligne of corpsTexte.split(/\r?\n/)) {
+    if (!ligne.startsWith("data: ")) continue
+
+    const evenement: unknown = JSON.parse(ligne.slice("data: ".length))
+    if (typeof evenement !== "object" || evenement === null) continue
+
+    const donnees = evenement as ReponseJson
+    if (donnees.type === "response.output_text.delta" && typeof donnees.delta === "string") {
+      texte += donnees.delta
+      continue
+    }
+
+    if (donnees.type === "error") {
+      const erreur = donnees.error
+      const message =
+        typeof erreur === "object" && erreur !== null && typeof (erreur as ReponseJson).message === "string"
+          ? (erreur as ReponseJson).message as string
+          : "Erreur du backend ChatGPT."
+      throw new Error(message)
     }
   }
-  throw new Error("Réponse invalide du backend ChatGPT.")
+
+  if (texte === "") throw new Error("Réponse vide du backend ChatGPT.")
+  return texte
 }
 
 export async function envoyerMessageCodex(
@@ -192,19 +200,33 @@ export async function envoyerMessageCodex(
   let accessToken = (await getSetting("chat.codexAccessToken")).trim()
   if (accessToken === "") throw new Error("Non connecté à ChatGPT.")
 
-  let response = await appelerBackendCodex(accessToken, messages, model, systeme)
-  if (response.status === 401) {
-    const refreshToken = (await getSetting("chat.codexRefreshToken")).trim()
-    const tokens = await rafraichirTokenCodex(refreshToken)
-    accessToken = tokens.accessToken
-    await setSetting("chat.codexAccessToken", tokens.accessToken)
-    await setSetting("chat.codexRefreshToken", tokens.refreshToken)
-    response = await appelerBackendCodex(accessToken, messages, model, systeme)
-  }
+  let aRafraichiToken = false
+  let aReessayeErreurServeur = false
 
-  const data = await lireReponseJson(
-    response,
-    `Erreur API ChatGPT (HTTP ${response.status}).`
-  )
-  return extraireTexteCodex(data)
+  while (true) {
+    let response = await appelerBackendCodex(accessToken, messages, model, systeme)
+    if (response.status === 401 && !aRafraichiToken) {
+      const refreshToken = (await getSetting("chat.codexRefreshToken")).trim()
+      const tokens = await rafraichirTokenCodex(refreshToken)
+      accessToken = tokens.accessToken
+      await setSetting("chat.codexAccessToken", tokens.accessToken)
+      await setSetting("chat.codexRefreshToken", tokens.refreshToken)
+      aRafraichiToken = true
+      response = await appelerBackendCodex(accessToken, messages, model, systeme)
+    }
+
+    if (response.status !== 200) {
+      const detail = await response.text()
+      throw new Error(`Erreur API ChatGPT (HTTP ${response.status}) : ${detail}`)
+    }
+
+    try {
+      return parserReponseSSE(await response.text())
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const estErreurServeur = message.includes("server_error") || message.includes("error occurred")
+      if (aReessayeErreurServeur || !estErreurServeur) throw error
+      aReessayeErreurServeur = true
+    }
+  }
 }

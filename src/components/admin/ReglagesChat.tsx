@@ -61,7 +61,7 @@ const placeholdersModeles: Record<ChatProvider, string> = {
   openai: "gpt-4o-mini",
   anthropic: "claude-sonnet-4-5",
   custom: "nom du modèle",
-  "openai-codex": "gpt-4o-mini",
+  "openai-codex": "gpt-5.5",
 }
 
 const urlsParDefaut: Record<ChatProvider, string> = {

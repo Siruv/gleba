@@ -15,9 +15,11 @@ vi.mock("@/lib/prisma", () => ({
 }))
 
 import {
+  appelerBackendCodex,
   demarrerConnexionCodex,
   echangerCodeCodex,
   envoyerMessageCodex,
+  parserReponseSSE,
   sonderConnexionCodex,
 } from "../chat-codex"
 import { clearSettingsCache } from "../settings"
@@ -92,7 +94,47 @@ describe("provider ChatGPT Codex", () => {
     )
   })
 
-  it("envoie un message au backend Codex et extrait le texte de réponse", async () => {
+  it("reconstitue le texte à partir des deltas SSE", () => {
+    const corps = [
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Bonjour"}',
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":" le monde !"}',
+      'event: response.completed\ndata: {"type":"response.completed"}',
+    ].join("\n\n")
+
+    expect(parserReponseSSE(corps)).toBe("Bonjour le monde !")
+  })
+
+  it("lève l'erreur transmise par un événement SSE error", () => {
+    const corps = 'event: error\ndata: {"type":"error","error":{"message":"server_error: error occurred"}}'
+
+    expect(() => parserReponseSSE(corps)).toThrow("server_error: error occurred")
+  })
+
+  it("envoie le body Codex en streaming avec le header Authorization", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response("", { status: 200 }))
+
+    await appelerBackendCodex("access-test", [{ role: "user", content: "Bonjour" }], "", "Réponds en français.")
+
+    expect(fetch).toHaveBeenCalledWith(
+      "https://chatgpt.com/backend-api/codex/responses",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer access-test",
+        },
+      })
+    )
+    const options = vi.mocked(fetch).mock.calls[0]?.[1]
+    const body = JSON.parse(String(options?.body)) as {
+      model: string
+      store: boolean
+      stream: boolean
+    }
+    expect(body).toMatchObject({ model: "gpt-5.5", store: false, stream: true })
+  })
+
+  it("envoie un message au backend Codex et extrait le texte de réponse SSE", async () => {
     mocks.parametreFindUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
       if (where.id === "chat.codexAccessToken") return { valeur: "access-test" }
       if (where.id === "chat.codexRefreshToken") return { valeur: "refresh-test" }
@@ -100,11 +142,11 @@ describe("provider ChatGPT Codex", () => {
     })
     vi.mocked(fetch).mockResolvedValue(
       new Response(
-        JSON.stringify({
-          output: [
-            { type: "message", content: [{ type: "output_text", text: "Réponse ChatGPT" }] },
-          ],
-        }),
+        [
+          'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Réponse "}',
+          'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ChatGPT"}',
+          'event: response.completed\ndata: {"type":"response.completed"}',
+        ].join("\n\n"),
         { status: 200 }
       )
     )
@@ -134,5 +176,30 @@ describe("provider ChatGPT Codex", () => {
     const body = JSON.parse(String(options?.body)) as { input: Array<{ content: Array<{ type: string }> }> }
     expect(body.input[0]?.content[0]?.type).toBe("input_text")
     expect(body.input[1]?.content[0]?.type).toBe("output_text")
+    expect(body).toMatchObject({ store: false, stream: true })
+  })
+
+  it("réessaie une réponse SSE en server_error une seule fois", async () => {
+    mocks.parametreFindUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
+      if (where.id === "chat.codexAccessToken") return { valeur: "access-test" }
+      if (where.id === "chat.codexRefreshToken") return { valeur: "refresh-test" }
+      return null
+    })
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        new Response('event: error\ndata: {"type":"error","error":{"message":"server_error: error occurred"}}', {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Réponse après retry"}', {
+          status: 200,
+        })
+      )
+
+    await expect(envoyerMessageCodex([{ role: "user", content: "Bonjour" }], "gpt-test", "Réponds en français.")).resolves.toBe(
+      "Réponse après retry"
+    )
+    expect(fetch).toHaveBeenCalledTimes(2)
   })
 })
