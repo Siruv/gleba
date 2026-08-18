@@ -36,6 +36,7 @@ export async function POST(request: NextRequest) {
     const tokens = await echangerCodeCodex(resultat.authorizationCode, resultat.codeVerifier)
     await setSetting("chat.codexAccessToken", tokens.accessToken)
     await setSetting("chat.codexRefreshToken", tokens.refreshToken)
+    await setSetting("chat.provider", "openai-codex")
     return NextResponse.json({ status: "connected" })
   } catch (error) {
     console.error("POST /api/admin/chat/codex-login/poll error:", error)

@@ -305,12 +305,8 @@ export function ReglagesChat() {
     const apiKeyInitialisee =
       reglagesInitiaux["chat.apiKey"].valeur === valeurMasquee ||
       String(reglagesInitiaux["chat.apiKey"].valeur).trim() !== ""
-    if (
-      provider !== "ollama" &&
-      provider !== "openai-codex" &&
-      cleApiSaisie.trim() === "" &&
-      !apiKeyInitialisee
-    ) {
+    const providerSansCleApi = provider === "ollama" || provider === "openai-codex"
+    if (!providerSansCleApi && cleApiSaisie.trim() === "" && !apiKeyInitialisee) {
       toast({
         variant: "destructive",
         title: "Réglages invalides",
