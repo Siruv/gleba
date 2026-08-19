@@ -15,7 +15,7 @@ const texteSystemeBase =
 const reponseMaximaleErreur = 1000
 
 function estProvider(value: string): value is ChatProvider {
-  return value === "ollama" || value === "openai" || value === "anthropic" || value === "custom" || value === "openai-codex"
+  return value === "ollama" || value === "openai" || value === "anthropic" || value === "custom" || value === "openai-codex" || value === "mistral"
 }
 
 function detailErreur(error: unknown): string {

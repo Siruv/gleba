@@ -121,6 +121,7 @@ export function ReglagesChat() {
   const [modeleCodexAutreSelectionne, setModeleCodexAutreSelectionne] = React.useState(false)
   const [modelesMistral, setModelesMistral] = React.useState<Array<{id: string; nom: string; description: string; functionCalling: boolean}> | null>(null)
   const [modelesMistralChargement, setModelesMistralChargement] = React.useState(false)
+  const [modeleMistralAutreSelectionne, setModeleMistralAutreSelectionne] = React.useState(false)
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
   const [testing, setTesting] = React.useState(false)
@@ -227,7 +228,7 @@ export function ReglagesChat() {
       return
     }
     const apiKeyInitiale = String(reglagesInitiaux?.["chat.apiKey"]?.valeur ?? "")
-    if (apiKeyInitiale === "" || apiKeyInitiale === valeurMasquee) return
+    if (apiKeyInitiale === "") return
 
     setModelesMistralChargement(true)
     let annule = false
@@ -489,6 +490,10 @@ export function ReglagesChat() {
   const modeleCodexEstAutre =
     modeleCodexAutreSelectionne ||
     (modeleActuel.trim() !== "" && !modeleCodexSlugs.includes(modeleActuel))
+  const modeleMistralSlugs = modelesMistral?.map((modele) => modele.id) ?? []
+  const modeleMistralEstAutre =
+    modeleMistralAutreSelectionne ||
+    (modeleActuel.trim() !== "" && !modeleMistralSlugs.includes(modeleActuel))
   const baseUrl = String(reglages["chat.baseUrl"].valeur)
   const presetBaseUrlCustom = presetsBaseUrlCustom.some((preset) => preset.value === baseUrl)
     ? baseUrl
@@ -528,6 +533,9 @@ export function ReglagesChat() {
                 if (value !== "openai-codex") {
                   arreterPollingCodex()
                   setCodexConnexion(null)
+                }
+                if (value !== "mistral") {
+                  setModeleMistralAutreSelectionne(false)
                 }
                 modifierValeur("chat.provider", value as ChatProvider)
               }}
@@ -600,8 +608,15 @@ export function ReglagesChat() {
             ) : providerValide === "mistral" && modelesMistral && modelesMistral.length > 0 ? (
               <div className="space-y-2">
                 <Select
-                  value={modeleActuel}
-                  onValueChange={(value) => modifierValeur("chat.model", value)}
+                  value={modeleMistralEstAutre ? "autre" : modeleActuel}
+                  onValueChange={(value) => {
+                    if (value === "autre") {
+                      setModeleMistralAutreSelectionne(true)
+                    } else {
+                      setModeleMistralAutreSelectionne(false)
+                      modifierValeur("chat.model", value)
+                    }
+                  }}
                   disabled={saving || testing}
                 >
                   <SelectTrigger id="chat-model">
@@ -619,7 +634,7 @@ export function ReglagesChat() {
                     <SelectItem value="autre">Autre modèle (saisir manuellement)</SelectItem>
                   </SelectContent>
                 </Select>
-                {modeleActuel === "autre" && (
+                {modeleMistralEstAutre && (
                   <Input
                     id="chat-model-autre"
                     type="text"
