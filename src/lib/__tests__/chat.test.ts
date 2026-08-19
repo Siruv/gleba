@@ -160,10 +160,17 @@ describe("service de chat IA", () => {
       "chat.model": "claude-test",
     })
     vi.mocked(fetch).mockResolvedValue(
-      new Response(JSON.stringify({ content: [{ text: "Réponse Anthropic" }] }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      })
+      new Response(
+        JSON.stringify({ 
+          content: [
+            { type: "text", text: "Réponse Anthropic" }
+          ] 
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      )
     )
 
     await expect(envoyerMessageChat([{ role: "user", content: "Bonjour" }])).resolves.toBe(
@@ -186,11 +193,24 @@ describe("service de chat IA", () => {
       "chat.ollamaHost": "http://ollama:11434",
       "chat.model": "glm-test",
     })
-    mocks.ollamaChat.mockResolvedValue({ message: { content: "Réponse Ollama" } })
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify({ message: { role: "assistant", content: "Réponse Ollama" } }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      )
+    )
 
     await expect(envoyerMessageChat([{ role: "user", content: "Bonjour" }])).resolves.toBe(
       "Réponse Ollama"
     )
-    expect(mocks.ollamaChat).toHaveBeenCalled()
+    expect(fetch).toHaveBeenCalledWith(
+      "http://ollama:11434/api/chat",
+      expect.objectContaining({
+        method: "POST",
+      })
+    )
   })
 })

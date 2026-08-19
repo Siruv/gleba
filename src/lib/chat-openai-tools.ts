@@ -17,19 +17,13 @@ type MessageAvecToolCalls = {
   tool_calls?: ToolCallRecu[]
 }
 
-type MessageToolResult = {
-  role: "tool"
-  tool_call_id: string
-  content: string
-}
-
 /** Convertit les outils au format Chat Completions OpenAI */
 export async function outilsFormatOpenAI(): Promise<Array<{
   type: "function"
   function: { name: string; description: string; parameters: Record<string, unknown> }
 }>> {
   const { outilsChat } = await import("@/lib/chat-tools")
-  return outilsChat.map((outil: any) => ({
+  return outilsChat.map((outil) => ({
     type: "function" as const,
     function: {
       name: outil.name,
@@ -53,7 +47,7 @@ export async function envoyerMessageAvecOutils(
   const tools = userId ? await outilsFormatOpenAI() : undefined
 
   // Construire la liste de messages
-  let messagesComplets: Array<Record<string, unknown>> = [
+  const messagesComplets: Array<Record<string, unknown>> = [
     { role: "system", content: systeme },
     ...messages.map((m) => ({ role: m.role, content: m.content })),
   ]
