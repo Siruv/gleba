@@ -39,6 +39,13 @@ type SettingKey =
   | "chat.ollamaHost"
   | "chat.codexAccessToken"
   | "chat.codexRefreshToken"
+
+type ModeleGenerique = {
+  id: string
+  nom: string
+  description: string
+  functionCalling: boolean
+}
 type Reglages = Record<SettingKey, SettingDetails>
 
 const valeurMasquee = "••••••••"
@@ -57,6 +64,8 @@ const providers: Array<{ value: ChatProvider; label: string }> = [
   { value: "custom", label: "Personnalisé (compatible OpenAI)" },
   { value: "openai-codex", label: "ChatGPT (compte OpenAI)" },
 ]
+
+const providersAvecListeGenerique: ChatProvider[] = ["openai", "anthropic", "ollama", "custom"]
 
 const placeholdersModeles: Record<ChatProvider, string> = {
   ollama: "glm-4.7",
@@ -122,6 +131,9 @@ export function ReglagesChat() {
   const [modelesMistral, setModelesMistral] = React.useState<Array<{id: string; nom: string; description: string; functionCalling: boolean}> | null>(null)
   const [modelesMistralChargement, setModelesMistralChargement] = React.useState(false)
   const [modeleMistralAutreSelectionne, setModeleMistralAutreSelectionne] = React.useState(false)
+  const [modelesGeneriques, _setModelesGeneriques] = React.useState<ModeleGenerique[] | null>(null)
+  const [modelesGeneriquesChargement, _setModelesGeneriquesChargement] = React.useState(false)
+  const [modeleGeneriqueAutreSelectionne, setModeleGeneriqueAutreSelectionne] = React.useState(false)
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
   const [testing, setTesting] = React.useState(false)
@@ -242,6 +254,30 @@ export function ReglagesChat() {
       })
       .catch(() => {})
       .finally(() => { if (!annule) setModelesMistralChargement(false) })
+    return () => { annule = true }
+  }, [providerValide, reglagesInitiaux])
+
+  React.useEffect(() => {
+    if (!providersAvecListeGenerique.includes(providerValide)) {
+      _setModelesGeneriques(null)
+      return
+    }
+    const apiKeyInitiale = String(reglagesInitiaux?.["chat.apiKey"]?.valeur ?? "")
+    const baseUrlInitiale = String(reglagesInitiaux?.["chat.baseUrl"]?.valeur ?? "")
+    if (providerValide !== "ollama") {
+      if (apiKeyInitiale === "") return
+      if (providerValide === "custom" && baseUrlInitiale === "") return
+    }
+    _setModelesGeneriquesChargement(true)
+    let annule = false
+    fetch(`/api/admin/chat/models?provider=${providerValide}`, { cache: "no-store" })
+      .then((r) => r.json())
+      .then((data) => {
+        if (annule) return
+        if (data && Array.isArray(data.modeles)) _setModelesGeneriques(data.modeles)
+      })
+      .catch(() => {})
+      .finally(() => { if (!annule) _setModelesGeneriquesChargement(false) })
     return () => { annule = true }
   }, [providerValide, reglagesInitiaux])
 
@@ -494,6 +530,10 @@ export function ReglagesChat() {
   const modeleMistralEstAutre =
     modeleMistralAutreSelectionne ||
     (modeleActuel.trim() !== "" && !modeleMistralSlugs.includes(modeleActuel))
+  const modeleGeneriqueSlugs = modelesGeneriques?.map((modele) => modele.id) ?? []
+  const modeleGeneriqueEstAutre =
+    modeleGeneriqueAutreSelectionne ||
+    (modeleActuel.trim() !== "" && !modeleGeneriqueSlugs.includes(modeleActuel))
   const baseUrl = String(reglages["chat.baseUrl"].valeur)
   const presetBaseUrlCustom = presetsBaseUrlCustom.some((preset) => preset.value === baseUrl)
     ? baseUrl
@@ -586,6 +626,7 @@ export function ReglagesChat() {
                       return (
                         <SelectItem key={modele.slug} value={modele.slug}>
                           {`${modele.displayName} — ${description}`}
+                          <Badge className="ml-2">Tool-calling</Badge>
                         </SelectItem>
                       )
                     })}
@@ -635,6 +676,48 @@ export function ReglagesChat() {
                   </SelectContent>
                 </Select>
                 {modeleMistralEstAutre && (
+                  <Input
+                    id="chat-model-autre"
+                    type="text"
+                    placeholder={placeholdersModeles[providerValide]}
+                    value={modeleActuel}
+                    onChange={(event) => modifierValeur("chat.model", event.target.value)}
+                    disabled={saving || testing}
+                  />
+                )}
+              </div>
+            ) : providersAvecListeGenerique.includes(providerValide) && modelesGeneriquesChargement ? (
+              <p className="text-sm text-muted-foreground">Chargement des modèles disponibles…</p>
+            ) : providersAvecListeGenerique.includes(providerValide) && modelesGeneriques && modelesGeneriques.length > 0 ? (
+              <div className="space-y-2">
+                <Select
+                  value={modeleGeneriqueEstAutre ? "autre" : modeleActuel}
+                  onValueChange={(value) => {
+                    if (value === "autre") {
+                      setModeleGeneriqueAutreSelectionne(true)
+                    } else {
+                      setModeleGeneriqueAutreSelectionne(false)
+                      modifierValeur("chat.model", value)
+                    }
+                  }}
+                  disabled={saving || testing}
+                >
+                  <SelectTrigger id="chat-model">
+                    <SelectValue placeholder="Choisir un modèle" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {modelesGeneriques.map((modele) => (
+                      <SelectItem key={modele.id} value={modele.id}>
+                        {modele.nom}
+                        {modele.functionCalling && (
+                          <Badge className="ml-2">Tool-calling</Badge>
+                        )}
+                      </SelectItem>
+                    ))}
+                    <SelectItem value="autre">Autre modèle (saisir manuellement)</SelectItem>
+                  </SelectContent>
+                </Select>
+                {modeleGeneriqueEstAutre && (
                   <Input
                     id="chat-model-autre"
                     type="text"
