@@ -21,6 +21,67 @@ export interface OutilChat {
 }
 
 // ============================================================
+// HELPERS
+// ============================================================
+
+/**
+ * Résout une espèce par son nom pour les outils d'écriture.
+ * Cherche d'abord une correspondance exacte (insensible à la casse),
+ * puis une correspondance partielle. Retourne l'id de l'espèce ou une erreur.
+ */
+async function resoudreEspeceParNom(
+  nom: string,
+  userId: string
+): Promise<{ especeId?: string; erreur?: string }> {
+  const nomRecherche = nom.trim()
+  if (nomRecherche === "") {
+    return { erreur: "Le nom de l'espèce est vide." }
+  }
+
+  // 1. Correspondance exacte (insensible à la casse)
+  const exactes = await prisma.espece.findMany({
+    where: {
+      nom: { equals: nomRecherche, mode: "insensitive" },
+      OR: [{ userId }, { userId: null }],
+    },
+    select: { id: true, nom: true, userId: true },
+    take: 5,
+  })
+  if (exactes.length === 1) {
+    return { especeId: exactes[0].id }
+  }
+  if (exactes.length > 1) {
+    // Priorité à l'espèce perso de l'utilisateur
+    const perso = exactes.find((e) => e.userId === userId)
+    if (perso) return { especeId: perso.id }
+    return {
+      erreur: `Plusieurs espèces correspondent à "${nomRecherche}". Précisez le nom exact.`,
+    }
+  }
+
+  // 2. Correspondance partielle
+  const partielles = await prisma.espece.findMany({
+    where: {
+      nom: { contains: nomRecherche, mode: "insensitive" },
+      OR: [{ userId }, { userId: null }],
+    },
+    select: { id: true, nom: true, userId: true },
+    take: 6,
+  })
+  if (partielles.length === 1) {
+    return { especeId: partielles[0].id }
+  }
+  if (partielles.length > 1) {
+    const suggestions = partielles.map((e) => e.nom).join(", ")
+    return {
+      erreur: `Plusieurs espèces correspondent à "${nomRecherche}" : ${suggestions}. Précisez le nom.`,
+    }
+  }
+
+  return { erreur: `Aucune espèce trouvée pour "${nomRecherche}".` }
+}
+
+// ============================================================
 // OUTILS DISPONIBLES
 // ============================================================
 
@@ -435,6 +496,303 @@ export const outilsChat: OutilChat[] = [
         }
       } catch {
         return { erreur: "Impossible de récupérer les statistiques" }
+      }
+    },
+  },
+  {
+    name: "create_intervention",
+    description:
+      "Crée une tâche / intervention dans le jardin (semis, plantation, désherbage, arrosage, récolte, taille, etc.). Utilise cet outil quand l'utilisateur demande de créer, planifier ou enregistrer une tâche ou une action à faire.",
+    parameters: {
+      type: "object",
+      properties: {
+        type: {
+          type: "string",
+          enum: [
+            "semis",
+            "plantation",
+            "desherbage",
+            "binage",
+            "paillage",
+            "traitement_phyto",
+            "fertilisation",
+            "recolte",
+            "taille",
+            "arrosage",
+            "tuteurage",
+            "autre",
+          ],
+          description: "Type d'intervention",
+        },
+        description: {
+          type: "string",
+          description: "Description de la tâche (ex: 'Arroser les tomates de la serre')",
+        },
+        date: {
+          type: "string",
+          description: "Date de l'intervention au format ISO (ex: '2026-08-20'). Si omis, la date du jour est utilisée.",
+        },
+        datePrevue: {
+          type: "string",
+          description: "Date prévue (pour une tâche à faire plus tard) au format ISO",
+        },
+        fait: {
+          type: "boolean",
+          description: "true si la tâche est déjà faite, false si elle est à faire (défaut: true)",
+        },
+        dureeMinutes: {
+          type: "number",
+          description: "Durée estimée ou passée en minutes",
+        },
+      },
+      required: ["type"],
+    },
+    handler: async (args: Record<string, unknown>, userId: string) => {
+      try {
+        const type = String(args.type ?? "")
+        const typesValides = [
+          "semis", "plantation", "desherbage", "binage", "paillage",
+          "traitement_phyto", "fertilisation", "recolte", "taille",
+          "arrosage", "tuteurage", "autre",
+        ]
+        if (!typesValides.includes(type)) {
+          return { erreur: `Type d'intervention invalide : "${type}". Types acceptés : ${typesValides.join(", ")}.` }
+        }
+
+        const donnees: Record<string, unknown> = {
+          userId,
+          type,
+          fait: args.fait === undefined ? true : Boolean(args.fait),
+        }
+        if (args.description) donnees.description = String(args.description)
+        if (args.date) {
+          const dateParsee = new Date(String(args.date))
+          if (!Number.isNaN(dateParsee.getTime())) donnees.date = dateParsee
+        }
+        if (args.datePrevue) {
+          const datePrevueParsee = new Date(String(args.datePrevue))
+          if (!Number.isNaN(datePrevueParsee.getTime())) donnees.datePrevue = datePrevueParsee
+        }
+        if (args.dureeMinutes !== undefined) {
+          donnees.dureeMinutes = Number(args.dureeMinutes)
+        }
+
+        const intervention = await prisma.intervention.create({
+          data: donnees as never,
+        })
+
+        return {
+          succes: true,
+          message: `Intervention "${type}" créée (id ${intervention.id}).`,
+          intervention: {
+            id: intervention.id,
+            type: intervention.type,
+            description: intervention.description,
+            date: intervention.date,
+            fait: intervention.fait,
+          },
+        }
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
+        return { erreur: `Impossible de créer l'intervention : ${message}` }
+      }
+    },
+  },
+  {
+    name: "create_culture",
+    description:
+      "Crée une nouvelle culture (un semis ou une plantation planifié) pour une espèce donnée. Utilise cet outil quand l'utilisateur veut ajouter une culture, semer ou planter une espèce. L'espèce peut être donnée par son nom (ex: 'tomate') ou par son id.",
+    parameters: {
+      type: "object",
+      properties: {
+        especeNom: {
+          type: "string",
+          description: "Nom de l'espèce (ex: 'tomate', 'carotte'). Utilisé si especeId n'est pas fourni.",
+        },
+        especeId: {
+          type: "string",
+          description: "ID de l'espèce (si déjà connu). Prioritaire sur especeNom.",
+        },
+        annee: {
+          type: "number",
+          description: "Année de planification (ex: 2026). Si omis, l'année courante est utilisée.",
+        },
+        dateSemis: {
+          type: "string",
+          description: "Date du semis au format ISO (ex: '2026-08-20')",
+        },
+        datePlantation: {
+          type: "string",
+          description: "Date de plantation au format ISO",
+        },
+        dateRecolte: {
+          type: "string",
+          description: "Date de récolte prévue au format ISO",
+        },
+        quantite: {
+          type: "number",
+          description: "Surface (m²) ou nombre de plants",
+        },
+        semisFait: {
+          type: "boolean",
+          description: "true si le semis est déjà réalisé (défaut: false)",
+        },
+        plantationFaite: {
+          type: "boolean",
+          description: "true si la plantation est déjà réalisée (défaut: false)",
+        },
+      },
+    },
+    handler: async (args: Record<string, unknown>, userId: string) => {
+      try {
+        // Résolution de l'espèce
+        let especeId = args.especeId ? String(args.especeId) : ""
+        if (especeId === "") {
+          const especeNom = args.especeNom ? String(args.especeNom) : ""
+          if (especeNom === "") {
+            return { erreur: "Indiquez l'espèce (especeNom ou especeId)." }
+          }
+          const resolution = await resoudreEspeceParNom(especeNom, userId)
+          if (resolution.erreur) return { erreur: resolution.erreur }
+          especeId = resolution.especeId!
+        }
+
+        const donnees: Record<string, unknown> = {
+          userId,
+          especeId,
+          annee: args.annee !== undefined ? Number(args.annee) : new Date().getFullYear(),
+          semisFait: args.semisFait === true,
+          plantationFaite: args.plantationFaite === true,
+        }
+        if (args.dateSemis) {
+          const d = new Date(String(args.dateSemis))
+          if (!Number.isNaN(d.getTime())) donnees.dateSemis = d
+        }
+        if (args.datePlantation) {
+          const d = new Date(String(args.datePlantation))
+          if (!Number.isNaN(d.getTime())) donnees.datePlantation = d
+        }
+        if (args.dateRecolte) {
+          const d = new Date(String(args.dateRecolte))
+          if (!Number.isNaN(d.getTime())) donnees.dateRecolte = d
+        }
+        if (args.quantite !== undefined) {
+          donnees.quantite = Number(args.quantite)
+        }
+
+        const culture = await prisma.culture.create({
+          data: donnees as never,
+          include: { espece: { select: { nom: true } } },
+        })
+
+        return {
+          succes: true,
+          message: `Culture "${culture.espece?.nom ?? especeId}" créée (id ${culture.id}).`,
+          culture: {
+            id: culture.id,
+            espece: culture.espece?.nom ?? especeId,
+            annee: culture.annee,
+            dateSemis: culture.dateSemis,
+            datePlantation: culture.datePlantation,
+            semisFait: culture.semisFait,
+            plantationFaite: culture.plantationFaite,
+          },
+        }
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
+        return { erreur: `Impossible de créer la culture : ${message}` }
+      }
+    },
+  },
+  {
+    name: "update_culture",
+    description:
+      "Met à jour l'état d'une culture existante : marquer le semis fait, la plantation faite, la récolte faite, ou modifier les dates et quantités. Utilise cet outil quand l'utilisateur dit qu'il a semé, planté ou récolté, ou qu'il veut corriger une culture.",
+    parameters: {
+      type: "object",
+      properties: {
+        cultureId: {
+          type: "number",
+          description: "ID de la culture à mettre à jour (obligatoire)",
+        },
+        semisFait: {
+          type: "boolean",
+          description: "true pour marquer le semis comme fait",
+        },
+        plantationFaite: {
+          type: "boolean",
+          description: "true pour marquer la plantation comme faite",
+        },
+        recolteFaite: {
+          type: "boolean",
+          description: "true pour marquer la récolte comme faite",
+        },
+        dateSemis: { type: "string", description: "Nouvelle date de semis au format ISO" },
+        datePlantation: { type: "string", description: "Nouvelle date de plantation au format ISO" },
+        dateRecolte: { type: "string", description: "Nouvelle date de récolte au format ISO" },
+        quantite: { type: "number", description: "Nouvelle quantité (surface m² ou nb plants)" },
+      },
+      required: ["cultureId"],
+    },
+    handler: async (args: Record<string, unknown>, userId: string) => {
+      try {
+        const cultureId = Number(args.cultureId)
+        if (!Number.isFinite(cultureId) || cultureId <= 0) {
+          return { erreur: "cultureId invalide." }
+        }
+
+        // Vérifier que la culture appartient bien à l'utilisateur
+        const existante = await prisma.culture.findFirst({
+          where: { id: cultureId, userId },
+          select: { id: true },
+        })
+        if (!existante) {
+          return { erreur: `Culture ${cultureId} introuvable ou n'appartient pas à l'utilisateur.` }
+        }
+
+        const donnees: Record<string, unknown> = {}
+        if (args.semisFait !== undefined) donnees.semisFait = Boolean(args.semisFait)
+        if (args.plantationFaite !== undefined) donnees.plantationFaite = Boolean(args.plantationFaite)
+        if (args.recolteFaite !== undefined) donnees.recolteFaite = Boolean(args.recolteFaite)
+        if (args.quantite !== undefined) donnees.quantite = Number(args.quantite)
+        for (const [cle, valeur] of Object.entries({
+          dateSemis: args.dateSemis,
+          datePlantation: args.datePlantation,
+          dateRecolte: args.dateRecolte,
+        })) {
+          if (valeur) {
+            const d = new Date(String(valeur))
+            if (!Number.isNaN(d.getTime())) donnees[cle] = d
+          }
+        }
+
+        if (Object.keys(donnees).length === 0) {
+          return { erreur: "Aucun champ à mettre à jour." }
+        }
+
+        const culture = await prisma.culture.update({
+          where: { id: cultureId },
+          data: donnees as never,
+          include: { espece: { select: { nom: true } } },
+        })
+
+        return {
+          succes: true,
+          message: `Culture "${culture.espece?.nom ?? ""}" (id ${culture.id}) mise à jour.`,
+          culture: {
+            id: culture.id,
+            espece: culture.espece?.nom,
+            semisFait: culture.semisFait,
+            plantationFaite: culture.plantationFaite,
+            recolteFaite: culture.recolteFaite,
+            dateSemis: culture.dateSemis,
+            datePlantation: culture.datePlantation,
+            dateRecolte: culture.dateRecolte,
+          },
+        }
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
+        return { erreur: `Impossible de mettre à jour la culture : ${message}` }
       }
     },
   },
