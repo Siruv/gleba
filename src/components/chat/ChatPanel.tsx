@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react"
 import { Bot, Maximize2, Minimize2, Send, X } from "lucide-react"
+import ReactMarkdown from "react-markdown"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -26,6 +27,14 @@ const suggestions = [
   "Quand récolter mes cultures ?",
   "Résumé de ma comptabilité",
 ]
+
+function MessageMarkdown({ contenu }: { contenu: string }) {
+  return (
+    <div className="text-sm leading-relaxed [&_p]:my-1 [&_ul]:my-1 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:my-1 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-0.5 [&_h1]:text-base [&_h1]:font-bold [&_h1]:my-2 [&_h2]:text-sm [&_h2]:font-bold [&_h2]:my-2 [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:my-1.5 [&_strong]:font-semibold [&_em]:italic [&_code]:rounded [&_code]:bg-slate-200 [&_code]:px-1 [&_code]:text-xs [&_pre]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:bg-slate-800 [&_pre]:p-2 [&_pre]:text-xs [&_pre]:text-slate-100 [&_a]:text-emerald-700 [&_a]:underline [&_blockquote]:my-1 [&_blockquote]:border-l-2 [&_blockquote]:border-slate-300 [&_blockquote]:pl-2 [&_table]:my-2 [&_table]:w-full [&_table]:text-xs [&_th]:border [&_th]:border-slate-300 [&_th]:px-2 [&_th]:py-1 [&_td]:border [&_td]:border-slate-300 [&_td]:px-2 [&_td]:py-1">
+      <ReactMarkdown>{contenu}</ReactMarkdown>
+    </div>
+  )
+}
 
 const messageErreurReseau =
   "Impossible de joindre l'assistant IA pour le moment. Vérifiez votre connexion puis réessayez."
@@ -216,7 +225,11 @@ export function ChatPanel({
                         : "bg-slate-100 text-slate-800"
                   }`}
                 >
-                  <p className="whitespace-pre-wrap text-sm leading-relaxed">{message.content}</p>
+                  {message.role === "assistant" && !message.error ? (
+                    <MessageMarkdown contenu={message.content} />
+                  ) : (
+                    <p className="whitespace-pre-wrap text-sm leading-relaxed">{message.content}</p>
+                  )}
                 </div>
               </div>
             ))

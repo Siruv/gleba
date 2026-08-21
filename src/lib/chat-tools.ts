@@ -8,6 +8,11 @@
 import prisma from "@/lib/prisma"
 import { fetchOpenMeteoForecast } from "@/lib/meteo"
 import type { Prisma } from "@prisma/client"
+import { createPlancheSchema } from "@/lib/validations/planche"
+import { createVarieteSchema } from "@/lib/validations/variete"
+import { cleanReferentielName, normalizeVarieteName } from "@/lib/normalize"
+import { attributionCreation } from "@/lib/referentiel-communaute"
+import { invalidateKpi } from "@/lib/kpi"
 
 // ============================================================
 // INTERFACES
@@ -793,6 +798,300 @@ export const outilsChat: OutilChat[] = [
       } catch (caughtError) {
         const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
         return { erreur: `Impossible de mettre à jour la culture : ${message}` }
+      }
+    },
+  },
+  {
+    name: "create_planche",
+    description: "Crée une nouvelle planche de culture. Supprime définitivement les données existantes si une planche du même nom existe déjà.",
+    parameters: {
+      type: "object",
+      properties: {
+        nom: { type: "string", description: "Nom de la planche (obligatoire)" },
+        largeur: { type: "number", description: "Largeur en mètres" },
+        longueur: { type: "number", description: "Longueur en mètres" },
+        surface: { type: "number", description: "Surface en m² (calculée automatiquement si largeur et longueur sont fournies)" },
+        type: { type: "string", description: "Type de planche (Serre, Plein champ, Tunnel, Chassis)" },
+        irrigation: { type: "string", description: "Type d'irrigation" },
+        ilot: { type: "string", description: "Nom de l'ilot ou de la parcelle" },
+        parcelleGeoId: { type: "string", description: "ID de la parcelle géographique" },
+        notes: { type: "string", description: "Notes supplémentaires" },
+        posX: { type: "number", description: "Position X pour le placement" },
+        posY: { type: "number", description: "Position Y pour le placement" },
+      },
+      required: ["nom"],
+    },
+    handler: async (args: Record<string, unknown>, userId: string) => {
+      try {
+        const validation = createPlancheSchema.safeParse(args)
+        if (!validation.success) {
+          return { erreur: validation.error.issues.map((e) => e.message).join(", ") }
+        }
+
+        const nom = String(args.nom)
+        const existante = await prisma.planche.findUnique({
+          where: { nom_userId: { nom, userId } },
+        })
+        if (existante) {
+          return { erreur: `La planche "${nom}" existe déjà.` }
+        }
+
+        const largeur = args.largeur !== undefined ? Number(args.largeur) : null
+        const longueur = args.longueur !== undefined ? Number(args.longueur) : null
+        let surface = args.surface !== undefined ? Number(args.surface) : null
+        if (largeur !== null && longueur !== null && largeur > 0 && longueur > 0) {
+          surface = largeur * longueur
+        }
+
+        const data: Record<string, unknown> = {
+          nom,
+          userId,
+          surface,
+        }
+        if (args.type) data.type = String(args.type)
+        if (args.irrigation) data.irrigation = String(args.irrigation)
+        if (args.ilot) data.ilot = String(args.ilot)
+        if (args.parcelleGeoId) data.parcelleGeoId = String(args.parcelleGeoId)
+        if (args.notes) data.notes = String(args.notes)
+        if (args.posX !== undefined) data.posX = Number(args.posX)
+        if (args.posY !== undefined) data.posY = Number(args.posY)
+
+        const planche = await prisma.planche.create({
+          data: data as never,
+        })
+
+        await invalidateKpi(userId)
+        return { succes: true, planche: { id: planche.id, nom: planche.nom, surface: planche.surface, type: planche.type, ilot: planche.ilot } }
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
+        return { erreur: `Impossible de créer la planche : ${message}` }
+      }
+    },
+  },
+  {
+    name: "delete_planche",
+    description: "Supprime définitivement une planche de culture par son nom. Vérifie qu'aucune culture n'est liée avant suppression.",
+    parameters: {
+      type: "object",
+      properties: {
+        nom: { type: "string", description: "Nom de la planche à supprimer (obligatoire)" },
+      },
+      required: ["nom"],
+    },
+    handler: async (args: Record<string, unknown>, userId: string) => {
+      try {
+        const nom = String(args.nom)
+        const planche = await prisma.planche.findUnique({
+          where: { nom_userId: { nom, userId } },
+          include: { _count: { select: { cultures: true } } },
+        })
+        if (!planche) {
+          return { erreur: `Planche "${nom}" non trouvée.` }
+        }
+        if (planche._count.cultures > 0) {
+          return { erreur: `Impossible de supprimer la planche "${nom}" car elle a ${planche._count.cultures} culture(s) liée(s).` }
+        }
+        await prisma.planche.delete({ where: { id: planche.id } })
+        await invalidateKpi(userId)
+        return { succes: true, supprimee: nom }
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
+        return { erreur: `Impossible de supprimer la planche : ${message}` }
+      }
+    },
+  },
+  {
+    name: "create_objet_jardin",
+    description: "Crée un nouvel objet dans le jardin (allée, passage, bordure, serre, compost, etc.).",
+    parameters: {
+      type: "object",
+      properties: {
+        type: { type: "string", description: "Type d'objet (allee, passage, bordure, serre, compost, autre)", enum: ["allee", "passage", "bordure", "serre", "compost", "autre"] },
+        nom: { type: "string", description: "Nom de l'objet" },
+        largeur: { type: "number", description: "Largeur en mètres (obligatoire)" },
+        longueur: { type: "number", description: "Longueur en mètres (obligatoire)" },
+        posX: { type: "number", description: "Position X (obligatoire)" },
+        posY: { type: "number", description: "Position Y (obligatoire)" },
+        parcelleGeoId: { type: "string", description: "ID de la parcelle géographique" },
+        couleur: { type: "string", description: "Couleur de l'objet" },
+        notes: { type: "string", description: "Notes supplémentaires" },
+      },
+      required: ["type", "largeur", "longueur", "posX", "posY"],
+    },
+    handler: async (args: Record<string, unknown>, userId: string) => {
+      try {
+        const type = String(args.type)
+        const typesValides = ["allee", "passage", "bordure", "serre", "compost", "autre"]
+        if (!typesValides.includes(type)) {
+          return { erreur: `Type d'objet invalide : "${type}". Types acceptés : ${typesValides.join(", ")}.` }
+        }
+        const largeur = Number(args.largeur)
+        const longueur = Number(args.longueur)
+        const posX = Number(args.posX)
+        const posY = Number(args.posY)
+        if (largeur <= 0 || longueur <= 0) {
+          return { erreur: "Largeur et longueur doivent être positives." }
+        }
+        const data: Record<string, unknown> = {
+          type,
+          largeur,
+          longueur,
+          posX,
+          posY,
+          userId,
+        }
+        if (args.nom) data.nom = String(args.nom)
+        if (args.parcelleGeoId) data.parcelleGeoId = String(args.parcelleGeoId)
+        if (args.couleur) data.couleur = String(args.couleur)
+        if (args.notes) data.notes = String(args.notes)
+        const objet = await prisma.objetJardin.create({ data: data as never })
+        return { succes: true, objet: { id: objet.id, nom: objet.nom, type: objet.type, largeur: objet.largeur, longueur: objet.longueur } }
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
+        return { erreur: `Impossible de créer l'objet jardin : ${message}` }
+      }
+    },
+  },
+  {
+    name: "delete_objet_jardin",
+    description: "Supprime définitivement un objet du jardin par son ID.",
+    parameters: {
+      type: "object",
+      properties: {
+        objetId: { type: "number", description: "ID de l'objet à supprimer (obligatoire)" },
+      },
+      required: ["objetId"],
+    },
+    handler: async (args: Record<string, unknown>, userId: string) => {
+      try {
+        const objetId = Number(args.objetId)
+        const objet = await prisma.objetJardin.findUnique({ where: { id: objetId, userId } })
+        if (!objet) {
+          return { erreur: "Objet non trouvé." }
+        }
+        await prisma.objetJardin.delete({ where: { id: objetId } })
+        return { succes: true }
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
+        return { erreur: `Impossible de supprimer l'objet jardin : ${message}` }
+      }
+    },
+  },
+  {
+    name: "create_variete_perso",
+    description: "Crée une nouvelle variété personnelle pour une espèce donnée. Supprime définitivement les données existantes si une variété du même nom existe déjà pour cette espèce.",
+    parameters: {
+      type: "object",
+      properties: {
+        nom: { type: "string", description: "Nom de la variété (obligatoire)" },
+        especeNom: { type: "string", description: "Nom de l'espèce parente (ex: Tomate) (obligatoire)" },
+        bio: { type: "boolean", description: "Variété bio" },
+        description: { type: "string", description: "Description de la variété" },
+        semaineRecolte: { type: "number", description: "Semaine de récolte" },
+        dureeRecolte: { type: "number", description: "Durée de récolte en semaines" },
+      },
+      required: ["nom", "especeNom"],
+    },
+    handler: async (args: Record<string, unknown>, userId: string) => {
+      try {
+        const especeNom = String(args.especeNom)
+        const resolution = await resoudreEspeceParNom(especeNom, userId)
+        if (resolution.erreur) {
+          return { erreur: resolution.erreur }
+        }
+        const especeId = resolution.especeId!
+        const nomSaisi = cleanReferentielName(String(args.nom))
+        const nomNormalise = normalizeVarieteName(nomSaisi)
+        const existante = await prisma.variete.findFirst({
+          where: { especeId, nomNormalise, userId },
+        })
+        if (existante) {
+          return { erreur: `La variété "${nomSaisi}" existe déjà pour l'espèce "${especeNom}".` }
+        }
+        const data: Record<string, unknown> = {
+          nom: nomSaisi,
+          nomNormalise,
+          especeId,
+          userId,
+          partageCommunaute: false,
+        }
+        if (args.bio === true) data.bio = true
+        if (args.description) data.description = String(args.description)
+        if (args.semaineRecolte !== undefined) data.semaineRecolte = Number(args.semaineRecolte)
+        if (args.dureeRecolte !== undefined) data.dureeRecolte = Number(args.dureeRecolte)
+        const variete = await prisma.variete.create({ data: data as never })
+        return { succes: true, variete: { id: variete.id, nom: variete.nom, especeId: variete.especeId } }
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
+        return { erreur: `Impossible de créer la variété : ${message}` }
+      }
+    },
+  },
+  {
+    name: "delete_variete_perso",
+    description: "Supprime définitivement une variété personnelle par son ID. Vérifie que l'utilisateur est bien le propriétaire.",
+    parameters: {
+      type: "object",
+      properties: {
+        varieteId: { type: "string", description: "ID de la variété à supprimer (obligatoire)" },
+      },
+      required: ["varieteId"],
+    },
+    handler: async (args: Record<string, unknown>, userId: string) => {
+      try {
+        const varieteId = String(args.varieteId)
+        const variete = await prisma.variete.findUnique({ where: { id: varieteId } })
+        if (!variete) {
+          return { erreur: "Variété non trouvée." }
+        }
+        if (variete.userId !== userId) {
+          return { erreur: "Vous ne pouvez supprimer que vos propres variétés." }
+        }
+        await prisma.variete.delete({ where: { id: varieteId } })
+        return { succes: true }
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
+        return { erreur: `Impossible de supprimer la variété : ${message}` }
+      }
+    },
+  },
+  {
+    name: "delete_culture",
+    description: "Supprime définitivement une culture par son ID. Supprime également les ventes automatiques liées aux récoltes de cette culture.",
+    parameters: {
+      type: "object",
+      properties: {
+        cultureId: { type: "number", description: "ID de la culture à supprimer (obligatoire)" },
+      },
+      required: ["cultureId"],
+    },
+    handler: async (args: Record<string, unknown>, userId: string) => {
+      try {
+        const cultureId = Number(args.cultureId)
+        const culture = await prisma.culture.findUnique({ where: { id: cultureId, userId } })
+        if (!culture) {
+          return { erreur: "Culture non trouvée." }
+        }
+        const recoltes = await prisma.recolte.findMany({
+          where: { cultureId, userId },
+          select: { id: true },
+        })
+        await prisma.$transaction(async (tx) => {
+          if (recoltes.length > 0) {
+            await tx.venteManuelle.deleteMany({
+              where: {
+                sourceType: "recolte",
+                sourceId: { in: recoltes.map((r) => r.id) },
+                auto: true,
+              },
+            })
+          }
+          await tx.culture.delete({ where: { id: cultureId } })
+        })
+        return { succes: true, supprimee: cultureId }
+      } catch (caughtError) {
+        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
+        return { erreur: `Impossible de supprimer la culture : ${message}` }
       }
     },
   },
