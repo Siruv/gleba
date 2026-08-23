@@ -36,6 +36,11 @@ npx tsx prisma/seed-races.ts 2>/dev/null || echo "Breeds seed skipped"
 echo "==> Seeding geographic referential (outre-mer species/ITP, idempotent)..."
 npx tsx prisma/seed-referentiel-geographique.ts 2>/dev/null || echo "Geographic referential seed skipped"
 
+echo "==> Seeding verger referential (bioagresseurs, porte-greffes, essences bocageres, idempotent)..."
+npx tsx scripts/seed-referentiel-verger.ts 2>/dev/null || echo "Verger referential seed skipped"
+echo "==> Seeding associations referential (idempotent)..."
+npx tsx scripts/seed-associations.ts 2>/dev/null || echo "Associations seed skipped"
+
 echo "==> Checking data migration v1.0.0..."
 if [ -f "especes_enriched.csv" ]; then
   # Feedback Marc 2026-05-16 — V3 Bug 2 : on n'utilise plus `--force`

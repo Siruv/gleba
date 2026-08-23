@@ -80,10 +80,27 @@ async function importEspeces(file: string) {
 
   const data = parseCSV(file)
   let updated = 0
+  let created = 0
   let skipped = 0
 
   for (const row of data) {
     try {
+      const existing = await prisma.espece.findUnique({ where: { id: row.id } })
+      if (!existing) {
+        await prisma.espece.create({
+          data: {
+            id: row.id,
+            nom: row.id,
+            familleId: row.famille || null,
+            type: row.type || "legume",
+            nomLatin: row.nomLatin || null,
+            description: row.description_AI || null,
+          }
+        })
+        created++
+        console.log(`✨ ${row.id} créée`)
+        continue
+      }
       const updateData: any = {}
       let hasUpdates = false
 
@@ -175,10 +192,30 @@ async function importITPs(file: string) {
 
   const data = parseCSV(file)
   let updated = 0
+  let created = 0
   let skipped = 0
 
   for (const row of data) {
     try {
+      const existing = await prisma.iTP.findUnique({ where: { id: row.id } })
+      if (!existing) {
+        const espece = await prisma.espece.findUnique({ where: { id: row.espece } })
+        if (!espece) {
+          console.warn(`⚠️  Espèce non trouvée: ${row.espece}, skip ITP ${row.id}`)
+          continue
+        }
+
+        await prisma.iTP.create({
+          data: {
+            id: row.id,
+            especeId: row.espece,
+            notes: row.notes || null,
+          }
+        })
+        created++
+        console.log(`✨ ${row.id} créé`)
+        continue
+      }
       const updateData: any = {}
       let hasUpdates = false
 
@@ -254,10 +291,33 @@ async function importVarietes(file: string) {
 
   const data = parseCSV(file)
   let updated = 0
+  let created = 0
   let skipped = 0
 
   for (const row of data) {
     try {
+      const existing = await prisma.variete.findUnique({ where: { id: row.id } })
+      if (!existing) {
+        const espece = await prisma.espece.findUnique({ where: { id: row.espece } })
+        if (!espece) {
+          console.warn(`⚠️  Espèce non trouvée: ${row.espece}, skip variete ${row.id}`)
+          continue
+        }
+
+        await prisma.variete.create({
+          data: {
+            id: row.id,
+            nom: row.id,
+            especeId: row.espece,
+            nomNormalise: row.id.toLowerCase(),
+            isPlaceholder: false,
+            description: row.description_AI || null,
+          }
+        })
+        created++
+        console.log(`✨ ${row.id} créée`)
+        continue
+      }
       const updateData: any = {}
       let hasUpdates = false
 
