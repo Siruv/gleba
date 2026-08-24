@@ -136,6 +136,7 @@ export async function POST(request: NextRequest) {
   await mkdir(dir, { recursive: true })
   const fichier = `${key}.${ext}`
   const buffer = Buffer.from(await (file as Blob).arrayBuffer())
+  /* turbopackIgnore: true */
   await writeFile(path.join(dir, fichier), buffer)
 
   const existing = await prisma.fondPlan.findUnique({
