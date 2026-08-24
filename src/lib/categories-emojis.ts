@@ -33,6 +33,11 @@ export const ESPECE_NAME_EMOJIS: Record<string, string> = {
   'cerise': '🍒',
   'framboise': '🍇',
   'menthe': '🌿',
+  'abricotier': '🍑',
+  'aubergine': '🍆',
+  'melon': '🍈',
+  'courgette': '🥒',
+  'concombre': '🥒',
 }
 
 /**
@@ -49,7 +54,15 @@ export function getCategorieEmoji(categorie: string | null | undefined): string 
  * Retourne l'emoji pour une espece donnee (nom + categorie)
  */
 export function getEspeceEmoji(nom: string | null | undefined, categorie: string | null | undefined): string {
-  // 1. Essayer de matcher par nom d'espece d'abord (spécifique)
+  // 1. Catégorie prioritaire pour fruits
+  if (categorie) {
+    const catKey = categorie.toLowerCase().trim()
+    if (catKey === 'fruit' || catKey === 'fruit_legume') {
+        return '🍎'
+    }
+  }
+
+  // 2. Essayer de matcher par nom d'espece
   if (nom) {
     const nomKey = nom.toLowerCase().trim()
     for (const [key, emoji] of Object.entries(ESPECE_NAME_EMOJIS)) {
@@ -57,7 +70,7 @@ export function getEspeceEmoji(nom: string | null | undefined, categorie: string
     }
   }
 
-  // 2. Fallback sur categorie
+  // 3. Fallback sur categorie
   if (!categorie) return ''
   const key = categorie.toLowerCase().trim()
   const normalized = key.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
