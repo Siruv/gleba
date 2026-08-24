@@ -71,16 +71,6 @@ const ESPECE_TYPES_ARBRES = [
   { value: 'petit_fruit', label: 'Petits fruits', icon: Cherry },
 ] as const
 
-// Labels pour l'affichage (réf. Ticket FB-E33FAA)
-const TYPE_LABELS: Record<string, string> = {
-  legume: 'Légume',
-  fleur: 'Fleur',
-  arbre_fruitier: 'Arbre fruitier',
-  petit_fruit: 'Petit fruit',
-  aromatique: 'Aromatique',
-  engrais_vert: 'Engrais vert',
-}
-
 // Type pour les especes avec relations
 interface EspeceWithRelations {
   id: string
