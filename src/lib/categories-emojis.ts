@@ -36,6 +36,16 @@ export const ESPECE_NAME_EMOJIS: Record<string, string> = {
 }
 
 /**
+ * Retourne l'emoji pour une categorie donnee
+ */
+export function getCategorieEmoji(categorie: string | null | undefined): string {
+  if (!categorie) return ''
+  const key = categorie.toLowerCase().trim()
+  const normalized = key.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  return CATEGORIES_EMOJIS[key] || CATEGORIES_EMOJIS[normalized] || ''
+}
+
+/**
  * Retourne l'emoji pour une espece donnee (nom + categorie)
  */
 export function getEspeceEmoji(nom: string | null | undefined, categorie: string | null | undefined): string {

@@ -14,7 +14,7 @@ import { DataTable } from "@/components/tables/DataTable"
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useToast } from "@/hooks/use-toast"
-import { getCategorieEmoji } from "@/lib/categories-emojis"
+import { getEspeceEmoji } from "@/lib/categories-emojis"
 import {
   makeOrigineColumn,
   useReferentielActions,
@@ -85,7 +85,7 @@ const columns: ColumnDef<EspeceWithRelations>[] = [
     cell: ({ row }) => {
       const espece = row.original
       const couleur = espece.couleur || espece.famille?.couleur || "#888888"
-      const emoji = getCategorieEmoji(espece.categorie)
+      const emoji = getEspeceEmoji(espece.nom, espece.categorie)
       return (
         <div className="flex items-center gap-2">
           {emoji ? (

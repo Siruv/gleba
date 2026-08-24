@@ -5,7 +5,7 @@
 # ==========================================
 FROM node:20-alpine AS deps
 
-RUN apk add --no-cache libc6-compat
+RUN apk add --no-cache libc6-compat g++ make python3
 
 WORKDIR /app
 
