@@ -38,6 +38,7 @@ export const ESPECE_NAME_EMOJIS: Record<string, string> = {
   'melon': '🍈',
   'courgette': '🥒',
   'concombre': '🥒',
+  'patate douce': '🍠',
 }
 
 /**

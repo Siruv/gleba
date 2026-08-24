@@ -54,5 +54,8 @@ else
   echo "No enriched CSV files found, skipping data migration"
 fi
 
+echo "==> Fixing espece types (idempotent)..."
+npx tsx scripts/fix-especes-types.ts 2>/dev/null || echo "Fix especes types skipped"
+
 echo "==> Starting application..."
 exec node server.js
