@@ -1,5 +1,5 @@
 /**
- * Mapping des categories d'especes vers emojis botaniques
+ * Mapping des categories et noms d'especes vers emojis botaniques
  */
 
 export const CATEGORIES_EMOJIS: Record<string, string> = {
@@ -18,11 +18,9 @@ export const CATEGORIES_EMOJIS: Record<string, string> = {
   'feuille': '🥗',
   'fruit': '🍎',
   'agrume': '🍊',
-  'mellifere': '🐝',
-  'bois': '🪵',
-  'arbre': '🌳',
+}
 
-  // Spécifiques botaniques (pour matcher les libellés en base si présents)
+export const ESPECE_NAME_EMOJIS: Record<string, string> = {
   'ail': '🧄',
   'oignon': '🧅',
   'pomme de terre': '🥔',
@@ -35,28 +33,23 @@ export const CATEGORIES_EMOJIS: Record<string, string> = {
   'cerise': '🍒',
   'framboise': '🍇',
   'menthe': '🌿',
-  'basilic': '🌿',
-  'romarin': '🌿',
-  'thym': '🌿',
-  'lavande': '💜',
-  'rose': '🌹',
-  'tournesol': '🌻',
 }
 
 /**
- * Retourne l'emoji pour une categorie donnee
+ * Retourne l'emoji pour une espece donnee (nom + categorie)
  */
-export function getCategorieEmoji(categorie: string | null | undefined): string {
+export function getEspeceEmoji(nom: string | null | undefined, categorie: string | null | undefined): string {
+  // 1. Essayer de matcher par nom d'espece d'abord (spécifique)
+  if (nom) {
+    const nomKey = nom.toLowerCase().trim()
+    for (const [key, emoji] of Object.entries(ESPECE_NAME_EMOJIS)) {
+      if (nomKey.includes(key)) return emoji
+    }
+  }
+
+  // 2. Fallback sur categorie
   if (!categorie) return ''
   const key = categorie.toLowerCase().trim()
-  
-  // 1. Match exact
-  if (CATEGORIES_EMOJIS[key]) return CATEGORIES_EMOJIS[key]
-  
-  // 2. Match sans accents
   const normalized = key.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-  if (CATEGORIES_EMOJIS[normalized]) return CATEGORIES_EMOJIS[normalized]
-  
-  return ''
+  return CATEGORIES_EMOJIS[key] || CATEGORIES_EMOJIS[normalized] || ''
 }
-
