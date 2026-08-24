@@ -220,12 +220,55 @@ export default function ReferentielsAdminPage() {
             const count = stats[ref.id] || 0
             const isLoading = loading === ref.id
 
-            const CardComponent = ref.href ? Link : React.Fragment
-            const cardProps = ref.href ? { href: ref.href, className: "block hover:scale-[1.02] transition-transform" } : {}
-
             return (
-              <CardComponent key={ref.id} {...cardProps}>
-                <Card>
+              ref.href ? (
+                <Link key={ref.id} href={ref.href} className="block hover:scale-[1.02] transition-transform">
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="flex items-center gap-2">
+                        <span className="text-2xl">{ref.icon}</span>
+                        <div className="flex-1">
+                          <div className="text-base">{ref.label}</div>
+                          <div className="text-sm text-muted-foreground font-normal">
+                            {count > 0 ? `${count} enregistrements` : "Aucune donnée"}
+                          </div>
+                        </div>
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="flex gap-2">
+                        <Button
+                          variant="outline"
+                          onClick={(e) => { e.preventDefault(); handleExport(ref.id) }}
+                          disabled={isLoading || count === 0}
+                          className="flex-1"
+                        >
+                          {isLoading ? (
+                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                          ) : (
+                            <Download className="h-4 w-4 mr-2" />
+                          )}
+                          Exporter
+                        </Button>
+                        <Button
+                          variant="outline"
+                          onClick={(e) => { e.preventDefault(); handleImportClick(ref.id) }}
+                          disabled={isLoading}
+                          className="flex-1"
+                        >
+                          {isLoading ? (
+                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                          ) : (
+                            <Upload className="h-4 w-4 mr-2" />
+                          )}
+                          Importer
+                        </Button>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </Link>
+              ) : (
+                <Card key={ref.id}>
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                       <span className="text-2xl">{ref.icon}</span>
@@ -268,7 +311,7 @@ export default function ReferentielsAdminPage() {
                     </div>
                   </CardContent>
                 </Card>
-              </CardComponent>
+              )
             )
           })}
         </div>
