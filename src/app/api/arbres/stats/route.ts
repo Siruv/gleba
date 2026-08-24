@@ -6,6 +6,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import prisma from "@/lib/prisma"
 import { requireAuthApi } from "@/lib/auth-utils"
+import { debutDeJour as startOfToday } from "@/lib/operation-arbre-statut"
 
 export async function GET(request: NextRequest) {
   const { error, session } = await requireAuthApi()
@@ -110,13 +111,19 @@ export async function GET(request: NextRequest) {
     // regroupement, donc Figuier (1 arbre) disparaissait et la somme du
     // donut ≠ total fruitiers. On regroupe l'éventuel reliquat en
     // "Autres" pour conserver la cohérence visuelle.
+    // Ticket cmsofze9p — ne pas exclure les arbres sans espèce : le donut
+    // affichait 17 arbres pour 18 fruitiers. L'espèce nulle est regroupée
+    // sous « Non renseigné » et le tri se fait en JS (l'orderBy Prisma sur
+    // `_count.espece` compte les valeurs non nulles et classerait toujours
+    // ce groupe dernier, quel que soit son effectif).
     const especesRaw = await prisma.arbre.groupBy({
       by: ["espece"],
-      where: { userId, type: { in: ["fruitier", "petit_fruit"] }, espece: { not: null } },
+      where: { userId, type: { in: ["fruitier", "petit_fruit"] } },
       _count: { _all: true },
-      orderBy: { _count: { espece: "desc" } },
     })
-    const especesSorted = especesRaw.map((r) => ({ espece: r.espece ?? "—", count: r._count._all }))
+    const especesSorted = especesRaw
+      .map((r) => ({ espece: r.espece ?? "Non renseigné", count: r._count._all }))
+      .sort((a, b) => b.count - a.count)
     const topEspeces = especesSorted.slice(0, 5)
     if (especesSorted.length > 5) {
       const autresCount = especesSorted.slice(5).reduce((s, e) => s + e.count, 0)
@@ -213,12 +220,18 @@ export async function GET(request: NextRequest) {
         couleur: destinationColors[d.destination || ""] || "#9ca3af",
       }))
 
-    // Opérations en attente
+    // Opérations en attente : seulement ce qui est réellement faisable. Une
+    // fenêtre saisonnière refermée ou soldée n'est plus du travail en attente
+    // (cf. `src/lib/operation-arbre-statut.ts`) — la compter gonflait le KPI de
+    // 125 tâches hors saison sur un verger de 86 arbres (constat 2026-08-03).
+    const maintenant = new Date()
     const operationsEnAttente = await prisma.operationArbre.count({
       where: {
         userId,
         fait: false,
-        datePrevue: { lte: new Date() },
+        abandonneeLe: null,
+        datePrevue: { lte: maintenant },
+        OR: [{ dateLimite: null }, { dateLimite: { gte: startOfToday(maintenant) } }],
       },
     })
 

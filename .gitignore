@@ -45,8 +45,12 @@ yarn-debug.log*
 yarn-error.log*
 
 # local env files
-.env
-.env*.local
+# Motif large VOLONTAIREMENT : `.env` et `.env*.local` seuls laissaient passer
+# `.env.bak-*`, `.env.save`, `.env.production`… c'est-à-dire des fichiers de
+# SECRETS dans un dépôt public. Constaté le 2026-08-19 avec une sauvegarde de
+# `.env` prise avant une bascule, qu'un `git add -A` aurait publiée.
+.env*
+!.env.example
 
 # vercel
 .vercel
@@ -115,3 +119,35 @@ et)
 
 # La consultation admin fait partie du produit : ses sources doivent rester
 # versionnées avec auth.ts/layout.tsx afin qu'un clone propre compile.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scripts one-shot porteurs de DONNÉES PERSONNELLES réelles (dépôt public).
+# Ils ont servi une fois, contre la base de production, et contiennent des
+# adresses email, des noms et des questions d'utilisateurs identifiables :
+# rien de tout cela ne doit entrer dans l'historique Git, qui est indélébile.
+# Les garder en local est utile ; les publier serait une violation RGPD.
+# ─────────────────────────────────────────────────────────────────────────────
+/scripts/debloquer-jeanjacques-20260811.ts
+/scripts/reponse-vorwerk-fleurs-20260818.ts
+/scripts/replay-questions-reelles.ts
+
+# Rebut de travail (sauvegardes d'éditeur, page 3D retirée du site)
+/.dl-retire/
+*.bak-vc3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outillage d'agent : reste sur le VPS, jamais dans le dépôt public.
+# Complète l'intention déjà déclarée plus haut, qui n'excluait que 3 chemins.
+# ─────────────────────────────────────────────────────────────────────────────
+/_bmad/
+/.claude/
+
+# Artefacts générés (régénérables, bruit de diff)
+/docs/project-scan-report.json
+/docs/source-tree-analysis.md
+
+# Support commercial et visuels de travail : gardés sur la machine, hors dépôt.
+# Le deck expose le modèle tarifaire, il n'a rien à faire dans le code ; l'image
+# générée pesait 6,5 Mo dans chaque clone sans être référencée nulle part.
+/gleba-pro.pptx
+/Gemini_Generated_Image_*.png

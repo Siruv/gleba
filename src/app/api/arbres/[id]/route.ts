@@ -8,7 +8,10 @@
 import { NextRequest, NextResponse } from "next/server"
 import prisma from "@/lib/prisma"
 import { requireAuthApi } from "@/lib/auth-utils"
-import { trouverParcelleGpsProche } from "@/lib/parcelle-gps-utils"
+import { doitInfererParcelle, trouverParcelleGpsProche } from "@/lib/parcelle-gps-utils"
+import { messageErreurCoordonnees } from "@/lib/geolocation"
+import { normaliserLibelle } from "@/lib/libelle-libre"
+import { noteArbreSupprime, preserverTracesPhytoArbre } from "@/lib/verger/preserver-traces-phyto"
 
 interface Params {
   params: Promise<{ id: string }>
@@ -119,23 +122,31 @@ export async function PUT(request: NextRequest, { params }: Params) {
           ? null
           : Number(body.gpsLng)
         : existing.gpsLng
-    if (
-      (gpsLat != null && (!Number.isFinite(gpsLat) || gpsLat < -90 || gpsLat > 90)) ||
-      (gpsLng != null && (!Number.isFinite(gpsLng) || gpsLng < -180 || gpsLng > 180)) ||
-      (gpsLat == null) !== (gpsLng == null)
-    ) {
-      return NextResponse.json(
-        { error: "Les coordonnées GPS sont invalides ou incomplètes" },
-        { status: 400 }
-      )
+    // Message circonstancié (2026-08-03) : deux fiches de production étaient
+    // devenues insauvegardables parce que le formulaire renvoyait une longitude
+    // héritée hors bornes (point décimal perdu à la saisie, avant l'ajout du
+    // garde-fou). L'utilisateur recevait « coordonnées invalides » en modifiant
+    // un tout autre champ, sans moyen de comprendre ni de corriger.
+    const erreurGps = messageErreurCoordonnees(gpsLat, gpsLng)
+    if (erreurGps) {
+      return NextResponse.json({ error: erreurGps }, { status: 400 })
     }
 
     let parcelleGeoId =
       body.parcelleGeoId !== undefined ? (body.parcelleGeoId || null) : existing.parcelleGeoId
+
+    // Rattachement GPS → parcelle : règle et justification dans
+    // `doitInfererParcelle` (`src/lib/parcelle-gps-utils.ts`).
     if (
-      body.parcelleGeoId === undefined &&
-      !existing.parcelleGeoId &&
-      (body.gpsLat !== undefined || body.gpsLng !== undefined) &&
+      doitInfererParcelle({
+        parcelleChoisie: parcelleGeoId,
+        parcelleExistante: existing.parcelleGeoId,
+        coordonneesFournies: body.gpsLat !== undefined || body.gpsLng !== undefined,
+        lat: gpsLat,
+        lng: gpsLng,
+        latExistante: existing.gpsLat,
+        lngExistante: existing.gpsLng,
+      }) &&
       gpsLat != null &&
       gpsLng != null
     ) {
@@ -183,9 +194,13 @@ export async function PUT(request: NextRequest, { params }: Params) {
       data: {
         nom: body.nom,
         type: body.type,
-        espece: body.espece,
-        variete: body.variete,
-        portGreffe: body.portGreffe,
+        // Libellés libres normalisés à l'écriture (cf. `normaliserLibelle`) :
+        // une espace de bordure créait une espèce en double dans les
+        // regroupements. `undefined` reste `undefined` : un payload partiel ne
+        // doit rien effacer.
+        espece: normaliserLibelle(body.espece),
+        variete: normaliserLibelle(body.variete),
+        portGreffe: normaliserLibelle(body.portGreffe),
         // Bug #1 — Le PUT ignorait porte-greffe structuré + circonférence + GPS,
         // d'où le bug "fiche détail vide" alors que la création persistait bien.
         porteGreffeId: body.porteGreffeId !== undefined ? (body.porteGreffeId || null) : undefined,
@@ -194,7 +209,7 @@ export async function PUT(request: NextRequest, { params }: Params) {
           : undefined,
         gpsLat: body.gpsLat !== undefined ? gpsLat : undefined,
         gpsLng: body.gpsLng !== undefined ? gpsLng : undefined,
-        fournisseur: body.fournisseur,
+        fournisseur: normaliserLibelle(body.fournisseur),
         dateAchat: body.dateAchat !== undefined ? (body.dateAchat ? new Date(body.dateAchat) : null) : undefined,
         prixAchat: body.prixAchat !== undefined
           ? (body.prixAchat != null && body.prixAchat !== "" ? parseFloat(body.prixAchat) : null)
@@ -302,7 +317,35 @@ export async function DELETE(request: NextRequest, { params }: Params) {
       )
     }
 
+    // QA cmsjhogc8 — les productions de bois (arbreId onDelete:SetNull) sont du
+    // stock réel : on ne les supprime pas (sinon perte d'inventaire), mais leur
+    // rattachement à l'arbre allait être nullé, cassant la traçabilité (« Arbre
+    // - »). On snapshote donc l'identité de l'arbre dans les notes du lot avant
+    // la coupe du lien, pour conserver l'origine au registre.
+    const boisAOrpheliner = await prisma.productionBois.findMany({
+      where: { arbreId, userId: session!.user.id },
+      select: { id: true, notes: true },
+    })
+    const origineArbre = `Arbre d'origine : ${existing.nom}${existing.espece ? ` (${existing.espece})` : ""} — fiche supprimée le ${new Date().toLocaleDateString("fr-FR")}.`
+
+    // QA cmsofhlzg — Intervention.arbreId est une colonne SANS FK : la
+    // suppression de l'arbre laissait les traitements phyto « orphelins »
+    // (le registre affichait « Arbre #587 »). Le registre phyto est une
+    // traçabilité réglementaire : on ne supprime JAMAIS ces interventions.
+    // Même approche que la traçabilité bois ci-dessus : on snapshote
+    // l'identité de l'arbre dans les notes, puis on détache le lien.
+    const interventionsADetacher = await prisma.intervention.findMany({
+      where: { arbreId, userId: session!.user.id },
+      select: { id: true, notes: true },
+    })
+    const snapshotArbre = noteArbreSupprime({
+      id: arbreId,
+      nom: existing.nom,
+      espece: existing.espece,
+    })
+
     const recolteIds = recoltes.map((r) => r.id)
+    let tracesPhyto = { observations: 0, operations: 0 }
     await prisma.$transaction(async (tx) => {
       // Supprimer les écritures auto liées aux récoltes (pas de FK, sinon orphelines)
       if (recolteIds.length > 0) {
@@ -315,11 +358,41 @@ export async function DELETE(request: NextRequest, { params }: Params) {
           },
         })
       }
+      // Conserver la traçabilité de l'arbre sur les lots de bois avant que la
+      // suppression ne mette arbreId à NULL (onDelete: SetNull).
+      for (const bois of boisAOrpheliner) {
+        await tx.productionBois.update({
+          where: { id: bois.id },
+          data: { notes: bois.notes ? `${bois.notes}\n${origineArbre}` : origineArbre },
+        })
+      }
+      // QA cmsofhlzg — détacher les interventions (registre phyto) en
+      // conservant l'identité de l'arbre dans les notes.
+      for (const intervention of interventionsADetacher) {
+        await tx.intervention.update({
+          where: { id: intervention.id },
+          data: {
+            arbreId: null,
+            notes: intervention.notes ? `${snapshotArbre}\n${intervention.notes}` : snapshotArbre,
+          },
+        })
+      }
+      // QA cmswxinhf — les traitements saisis via Verger > Santé & Phyto
+      // (`ObservationSante`) et via Verger > Opérations (`OperationArbre`)
+      // portent un `arbre_id` obligatoire en cascade : ils disparaissaient du
+      // registre phytosanitaire avec l'arbre, alors que ce registre est une
+      // obligation de conservation. On les matérialise en interventions
+      // détachées avant la suppression.
+      tracesPhyto = await preserverTracesPhytoArbre(tx, session!.user.id, {
+        id: arbreId,
+        nom: existing.nom,
+        espece: existing.espece,
+      })
       // La suppression de l'arbre cascade sur les récoltes (onDelete: Cascade)
       await tx.arbre.delete({ where: { id: arbreId } })
     })
 
-    return NextResponse.json({ success: true })
+    return NextResponse.json({ success: true, tracesPhytoConservees: tracesPhyto })
   } catch (err) {
     console.error("DELETE /api/arbres/[id] error:", err)
     return NextResponse.json(

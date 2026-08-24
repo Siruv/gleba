@@ -31,6 +31,7 @@
 
 import { Prisma } from "@prisma/client"
 import prisma from "@/lib/prisma"
+import { visibiliteReferentiel } from "@/lib/referentiel-communaute"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -115,6 +116,12 @@ interface ModelMeta {
   /** clés étrangères (champ scalaire → modèle cible) */
   rels: RelMeta[]
   hasUserId: boolean
+  /**
+   * Référentiel COMMUNAUTAIRE : porte `userId` ET `partageCommunaute`, donc une
+   * partie de ses lignes appartient à d'autres membres. Déduit du schéma, jamais
+   * recopié dans une liste.
+   */
+  estCommunautaire: boolean
   klass: ModelClass
 }
 
@@ -189,6 +196,13 @@ function buildManifest(): Map<string, ModelMeta> {
       scalarFields,
       rels,
       hasUserId,
+      // Référentiel COMMUNAUTAIRE : porte à la fois `userId` et
+      // `partageCommunaute`, donc une partie de ses lignes appartient à d'autres
+      // membres et n'est pas visible de tous. Déduit du schéma plutôt que
+      // recopié dans une liste — une liste oubliée est exactement ce qui a
+      // laissé les espèces, variétés et ITP privés de la communauté partir dans
+      // la sauvegarde de n'importe quel compte.
+      estCommunautaire: hasUserId && scalarFieldNames.has("partageCommunaute"),
       klass,
     })
   }
@@ -217,10 +231,14 @@ export async function exportAccount(userId: string, appVersion = "1.0.0"): Promi
   const data: Record<string, Row[]> = {}
   const stats: Record<string, number> = {}
 
-  // 1) Référentiels : tout
+  // 1) Référentiels : tout, SAUF le privé d'autrui dans les référentiels
+  //    communautaires (cf. REFERENTIAL_COMMUNAUTAIRE).
   for (const meta of manifest.values()) {
     if (meta.klass !== "referential") continue
-    const rows = (await (prisma as any)[meta.delegate].findMany()) as Row[]
+    const where = meta.estCommunautaire ? visibiliteReferentiel(userId) : undefined
+    const rows = (await (prisma as any)[meta.delegate].findMany(
+      where ? { where } : undefined
+    )) as Row[]
     data[meta.name] = rows
     stats[meta.name] = rows.length
   }
@@ -431,12 +449,39 @@ export async function importAccount(
       const rows = data[meta.name] ?? []
       if (!opts.isAdmin) {
         if (rows.length) skipped[meta.name] = rows.length
-        // idMap identité : les FK owned pointant vers ces référentiels
-        // continuent de résoudre vers les lignes globales existantes.
+        // idMap identité, mais SEULEMENT pour les clés réellement présentes sur
+        // la cible.
+        //
+        // L'identité était posée pour toutes les lignes du fichier, y compris
+        // celles que cet import ne recrée pas : une culture rattachée à un ITP
+        // personnel voyait donc sa FK « résolue » vers un identifiant inexistant,
+        // violait la clé étrangère et était ABANDONNÉE, avec un simple warning
+        // noyé dans le rapport. Une sauvegarde complète réimportée perdait ainsi
+        // en silence toutes les cultures appuyées sur un itinéraire perso. Les
+        // clés absentes de la map partent en `deferredForRow` : la culture est
+        // créée sans itinéraire, ce qui est récupérable, au lieu d'être perdue.
         const map = ensureMap(meta.name)
-        for (const row of rows) {
-          const pk = row[meta.pkField]
-          if (pk !== null && pk !== undefined) map.set(pk, pk)
+        const pks = rows
+          .map((row) => row[meta.pkField as string])
+          .filter((pk) => pk !== null && pk !== undefined)
+        if (pks.length > 0) {
+          const delegue = (tx as unknown as Record<string, { findMany: (args: unknown) => Promise<Row[]> }>)[
+            meta.delegate
+          ]
+          const presentes = await delegue.findMany({
+            where: { [meta.pkField]: { in: pks } },
+            select: { [meta.pkField]: true },
+          })
+          for (const ligne of presentes) {
+            const pk = ligne[meta.pkField as string]
+            map.set(pk, pk)
+          }
+          const manquantes = pks.length - presentes.length
+          if (manquantes > 0) {
+            warnings.push(
+              `${meta.name} : ${manquantes} référence(s) du fichier n'existent pas sur cette instance. Les lignes qui en dépendaient sont créées sans cette référence plutôt que perdues.`
+            )
+          }
         }
         continue
       }

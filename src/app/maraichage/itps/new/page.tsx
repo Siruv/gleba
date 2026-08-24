@@ -89,13 +89,29 @@ export default function NewITPPage() {
     },
   })
 
-  const onSubmit = async (data: CreateITPInput) => {
+  const onSubmit = async (data: CreateITPInput, event?: React.BaseSyntheticEvent) => {
     setIsSubmitting(true)
     try {
+      // QA cmswxy73g — le Select Radix rend un <select> natif caché
+      // (SelectBubbleInput) : une valeur posée dessus sans passer par
+      // onValueChange laisse l'état React à null, et l'ITP partait « Aucune
+      // espèce » alors que le choix semblait fait. Même filet que les autres
+      // formulaires (OperationsTab, AlimentationTab) : le DOM soumis fait foi
+      // quand l'état est vide.
+      const formulaire = event?.target
+      const especeSoumise =
+        formulaire instanceof HTMLFormElement
+          ? String(new FormData(formulaire).get("especeId") || "").trim()
+          : ""
+      const payload: CreateITPInput = {
+        ...data,
+        especeId:
+          data.especeId ?? (especeSoumise && especeSoumise !== "_none" ? especeSoumise : null),
+      }
       const response = await fetch("/api/itps", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
+        body: JSON.stringify(payload),
       })
 
       if (!response.ok) {
@@ -103,9 +119,28 @@ export default function NewITPPage() {
         throw new Error(error.error || "Erreur lors de la creation")
       }
 
+      const cree = await response.json().catch(() => null)
+      const doublon = cree?.doublonPotentiel as { id: string; nom: string } | undefined
+
+      // Ticket cmsx5zgno (QA 2026-08-17) — un ITP créé sans espèce ne le disait
+      // pas : le message de succès était identique, et l'absence ne se voyait
+      // qu'en revenant à la liste, où la colonne Espèce affiche « - ». Le
+      // serveur refuse une espèce inconnue (400), donc un ITP « sans espèce »
+      // signifie toujours qu'aucun choix n'est parvenu au serveur : autant
+      // l'annoncer là où l'utilisateur peut encore agir.
+      // Le doublon est signalé, jamais bloqué : un itinéraire personnel peut
+      // légitimement porter le nom d'un itinéraire du catalogue. Le taire
+      // laissait le référentiel commun se remplir de quasi-doublons.
+      const mentionDoublon = doublon
+        ? ` Attention : « ${doublon.nom} » existe déjà dans le catalogue visible — vérifiez que vous ne le dupliquez pas.`
+        : ""
       toast({
-        title: "ITP cree",
-        description: `L'ITP "${data.id}" a été créé avec succès`,
+        title: "ITP créé",
+        description:
+          (payload.especeId
+            ? `« ${data.id} » — espèce : ${payload.especeId}.`
+            : `« ${data.id} » — aucune espèce rattachée. Ouvrez la fiche pour en choisir une : sans espèce, l'ITP ne sera pas proposé à la création d'une culture.`) +
+          mentionDoublon,
       })
       router.push("/maraichage/itps")
     } catch (error) {
@@ -122,7 +157,7 @@ export default function NewITPPage() {
   return (
     <div className="min-h-screen bg-slate-50 aurora-bg-subtle">
       <div className="fixed inset-0 dot-grid opacity-40 pointer-events-none" aria-hidden="true" />
-      <AppHeader current="maraichage" />
+      <AppHeader current="maraichage" showLune />
       <PageToolbar>
         <div className="flex items-center gap-4">
           <Link href="/maraichage/itps">
@@ -173,6 +208,7 @@ export default function NewITPPage() {
                     <FormItem>
                       <FormLabel>Espèce</FormLabel>
                       <Select
+                        name="especeId"
                         onValueChange={(value) => field.onChange(value === "_none" ? null : value)}
                         value={field.value || "_none"}
                       >

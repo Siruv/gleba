@@ -37,7 +37,7 @@ import {
   Package,
   ShoppingBag,
 } from "lucide-react"
-import { getWeek } from "date-fns"
+import { getISOWeek } from "date-fns"
 import {
   filtrerEspecesSaison,
   CATEGORIES_ESPECES,
@@ -46,7 +46,7 @@ import {
   getSemaineDepuisDate,
 } from "@/lib/assistant-helpers"
 import type { EspeceData, ITPData, VarieteData, CultureData } from "./AssistantDialog"
-import { libelleItp } from "@/lib/itp-label"
+import { nomAffichableItp } from "@/lib/itp-label"
 
 // ---------------------------------------------------------------------------
 // Props
@@ -119,7 +119,7 @@ function getDureeEstimee(itp: ITPData): string | null {
 // Espece helpers
 // ---------------------------------------------------------------------------
 
-type EspeceType = "all" | "legume" | "aromatique" | "engrais_vert"
+type EspeceType = "all" | "legume" | "aromatique" | "fleur" | "engrais_vert"
 
 function getCategorie(type?: string) {
   return CATEGORIES_ESPECES[type as keyof typeof CATEGORIES_ESPECES] || CATEGORIES_ESPECES.autre
@@ -219,7 +219,7 @@ export function AssistantStepPlante({
   const itpSectionRef = React.useRef<HTMLDivElement>(null)
   const varieteSectionRef = React.useRef<HTMLDivElement>(null)
 
-  const semaineCourante = getWeek(new Date(), { weekStartsOn: 1 })
+  const semaineCourante = getISOWeek(new Date())
 
   // =========================================================================
   // Espece filtering
@@ -259,7 +259,7 @@ export function AssistantStepPlante({
       setItpsError(null)
       try {
         const res = await fetch(
-          `/api/itps?especeId=${encodeURIComponent(especeId)}&pageSize=1000&applicable=1&calibre=1&sortBy=statutValidation&sortOrder=desc`
+          `/api/itps?especeId=${encodeURIComponent(especeId)}&pageSize=1000&applicable=1&calibre=1&sortBy=confiance`
         )
         if (!res.ok) throw new Error("Erreur lors du chargement des ITPs")
         const data = await res.json()
@@ -487,19 +487,25 @@ export function AssistantStepPlante({
           onValueChange={(v) => setTypeFilter(v as EspeceType)}
         >
           <TabsList className="w-full">
-            <TabsTrigger value="all" className="flex-1">
+            {/* QA cmswxt8a8 — libellé masqué sous 640 px : on nomme l'onglet. */}
+            <TabsTrigger value="all" className="flex-1" aria-label="Tous" title="Tous">
               <Leaf className="h-4 w-4 mr-1" />
               <span className="hidden sm:inline">Tous</span>
             </TabsTrigger>
-            <TabsTrigger value="legume" className="flex-1">
+            <TabsTrigger value="legume" className="flex-1" aria-label="Légumes" title="Légumes">
               <span className="mr-1">🥬</span>
               <span className="hidden sm:inline">Légumes</span>
             </TabsTrigger>
-            <TabsTrigger value="aromatique" className="flex-1">
+            <TabsTrigger value="aromatique" className="flex-1" aria-label="Aromatiques" title="Aromatiques">
               <span className="mr-1">🌿</span>
               <span className="hidden sm:inline">Arom.</span>
             </TabsTrigger>
-            <TabsTrigger value="engrais_vert" className="flex-1">
+            {/* Ticket FB-PMWX8O — production florale. */}
+            <TabsTrigger value="fleur" className="flex-1" aria-label="Fleurs" title="Fleurs">
+              <span className="mr-1">🌸</span>
+              <span className="hidden sm:inline">Fleurs</span>
+            </TabsTrigger>
+            <TabsTrigger value="engrais_vert" className="flex-1" aria-label="Engrais verts" title="Engrais verts">
               <Sprout className="h-4 w-4 mr-1" />
               <span className="hidden sm:inline">Eng. vert</span>
             </TabsTrigger>
@@ -686,7 +692,7 @@ export function AssistantStepPlante({
                             <div className="flex items-center justify-between">
                               <CardTitle className="text-sm font-medium flex items-center gap-2">
                                 <Sprout className="h-4 w-4 text-green-600" />
-                                {libelleItp(itpItem.nom ?? itpItem.id)}
+                                {nomAffichableItp(itpItem)}
                                 {isSelected && (
                                   <Check className="h-4 w-4 text-green-600" />
                                 )}

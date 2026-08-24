@@ -56,6 +56,8 @@ export interface EspeceData {
   famille?: { id: string; couleur?: string | null }
   nomLatin?: string
   rendement?: number | null
+  /** Unité de `rendement` : kg_m2 (défaut) | kg_arbre | biomasse_t_ha. */
+  uniteRendement?: string | null
   besoinEau?: number | null
   irrigation?: string | null
   niveau?: string | null
@@ -66,6 +68,8 @@ export interface EspeceData {
 export interface ITPData {
   id: string
   nom?: string | null
+  // null = catalogue officiel ; renseigné = libellé d'un membre, affiché tel quel.
+  userId?: string | null
   especeId?: string
   semaineSemis?: number | null
   semainePlantation?: number | null
@@ -73,6 +77,7 @@ export interface ITPData {
   dureeRecolte?: number | null
   dureePepiniere?: number | null
   dureeCulture?: number | null
+  delaiPremiereRecolteAnnees?: number | null
   nbRangs?: number | null
   espacement?: number | null
   espacementRangs?: number | null
@@ -91,6 +96,8 @@ export interface VarieteData {
   stockPlants?: number | null
   userStockGraines?: number | null
   userStockPlants?: number | null
+  /** Graines par gramme : sans elle, un nombre de graines n'est pas convertible en grammes. */
+  nbGrainesG?: number | null
   bio?: boolean
 }
 

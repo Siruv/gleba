@@ -30,7 +30,7 @@ import {
   ToggleLeft,
   RefreshCw,
 } from "lucide-react"
-import { format, getWeek } from "date-fns"
+import { format, getISOWeek } from "date-fns"
 import { fr } from "date-fns/locale"
 import {
   calculerDatesCulture,
@@ -215,9 +215,21 @@ export function AssistantStepDates({
     )
   }, [culture.longueur, planche.longueur, planche.largeur, culture.nbRangs, culture.espacement])
 
+  // L'unité voyage avec le rendement : sans elle, un fruitier en kg/ARBRE
+  // était projeté au m² (kiwi 25 → 750 kg sur 30 m²).
   const rendement = React.useMemo(() => {
-    return estimerRendement(espece?.rendement ?? culture.espece?.rendement, surface)
-  }, [espece?.rendement, culture.espece?.rendement, surface])
+    return estimerRendement(
+      espece?.rendement ?? culture.espece?.rendement,
+      surface,
+      espece?.uniteRendement ?? culture.espece?.uniteRendement,
+    )
+  }, [
+    espece?.rendement,
+    espece?.uniteRendement,
+    culture.espece?.rendement,
+    culture.espece?.uniteRendement,
+    surface,
+  ])
 
   // Décalage max from ITP
   const decalageMax = itp?.decalageMax || 4
@@ -423,7 +435,7 @@ export function AssistantStepDates({
                   max={2100}
                 />
                 <span className="text-sm text-muted-foreground">
-                  Semaine actuelle: S{getWeek(new Date(), { weekStartsOn: 1 })}
+                  Semaine actuelle: S{getISOWeek(new Date())}
                 </span>
               </div>
             </div>
@@ -539,7 +551,7 @@ export function AssistantStepDates({
                   max={2100}
                 />
                 <span className="text-sm text-muted-foreground">
-                  Semaine actuelle: S{getWeek(new Date(), { weekStartsOn: 1 })}
+                  Semaine actuelle: S{getISOWeek(new Date())}
                 </span>
               </div>
             </div>
@@ -566,7 +578,7 @@ export function AssistantStepDates({
                     />
                     {manualSemis && (
                       <p className="text-xs text-muted-foreground text-center">
-                        {formatSemaine(getWeek(new Date(manualSemis + "T00:00:00"), { weekStartsOn: 1 }))}
+                        {formatSemaine(getISOWeek(new Date(manualSemis + "T00:00:00")))}
                       </p>
                     )}
                   </div>
@@ -583,7 +595,7 @@ export function AssistantStepDates({
                     />
                     {manualPlantation && (
                       <p className="text-xs text-muted-foreground text-center">
-                        {formatSemaine(getWeek(new Date(manualPlantation + "T00:00:00"), { weekStartsOn: 1 }))}
+                        {formatSemaine(getISOWeek(new Date(manualPlantation + "T00:00:00")))}
                       </p>
                     )}
                   </div>
@@ -600,7 +612,7 @@ export function AssistantStepDates({
                     />
                     {manualRecolte && (
                       <p className="text-xs text-muted-foreground text-center">
-                        {formatSemaine(getWeek(new Date(manualRecolte + "T00:00:00"), { weekStartsOn: 1 }))}
+                        {formatSemaine(getISOWeek(new Date(manualRecolte + "T00:00:00")))}
                       </p>
                     )}
                   </div>

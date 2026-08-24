@@ -34,13 +34,20 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { useToast } from "@/hooks/use-toast"
+import { nomAffichableItpAvecFenetre } from "@/lib/itp-label"
 import { createRotationSchema, type CreateRotationInput } from "@/lib/validations"
 import { AppHeader, PageToolbar } from "@/components/shell/AppHeader"
 
 interface ITP {
   id: string
   nom: string | null
+  // Origine : le libellé d'un membre est rendu tel quel (cf. nomAffichableItp).
+  userId: string | null
   especeId: string | null
+  semaineImplantationDebut: number | null
+  semaineImplantationFin: number | null
+  semaineSemis: number | null
+  semainePlantation: number | null
   espece: {
     id: string
     nom: string | null
@@ -53,13 +60,14 @@ export default function NewRotationPage() {
   const router = useRouter()
   const { toast } = useToast()
   const [isSubmitting, setIsSubmitting] = React.useState(false)
+  const [submitError, setSubmitError] = React.useState<string | null>(null)
   const [itps, setItps] = React.useState<ITP[]>([])
 
   // Charger les ITPs
   React.useEffect(() => {
     async function loadItps() {
       try {
-        const response = await fetch("/api/itps?pageSize=1000&applicable=1&sortBy=statutValidation&sortOrder=desc")
+        const response = await fetch("/api/itps?pageSize=1000&applicable=1&sortBy=confiance")
         if (response.ok) {
           const data = await response.json()
           setItps(data.data)
@@ -92,6 +100,7 @@ export default function NewRotationPage() {
 
   const onSubmit = async (data: CreateRotationInput) => {
     setIsSubmitting(true)
+    setSubmitError(null)
     try {
       const response = await fetch("/api/rotations", {
         method: "POST",
@@ -105,7 +114,14 @@ export default function NewRotationPage() {
         const messages = fieldErrors
           ? Object.values(fieldErrors).flat().join(" · ")
           : error.error
-        throw new Error(messages || "Erreur lors de la création")
+        // QA cmsp5fzf8 — un refus (403 sur ce référentiel partagé) n'apparaissait
+        // que dans un toast éphémère : la création semblait avoir fonctionné.
+        const message =
+          response.status === 403
+            ? "Les plans de rotation sont un référentiel partagé entre tous les comptes : leur création est réservée à l'équipe Gleba. Écrivez-nous pour ajouter un plan."
+            : messages || "Erreur lors de la création"
+        setSubmitError(message)
+        throw new Error(message)
       }
 
       toast({
@@ -132,7 +148,7 @@ export default function NewRotationPage() {
   return (
     <div className="min-h-screen bg-slate-50 aurora-bg-subtle">
       <div className="fixed inset-0 dot-grid opacity-40 pointer-events-none" aria-hidden="true" />
-      <AppHeader current="maraichage" />
+      <AppHeader current="maraichage" showLune />
       <PageToolbar>
         <div className="flex items-center gap-4">
           <Link href="/maraichage/rotations">
@@ -225,7 +241,7 @@ export default function NewRotationPage() {
               <CardHeader>
                 <CardTitle>Plan de rotation</CardTitle>
                 <CardDescription>
-                  Définissez l'ITP pour chaque annee du cycle
+                  Définissez l'ITP pour chaque année du cycle
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
@@ -261,7 +277,7 @@ export default function NewRotationPage() {
                                         style={{ backgroundColor: itp.espece.couleur }}
                                       />
                                     )}
-                                    {itp.nom ?? itp.id}
+                                    {nomAffichableItpAvecFenetre(itp)}
                                     {itp.espece && (
                                       <span className="text-muted-foreground">
                                         ({itp.espece.nom ?? itp.espece.id})
@@ -297,7 +313,7 @@ export default function NewRotationPage() {
                   className="w-full"
                 >
                   <Plus className="h-4 w-4 mr-2" />
-                  Ajouter une annee
+                  Ajouter une année
                 </Button>
               </CardContent>
             </Card>
@@ -335,6 +351,9 @@ export default function NewRotationPage() {
                   Annuler
                 </Button>
               </Link>
+              {submitError && (
+                <p role="alert" className="mr-auto text-sm text-red-600">{submitError}</p>
+              )}
               <Button type="submit" disabled={isSubmitting}>
                 <Save className="h-4 w-4 mr-2" />
                 {isSubmitting ? "Creation..." : "Créer la rotation"}

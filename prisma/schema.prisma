@@ -21,6 +21,16 @@ enum Role {
   USER
 }
 
+/// Rôle d'un compte invité DANS l'exploitation d'un autre compte.
+/// Le propriétaire n'a pas de ligne d'adhésion : il est propriétaire par défaut
+/// de sa propre exploitation. Trois rôles seulement (décision 2026-08-19) :
+/// propriétaire (implicite), MEMBRE (écriture sur les modules autorisés) et
+/// CONSULTATION (lecture seule, ex. comptable ou technicien).
+enum RoleMembreExploitation {
+  MEMBRE
+  CONSULTATION
+}
+
 enum CoucheActivite {
   MARAICHAGE
   VERGER
@@ -34,10 +44,18 @@ enum BugType {
   AUTRE
 }
 
+/// États d'un signalement. Les deux derniers sont des issues de TRI : le
+/// signalement est qualifié, aucun correctif applicatif n'est attendu, et il
+/// sort du compteur de travail de l'accueil admin (qui ne somme que OPEN et
+/// IN_PROGRESS). Sans eux, tout signalement requalifié restait OPEN à vie.
 enum BugStatus {
   OPEN
   IN_PROGRESS
   RESOLVED
+  /// Besoin produit reconnu, non planifié — reste visible comme demande.
+  EVOLUTION_PRODUIT
+  /// Cause hors du code applicatif (pipeline, infrastructure, tiers).
+  HORS_PERIMETRE
 }
 
 enum BugPriority {
@@ -62,7 +80,7 @@ enum MediaReferentielStatut {
 model User {
   id                   String    @id @default(cuid())
   email                String    @unique
-  password             String // bcrypt hash
+  password             String? // bcrypt hash — null pour un compte créé via Google (OAuth) qui n'a jamais défini de mot de passe local
   name                 String?
   role                 Role      @default(USER)
   active               Boolean   @default(true)
@@ -85,8 +103,9 @@ model User {
   createdAt            DateTime  @default(now()) @map("created_at")
   updatedAt            DateTime  @updatedAt @map("updated_at")
 
-  // NextAuth sessions
+  // NextAuth sessions + comptes OAuth (Google)
   sessions Session[]
+  accounts Account[]
   pushSubscriptions PushSubscription[]
 
   // Relations avec données utilisateur
@@ -112,6 +131,8 @@ model User {
   animaux               Animal[]
   lotsAnimaux           LotAnimaux[]
   productionsOeufs      ProductionOeuf[]
+  productionsRuche      ProductionRuche[]
+  mouvementsStockRuche  MouvementStockRuche[]
   ventesProduits        VenteProduit[]
   abattages             Abattage[]
   consommationsAliments ConsommationAliment[]
@@ -241,7 +262,54 @@ model User {
   mouvementsStockOeufs             MouvementStockOeuf[]
   stocksMedicamentsElevage         StockMedicamentElevage[]
 
+  // Exploitation partagée — les comptes invités DANS mon exploitation, et
+  // l'adhésion éventuelle de MON compte à l'exploitation de quelqu'un d'autre.
+  membresExploitation MembreExploitation[] @relation("MembresDeMonExploitation")
+  adhesionExploitation MembreExploitation? @relation("AdhesionDeMonCompte")
+
   @@map("users")
+}
+
+/// Adhésion d'un compte à l'exploitation d'un AUTRE compte (chantier P1
+/// « exploitation professionnelle partagée », lot 1 du 2026-08-19).
+///
+/// Invariant de cloisonnement : `userId` reste PARTOUT dans le métier la clé de
+/// l'exploitation (le *tenant*), et vaut l'id du propriétaire. Cette table dit
+/// seulement quelles PERSONNES (les *acteurs*) ont le droit d'agir dans
+/// l'exploitation d'un propriétaire, et à quel titre. Aucune donnée métier n'est
+/// rattachée ici. Cf. `src/lib/exploitation/roles.ts` et [[Technique]].
+///
+/// `userId` est unique : un compte n'appartient qu'à une seule exploitation à la
+/// fois, sinon la résolution du tenant serait ambiguë. Une ligne révoquée garde
+/// la place ; une nouvelle invitation acceptée réécrit la ligne du compte.
+/// Le jeton d'invitation n'est jamais stocké en clair, seulement son SHA-256
+/// (même règle que `impersonation_grants`).
+model MembreExploitation {
+  id             String                 @id @default(cuid())
+  /// Propriétaire de l'exploitation = tenant. C'est cet id qui vaut `userId`
+  /// dans toutes les tables métier.
+  proprietaireId String                 @map("proprietaire_id")
+  proprietaire   User                   @relation("MembresDeMonExploitation", fields: [proprietaireId], references: [id], onDelete: Cascade)
+  /// Adresse invitée, en minuscules. Sert de clé d'invitation avant qu'un
+  /// compte n'existe ou n'accepte.
+  email          String                 @map("email")
+  /// Compte invité, renseigné à l'acceptation. Null = invitation en attente.
+  userId         String?                @unique @map("user_id")
+  user           User?                  @relation("AdhesionDeMonCompte", fields: [userId], references: [id], onDelete: Cascade)
+  role           RoleMembreExploitation @default(MEMBRE) @map("role")
+  /// Modules autorisés (cf. `src/lib/modules.ts`). Tableau vide = tous les
+  /// modules de l'exploitation, sans restriction supplémentaire.
+  modules        String[]               @default([]) @map("modules")
+  tokenHash      String?                @unique @map("token_hash")
+  tokenExpiresAt DateTime?              @map("token_expires_at")
+  accepteLe      DateTime?              @map("accepte_le")
+  revoqueLe      DateTime?              @map("revoque_le")
+  createdAt      DateTime               @default(now()) @map("created_at")
+  updatedAt      DateTime               @updatedAt @map("updated_at")
+
+  @@unique([proprietaireId, email])
+  @@index([proprietaireId, revoqueLe])
+  @@map("membres_exploitation")
 }
 
 /// Abonnement push navigateur d'un utilisateur.
@@ -426,6 +494,24 @@ model BugStatusLog {
   @@map("bug_status_logs")
 }
 
+/// Journal des erreurs serveur capturées globalement : console.error des
+/// routes API (via le patch installé par instrumentation.ts) et erreurs non
+/// attrapées (via onRequestError). Né du 2026-08-02 : un utilisateur a subi
+/// 10 erreurs 500 en silence, découvertes par hasard dans les logs docker —
+/// perdus au redéploiement suivant. Alimente /admin/erreurs et l'alerte
+/// email throttlée. Rétention ~30 jours (purge opportuniste à l'insertion).
+model ApiError {
+  id        Int      @id @default(autoincrement())
+  source    String // "console" | "uncaught"
+  route     String? // ex: "PUT /api/cultures/[id]"
+  message   String   @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@index([route])
+  @@map("api_errors")
+}
+
 /// Sessions NextAuth
 model Session {
   id           String   @id @default(cuid())
@@ -435,6 +521,31 @@ model Session {
   expires      DateTime
 
   @@map("sessions")
+}
+
+/// Comptes OAuth Auth.js (connexion Google) : une ligne par identité externe
+/// liée à un utilisateur. Les noms de champs snake_case des tokens sont imposés
+/// par l'adapter Prisma d'Auth.js — ne pas les renommer.
+model Account {
+  id                String   @id @default(cuid())
+  userId            String   @map("user_id")
+  type              String
+  provider          String
+  providerAccountId String   @map("provider_account_id")
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
 }
 
 // ============================================================
@@ -1312,6 +1423,11 @@ model IrrigationPlanifiee {
   culture       Culture   @relation(fields: [cultureId], references: [id], onDelete: Cascade)
   datePrevue    DateTime  @map("date_prevue")
   fait          Boolean   @default(false) @map("fait")
+  // Passage manqué de plus d'un cycle d'arrosage : abandonné, plus jamais dû.
+  // Un arrosage ne se rattrape pas — sans cet état, chaque jour sauté restait
+  // en retard indéfiniment et se soldait d'un clic qui antidatait la trace
+  // (cf. src/lib/irrigation-peremption.ts). `fait` et `perimee` s'excluent.
+  perimee       Boolean   @default(false) @map("perimee")
   dateEffective DateTime? @map("date_effective") // Date réelle si différente
   notes         String?   @map("notes") @db.Text
   createdAt     DateTime  @default(now()) @map("created_at")
@@ -1320,6 +1436,7 @@ model IrrigationPlanifiee {
   @@index([userId])
   @@index([cultureId])
   @@index([datePrevue])
+  @@index([userId, fait, perimee])
   @@map("irrigations_planifiees")
 }
 
@@ -1394,7 +1511,11 @@ model ObjetJardin {
   userId        String       @map("user_id")
   user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   nom           String?      @map("nom")
-  type          String       @map("type") // "allee", "passage", "bordure", "serre", "compost", "autre"
+  // Catalogue et rendus (2D/3D) : src/lib/jardin/objets-plan.ts — chaîne libre,
+  // donc ajouter un type n'exige aucune migration. Types connus : allee,
+  // passage, mur, cloture, poteau, batiment, serre, bordure, haie, compost,
+  // eau, autre.
+  type          String       @map("type")
   largeur       Float        @map("largeur") // mètres
   longueur      Float        @map("longueur") // mètres
   posX          Float        @map("pos_x") // Position X en mètres
@@ -1620,6 +1741,20 @@ model OperationArbre {
   unite             String?   @map("unite") // L, kg, etc.
   cout              Float?    @map("cout") // Coût en €
   datePrevue        DateTime? @map("date_prevue") // Date planifiée (si tâche future)
+  // Fenêtre saisonnière (2026-08-03) : une opération d'entretien générée est
+  // faisable sur une PÉRIODE (« taille en vert, juin-juillet »), pas à une date
+  // fixe. Avant, le générateur écrasait la fenêtre en une date pivot au 15 du
+  // mois : les 86 arbres d'un verger tombaient le même jour et devenaient tous
+  // « en retard » ensemble le 16, alors que l'opération restait faisable.
+  // `datePrevue` reste la date conseillée (étalée dans la fenêtre) ; ces deux
+  // bornes portent la réalité agronomique. Null = échéance ferme (saisie
+  // manuelle), comportement historique conservé.
+  fenetreDebut      DateTime? @map("fenetre_debut")
+  dateLimite        DateTime? @map("date_limite")
+  // Solde explicite d'une fenêtre fermée sans réalisation : ce n'est ni un
+  // « fait » (l'opération n'a pas eu lieu) ni un retard perpétuel. Conserve la
+  // trace de ce qui n'a pas été fait cette saison.
+  abandonneeLe      DateTime? @map("abandonnee_le")
   fait              Boolean   @default(true) @map("fait")
   dureeMinutes      Int?      @map("duree_minutes")
   nbPersonnes       Int?      @default(1) @map("nb_personnes")
@@ -1644,6 +1779,7 @@ model OperationArbre {
   @@index([type])
   @@index([fait])
   @@index([datePrevue])
+  @@index([dateLimite])
   @@map("operations_arbres")
 }
 
@@ -2118,6 +2254,7 @@ model Animal {
 
   // Relations
   productionsOeufs            ProductionOeuf[]
+  productionsRuche            ProductionRuche[]
   soins                       SoinAnimal[]
   abattages                   Abattage[]
   naissancesMere              NaissanceAnimale[]               @relation("NaissanceMere")
@@ -2170,6 +2307,7 @@ model LotAnimaux {
   // Relations
   animaux                     Animal[]
   productionsOeufs            ProductionOeuf[]
+  productionsRuche            ProductionRuche[]
   soins                       SoinAnimal[]
   abattages                   Abattage[]
   consommations               ConsommationAliment[]
@@ -2231,40 +2369,94 @@ model MouvementStockOeuf {
   @@map("mouvements_stock_oeufs")
 }
 
+/// Récoltes des produits de la ruche.
+/// Une ligne décrit une entrée physique, consommée par des mouvements FIFO.
+model ProductionRuche {
+  id              Int                   @id @default(autoincrement())
+  userId          String                @map("user_id")
+  user            User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lotId           Int?                  @map("lot_id")
+  lot             LotAnimaux?           @relation(fields: [lotId], references: [id], onDelete: SetNull)
+  // QA cmsbtlka1 — une ruche gérée en animal individuel (hors lot) doit pouvoir
+  // recevoir ses récoltes. XOR souple avec lotId (les deux restent optionnels).
+  animalId        Int?                  @map("animal_id")
+  animal          Animal?               @relation(fields: [animalId], references: [id], onDelete: SetNull)
+  date            DateTime              @default(now()) @map("date")
+  produit         String                @map("produit") // miel|cire|propolis|pollen|gelee_royale|autre
+  quantite        Float                 @map("quantite")
+  unite           String                @map("unite") // kg|g
+  numeroLot       String?               @map("numero_lot")
+  notes           String?               @map("notes")
+  createdAt       DateTime              @default(now()) @map("created_at")
+  updatedAt       DateTime              @updatedAt @map("updated_at")
+  mouvementsStock MouvementStockRuche[]
+
+  @@index([userId, date])
+  @@index([userId, produit])
+  @@index([lotId])
+  @@index([animalId])
+  @@map("productions_ruche")
+}
+
+/// Sortie physique d'une récolte de la ruche. Les ventes sont liées à leur
+/// VenteProduit ; les autres sorties peuvent être corrigées sans toucher à la compta.
+model MouvementStockRuche {
+  id             String          @id @default(cuid())
+  userId         String          @map("user_id")
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productionId   Int             @map("production_id")
+  production     ProductionRuche @relation(fields: [productionId], references: [id], onDelete: Restrict)
+  venteProduitId Int?            @map("vente_produit_id")
+  venteProduit   VenteProduit?   @relation(fields: [venteProduitId], references: [id], onDelete: Cascade)
+  operationId    String          @map("operation_id")
+  date           DateTime        @default(now()) @map("date")
+  type           String          @map("type") // vente|autoconsommation|don|destruction
+  quantite       Float           @map("quantite") // Toujours dans l'unité de la récolte source
+  notes          String?         @map("notes")
+  createdAt      DateTime        @default(now()) @map("created_at")
+
+  @@index([userId, date])
+  @@index([productionId])
+  @@index([venteProduitId])
+  @@index([userId, operationId])
+  @@map("mouvements_stock_ruche")
+}
+
 /// Ventes de produits (œufs, viande, animaux vivants)
 model VenteProduit {
-  id                Int                @id @default(autoincrement())
-  userId            String             @map("user_id")
-  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
-  date              DateTime           @default(now()) @map("date")
-  type              String             @map("type") // "oeufs", "viande", "animal_vivant", "lait", "autre"
-  description       String?            @map("description") // Ex: "Poulet fermier", "Œufs plein air"
-  quantite          Float              @map("quantite")
-  unite             String             @map("unite") // "unite", "douzaine", "kg", "L"
-  prixUnitaire      Float              @map("prix_unitaire")
-  prixTotal         Float              @map("prix_total")
-  client            String?            @map("client") // Nom du client
-  destinationId     String?            @map("destination")
-  destination       Destination?       @relation(fields: [destinationId], references: [id], onDelete: SetNull)
-  factureId         Int?               @map("facture_id")
-  facture           Facture?           @relation("VenteProduitFacture", fields: [factureId], references: [id])
-  paye              Boolean            @default(true) @map("paye")
-  annule            Boolean            @default(false) @map("annule")
-  dateAnnulation    DateTime?          @map("date_annulation")
+  id                   Int                   @id @default(autoincrement())
+  userId               String                @map("user_id")
+  user                 User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  date                 DateTime              @default(now()) @map("date")
+  type                 String                @map("type") // "oeufs", "viande", "animal_vivant", "lait", "fromage", produits de la ruche, "autre"
+  description          String?               @map("description") // Ex: "Poulet fermier", "Œufs plein air"
+  quantite             Float                 @map("quantite")
+  unite                String                @map("unite") // "unite", "douzaine", "kg", "L"
+  prixUnitaire         Float                 @map("prix_unitaire")
+  prixTotal            Float                 @map("prix_total")
+  client               String?               @map("client") // Nom du client
+  destinationId        String?               @map("destination")
+  destination          Destination?          @relation(fields: [destinationId], references: [id], onDelete: SetNull)
+  factureId            Int?                  @map("facture_id")
+  facture              Facture?              @relation("VenteProduitFacture", fields: [factureId], references: [id])
+  paye                 Boolean               @default(true) @map("paye")
+  annule               Boolean               @default(false) @map("annule")
+  dateAnnulation       DateTime?             @map("date_annulation")
   // Audit élevage 2026-06-11 — lien vers l'animal pour une vente
   // animal_vivant : sans lui, l'annulation ne peut pas restaurer le statut
   // de l'animal (il restait 'vendu' définitivement).
-  animalId          Int?               @map("animal_id")
-  animal            Animal?            @relation(fields: [animalId], references: [id], onDelete: SetNull)
-  tauxTVA           Float              @default(5.5) @map("taux_tva")
+  animalId             Int?                  @map("animal_id")
+  animal               Animal?               @relation(fields: [animalId], references: [id], onDelete: SetNull)
+  tauxTVA              Float                 @default(5.5) @map("taux_tva")
   // PROMPT 17 — traçabilité fromage : lien vers lot de fabrication
-  lotFromageId      String?            @map("lot_fromage_id")
-  lotFromage        LotFromage?        @relation(fields: [lotFromageId], references: [id], onDelete: SetNull)
+  lotFromageId         String?               @map("lot_fromage_id")
+  lotFromage           LotFromage?           @relation(fields: [lotFromageId], references: [id], onDelete: SetNull)
   // Review caprin 2026-07-21 — sortie(s) de cave générées par cette vente
   // (décrément de stock), pour restaurer le stock à l'annulation.
-  mouvementsFromage MouvementFromage[]
-  notes             String?            @map("notes")
-  createdAt         DateTime           @default(now()) @map("created_at")
+  mouvementsFromage    MouvementFromage[]
+  mouvementsStockRuche MouvementStockRuche[]
+  notes                String?               @map("notes")
+  createdAt            DateTime              @default(now()) @map("created_at")
 
   @@index([userId])
   @@index([type])

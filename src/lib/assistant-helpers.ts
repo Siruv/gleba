@@ -3,23 +3,35 @@
  * Calculs de dates, estimations de rendement, vérification de stock
  */
 
-import { startOfYear, addWeeks, startOfWeek, getWeek, getYear } from 'date-fns'
+import { getISOWeek } from 'date-fns'
+import { semaineVersDate } from './cultures/dates-itp'
+import { projectionRecolteKg } from './recolte/projection'
 
 /**
- * Calcule la date correspondant à une semaine donnée d'une annee
- * Utilise date-fns pour un calcul précis (ISO semaines)
+ * Lundi de la semaine ISO `semaine` de l'année `annee`.
+ *
+ * QA cmswxqnaz — cette fonction ÉCRIT des dates en base (creer-cultures,
+ * assistant) que tout le reste de l'application relit en semaine ISO
+ * (`getISOWeek`). Elle ancrait la semaine 1 sur « la semaine contenant le
+ * 1er janvier », convention `getWeek` (firstWeekContainsDate: 1) : dès que le
+ * 1er janvier tombe un vendredi, samedi ou dimanche (2027, 2028, 2032…), les
+ * deux conventions divergent d'une semaine. Une culture 2028 matérialisée
+ * depuis une rotation en S31 se relisait en S30, et une culture en S01 sortait
+ * carrément de la vue annuelle (`getISOWeekYear` = année précédente).
+ * On délègue donc à l'ancrage ISO (jeudi de la 1re semaine, cf. jan. 4) déjà
+ * utilisé par `src/lib/cultures/dates-itp.ts` : une seule convention pour
+ * l'écriture et la lecture. Les semaines > 52 débordent naturellement sur
+ * l'année suivante.
  */
 export function calculerDateDepuisSemaine(annee: number, semaine: number): Date {
-  const debut = startOfYear(new Date(annee, 0, 1))
-  const date = addWeeks(debut, semaine - 1)
-  return startOfWeek(date, { weekStartsOn: 1 }) // Lundi comme début de semaine
+  return semaineVersDate(annee, semaine)
 }
 
 /**
  * Obtient le numéro de semaine ISO à partir d'une date
  */
 export function getSemaineDepuisDate(date: Date): number {
-  return getWeek(date, { weekStartsOn: 1 })
+  return getISOWeek(date)
 }
 
 /**
@@ -28,18 +40,33 @@ export function getSemaineDepuisDate(date: Date): number {
  * tombe l'année suivante. Indispensable pour les ITP qui chevauchent deux années
  * (ex : semis semaine 31 en août → récolte semaine 2 en janvier de l'année +1).
  * `calculerDateDepuisSemaine` gère naturellement les semaines > 52 (débordement
- * sur l'année suivante via addWeeks).
+ * sur l'année suivante).
  */
 export function dateSemaineChrono(
   annee: number,
   semaine: number,
   semaineReference?: number | null
 ): Date {
+  return calculerDateDepuisSemaine(annee, semaineAbsolue(semaine, semaineReference))
+}
+
+/**
+ * Semaine reportée d'année en année tant qu'elle précède sa référence, rendue en
+ * valeur ABSOLUE (donc éventuellement > 52).
+ *
+ * C'est la valeur qu'il faut passer comme référence à l'étape SUIVANTE de la
+ * cascade : `dateSemaineChrono` ne compare qu'à sa référence, aussi lui donner
+ * une semaine déjà reportée sous sa forme bornée 1–52 perdait le report. Dans les
+ * notifications, un semis en S40 reportait bien la plantation en S5 de l'année
+ * suivante (S57 absolue), puis la récolte de S45 était comparée à S5 au lieu de
+ * S57 et retombait sur l'année de départ — récolte annoncée avant la plantation.
+ */
+export function semaineAbsolue(semaine: number, semaineReference?: number | null): number {
   let s = Math.max(Math.round(semaine), 1)
   if (semaineReference != null) {
     while (s < semaineReference) s += 52
   }
-  return calculerDateDepuisSemaine(annee, s)
+  return s
 }
 
 /**
@@ -126,14 +153,20 @@ export function estimerNombrePlantsStrict(
 }
 
 /**
- * Estime le rendement attendu
+ * Estime le rendement attendu sur une surface.
+ *
+ * `Espece.rendement` ne vaut pas toujours des kg/m² : le paramètre s'appelait
+ * `rendementKgM2` et était multiplié tel quel par la surface, ce qui faisait
+ * d'un kiwi à 25 kg/ARBRE 750 kg sur 30 m². L'unité fait partie de la donnée
+ * (cf. `recolte/projection`) ; rend 0 quand elle n'est pas surfacique, à
+ * charge de l'appelant de ne rien afficher plutôt qu'un chiffre inventé.
  */
 export function estimerRendement(
-  rendementKgM2: number | null | undefined,
-  surface: number // m²
+  rendement: number | null | undefined,
+  surface: number, // m²
+  uniteRendement?: string | null
 ): number {
-  if (!rendementKgM2 || !surface) return 0
-  return rendementKgM2 * surface
+  return projectionRecolteKg(surface, rendement, uniteRendement)
 }
 
 /**
@@ -220,6 +253,7 @@ export function necesiteIrrigation(espece: {
 export const CATEGORIES_ESPECES = {
   legume: { label: 'Légume', emoji: '🥬' },
   aromatique: { label: 'Aromatique', emoji: '🌿' },
+  fleur: { label: 'Fleur', emoji: '🌸' },
   engrais_vert: { label: 'Engrais vert', emoji: '🌱' },
   fruit: { label: 'Fruit', emoji: '🍎' },
   autre: { label: 'Autre', emoji: '🌾' },

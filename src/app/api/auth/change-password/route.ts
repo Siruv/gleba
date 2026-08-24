@@ -11,6 +11,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import prisma from "@/lib/prisma"
 import { requireAuthApi, hashPassword, verifyPassword } from "@/lib/auth-utils"
+import { getActeurId } from "@/lib/exploitation/garde-session"
 import { checkRateLimit, getClientIP } from "@/lib/rate-limit"
 
 const MIN_PASSWORD_LENGTH = 12
@@ -57,11 +58,25 @@ export async function POST(request: NextRequest) {
     }
 
     const user = await prisma.user.findUnique({
-      where: { id: session!.user.id },
+      // La PERSONNE connectée : un membre change son mot de passe, pas
+      // celui du propriétaire de l'exploitation.
+      where: { id: getActeurId(session) },
       select: { id: true, password: true },
     })
-    if (!user || !user.password) {
+    if (!user) {
       return NextResponse.json({ error: "Utilisateur introuvable" }, { status: 404 })
+    }
+    // Compte créé via Google, sans mot de passe local : la création du premier
+    // mot de passe passe par le flux « Mot de passe oublié » (preuve par
+    // email), pas par une session seule — anti hijack de session.
+    if (!user.password) {
+      return NextResponse.json(
+        {
+          error:
+            "Ce compte utilise la connexion Google et n'a pas encore de mot de passe. Créez-en un via « Mot de passe oublié » sur la page de connexion.",
+        },
+        { status: 400 }
+      )
     }
 
     const valid = await verifyPassword(currentPassword, user.password)

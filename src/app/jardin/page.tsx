@@ -18,12 +18,15 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog"
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
@@ -32,6 +35,7 @@ import {
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
@@ -50,6 +54,18 @@ import { calibrerFond, distance, formatDistance } from "@/lib/plan-fond-utils"
 import { croissanceCulture, envergureArbreADate } from "@/lib/plan-croissance"
 import { projeterGpsSurPlan, projeterPlanSurGps } from "@/lib/gps-plan-utils"
 import { partitionnerArbresPourSauvegarde } from "@/lib/plan-sauvegarde"
+import { nomsCopiesEnLot } from "@/lib/jardin/noms-copie"
+import {
+  TYPES_CONVERSION_PLANCHE,
+  TYPES_OBJETS_PAR_GROUPE,
+  gabaritObjet,
+  labelTypeObjet,
+  poseCopieObjet,
+  typeObjet,
+} from "@/lib/jardin/objets-plan"
+
+/** Garde-fou sur la duplication en lot (une requête par copie). */
+const MAX_COPIES_PLANCHE = 20
 
 // Palier 4 (perf) : dialogs lourds chargés à la demande, hors du bundle
 // initial de l'éditeur (le plus gros écran client de l'app).
@@ -159,15 +175,46 @@ interface Arbre {
   parcelleGeoId: string | null
 }
 
-const TYPES_OBJETS = [
-  { value: "allee", label: "Allée", color: "#d4a574" },
-  { value: "passage", label: "Passage", color: "#a8a29e" },
-  { value: "bordure", label: "Bordure", color: "#78716c" },
-  { value: "serre", label: "Serre", color: "#93c5fd" },
-  { value: "compost", label: "Compost", color: "#854d0e" },
-  { value: "eau", label: "Point d'eau", color: "#60a5fa" },
-  { value: "autre", label: "Autre", color: "#d1d5db" },
-]
+/**
+ * Sélecteur de type d'objet, sectionné.
+ *
+ * L'ajout du bâti porte le catalogue à douze types. Une liste à plat de douze
+ * lignes se parcourt mal ; les trois sections gardent le menu aussi court à
+ * l'œil qu'avant, et le même composant sert à la création et au panneau
+ * d'édition — les deux ne peuvent plus diverger.
+ */
+function SelectTypeObjet({
+  value,
+  onValueChange,
+  className,
+}: {
+  value: string
+  onValueChange: (v: string) => void
+  className?: string
+}) {
+  return (
+    <Select value={value} onValueChange={onValueChange}>
+      <SelectTrigger className={className}>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {TYPES_OBJETS_PAR_GROUPE.map(groupe => (
+          <SelectGroup key={groupe.groupe}>
+            <SelectLabel>{groupe.label}</SelectLabel>
+            {groupe.types.map(t => (
+              <SelectItem key={t.value} value={t.value}>
+                <div className="flex items-center gap-2">
+                  <div className="w-3 h-3 rounded" style={{ backgroundColor: t.color }} />
+                  {t.label}
+                </div>
+              </SelectItem>
+            ))}
+          </SelectGroup>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+}
 
 const TYPES_ARBRES = [
   { value: "fruitier", label: "Arbre fruitier", color: "#22c55e" },
@@ -291,6 +338,23 @@ function JardinContent() {
   }, [searchParams, parcelles])
   const [saving, setSaving] = React.useState(false)
   const autoSaveTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  /**
+   * Version du plan affiché, incrémentée à chaque modification (ticket
+   * cmsx6ak15). Sert à savoir si l'état a bougé pendant une sauvegarde : dans
+   * ce cas la sauvegarde qui se termine n'a pas écrit le dernier état et ne
+   * doit pas éteindre `hasChanges`.
+   */
+  const versionPlanRef = React.useRef(0)
+  /**
+   * Marque le plan comme modifié. Passe TOUJOURS par ici plutôt que par
+   * `setHasChanges(true)` : la version avance en même temps, seul moyen pour
+   * une sauvegarde qui se termine de savoir si elle a bien écrit le dernier
+   * état (ticket cmsx6ak15).
+   */
+  const marquerChangement = React.useCallback(() => {
+    versionPlanRef.current += 1
+    setHasChanges(true)
+  }, [])
 
   // Sélection multi-éléments
   const [selection, setSelection] = React.useState<SelectionItem[]>([])
@@ -356,7 +420,7 @@ function JardinContent() {
       // planches sans qu'aucune action utilisateur ait été faite.
       // Désormais, le positionnement auto est idempotent et n'est
       // persisté qu'au prochain mouvement réel (handleSave).
-      // if (needsPositioning) setHasChanges(true)
+      // if (needsPositioning) marquerChangement()
     } catch (error) {
       toastRef.current({
         variant: "destructive",
@@ -797,7 +861,7 @@ function JardinContent() {
     setPlanches(prev => prev.map(p =>
       p.id === id ? { ...p, posX: x, posY: y } : p
     ))
-    setHasChanges(true)
+    marquerChangement()
   }
 
   // Déplacer un objet
@@ -805,7 +869,7 @@ function JardinContent() {
     setObjets(prev => prev.map(o =>
       o.id === id ? { ...o, posX: x, posY: y } : o
     ))
-    setHasChanges(true)
+    marquerChangement()
   }
 
   // Déplacer un arbre
@@ -841,7 +905,7 @@ function JardinContent() {
     setArbres(prev => prev.map(a =>
       a.id === id ? { ...a, posX: x, posY: y } : a
     ))
-    setHasChanges(true)
+    marquerChangement()
   }
 
   const handleArbreMoveEnd = async (
@@ -900,7 +964,7 @@ function JardinContent() {
         : a
     ))
     nettoyerAttente()
-    setHasChanges(true)
+    marquerChangement()
     toast({
       title: "Position GPS mise à jour",
       description: `${arbre.nom} restera aligné sur la carte, le plan 2D et la vue 3D.`,
@@ -951,7 +1015,7 @@ function JardinContent() {
     }
     const arbreSansGps = Array.from(selArbres).some((id) => !arbresGps.has(id))
     if (selPlanches.size > 0 || selObjets.size > 0 || arbreSansGps) {
-      setHasChanges(true)
+      marquerChangement()
     }
   }, [selection, arbres])
 
@@ -968,7 +1032,7 @@ function JardinContent() {
         ? { ...p, rotation2D: normaliserAngle((p.rotation2D || 0) + degrees) }
         : p
     ))
-    setHasChanges(true)
+    marquerChangement()
   }
 
   // Tourner un objet
@@ -979,11 +1043,15 @@ function JardinContent() {
         ? { ...o, rotation2D: normaliserAngle(o.rotation2D + degrees) }
         : o
     ))
-    setHasChanges(true)
+    marquerChangement()
   }
 
   // Sauvegarder les positions
   const handleSave = async () => {
+    // Témoin d'ordre : incrémenté à chaque changement d'état du plan (effet
+    // ci-dessous). Si un déplacement survient pendant l'écriture, le compteur
+    // aura bougé et `hasChanges` doit rester armé (ticket cmsx6ak15).
+    const versionAuDepart = versionPlanRef.current
     // QA 2026-07-30 — Une position GPS en attente de confirmation ne doit pas
     // être persistée, mais le verrou portait sur TOUTE la sauvegarde : une
     // modale abandonnée sans réponse rendait planches, objets et tous les
@@ -994,7 +1062,7 @@ function JardinContent() {
     setSaving(true)
     try {
       const planchePromises = planches.map(p =>
-        fetch(`/api/planches/${encodeURIComponent(p.nom || p.id)}`, {
+        fetch(`/api/planches/${encodeURIComponent(p.id)}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1066,13 +1134,13 @@ function JardinContent() {
       const results = await Promise.all([...planchePromises, ...objetPromises, ...arbrePromises])
 
       if (results.every(r => r.ok)) {
+        if (versionPlanRef.current === versionAuDepart) setHasChanges(false)
         toast({
           title: "Plan sauvegardé",
           description: arbresDifferes.length > 0
             ? `Positions enregistrées. ${arbresDifferes.length} arbre${arbresDifferes.length > 1 ? "s" : ""} en attente de confirmation GPS ${arbresDifferes.length > 1 ? "n'ont" : "n'a"} pas été déplacé${arbresDifferes.length > 1 ? "s" : ""}.`
             : "Les positions ont été enregistrées"
         })
-        setHasChanges(false)
       } else {
         toast({
           variant: "destructive",
@@ -1092,11 +1160,26 @@ function JardinContent() {
   }
 
   // Auto-save débounced (1s après le dernier changement)
+  //
+  // Ticket cmsx6ak15 (QA 2026-08-17, 🔴) — une planche déplacée de 4 m
+  // revenait à 6 m après F5 : DEUX mètres seulement étaient persistés. Cause :
+  // toute modification survenue PENDANT une sauvegarde en vol était perdue.
+  // `saving` faisait sortir l'effet sans réarmer de minuteur, et `saving`
+  // n'était pas dans les dépendances : sa retombée à `false` ne relançait donc
+  // rien. La fin de la sauvegarde remettait par-dessus `hasChanges` à false,
+  // effaçant le témoin des changements qu'elle n'avait pas écrits. Un
+  // déplacement long (donc coupé par une sauvegarde intermédiaire) perdait
+  // silencieusement son dernier segment — sans bouton « Enregistrer » pour
+  // rattraper.
   React.useEffect(() => {
     // `pendingGpsMovesCount` ne bloque plus l'auto-save (cf. handleSave) : il
     // reste dans les dépendances pour relancer une sauvegarde dès qu'une
     // confirmation est tranchée.
-    if (!hasChanges || saving) return
+    if (!hasChanges) return
+    // Une sauvegarde est en vol : ne pas en lancer une seconde en parallèle,
+    // mais l'effet sera rejoué à sa retombée (`saving` est en dépendance) et
+    // réarmera le minuteur avec l'état le plus récent.
+    if (saving) return
     if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
     autoSaveTimer.current = setTimeout(() => {
       handleSave()
@@ -1105,7 +1188,7 @@ function JardinContent() {
       if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasChanges, planches, objets, arbres, pendingGpsMovesCount])
+  }, [hasChanges, saving, planches, objets, arbres, pendingGpsMovesCount])
 
   // Réorganiser en grille
   const handleReset = () => {
@@ -1116,7 +1199,7 @@ function JardinContent() {
       posX: (i % cols) * ((p.largeur || 0.8) + spacing),
       posY: Math.floor(i / cols) * ((p.longueur || 2) + spacing)
     })))
-    setHasChanges(true)
+    marquerChangement()
   }
 
   // Recentrer la vue
@@ -1172,6 +1255,38 @@ function JardinContent() {
     }
   }
 
+  // Renommage de la planche sélectionnée, depuis l'en-tête du panneau.
+  const [nomPlancheEdite, setNomPlancheEdite] = React.useState<string | null>(null)
+
+  // Repartir du nom réel dès qu'on change de sélection.
+  React.useEffect(() => { setNomPlancheEdite(null) }, [selectedPlanche])
+
+  const renommerPlanche = async () => {
+    const source = selectedPlancheData
+    const saisi = nomPlancheEdite?.trim()
+    setNomPlancheEdite(null)
+    if (!source || !saisi || saisi === source.nom) return
+
+    try {
+      const response = await fetch(`/api/planches/${encodeURIComponent(source.id)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nom: saisi }),
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(payload?.error || "Erreur renommage")
+
+      toast({ title: "Planche renommée", description: saisi })
+      await fetchPlanches()
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Renommage impossible",
+        description: error instanceof Error ? error.message : "Erreur inconnue",
+      })
+    }
+  }
+
   // Supprimer la planche sélectionnée
   const handleDeletePlanche = async () => {
     if (!selectedPlanche) return
@@ -1179,7 +1294,7 @@ function JardinContent() {
     if (!(await confirmDialog(`Supprimer la planche "${plancheNom}" ?`))) return
 
     try {
-      const response = await fetch(`/api/planches/${encodeURIComponent(plancheNom)}`, {
+      const response = await fetch(`/api/planches/${encodeURIComponent(selectedPlanche)}`, {
         method: "DELETE"
       })
 
@@ -1200,51 +1315,105 @@ function JardinContent() {
     }
   }
 
-  // Dupliquer la planche sélectionnée
-  const handleDuplicatePlanche = async () => {
+  // Dupliquer la planche sélectionnée, éventuellement en plusieurs exemplaires.
+  //
+  // Friction observée le 2026-07-30 : un utilisateur voulait dix planches
+  // identiques. Le seul chemin était de cliquer dix fois, et chaque copie
+  // reprenait le nom déjà suffixé de la précédente → « 4-copie-copie-copie… ».
+  // On numérote désormais à partir du nom de base, et on aligne les copies le
+  // long de la largeur au lieu de les décaler en diagonale d'un mètre.
+  const handleDuplicatePlanche = async (nombre = 1) => {
     if (!selectedPlanche) return
     const source = planches.find(p => p.id === selectedPlanche)
     if (!source) return
 
-    // Générer un nom unique basé sur l'original
-    const sourceName = source.nom || source.id
-    let newName = sourceName + "-copie"
-    let suffix = 2
-    while (planches.some(p => (p.nom || p.id) === newName)) {
-      newName = sourceName + "-copie" + suffix
-      suffix++
-    }
+    const copies = Math.max(1, Math.min(nombre, MAX_COPIES_PLANCHE))
+    const noms = nomsCopiesEnLot(
+      source.nom || source.id,
+      planches.map(p => p.nom || p.id),
+      copies
+    )
+    const pas = (source.largeur || 1) + 0.4
 
     try {
-      const response = await fetch("/api/planches", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          nom: newName,
-          largeur: source.largeur,
-          longueur: source.longueur,
-          surface: (source.largeur || 0) * (source.longueur || 0),
-          posX: (source.posX ?? 0) + 1,
-          posY: (source.posY ?? 0) + 1,
-          rotation2D: source.rotation2D,
-          parcelleGeoId: selectedParcelleId || undefined,
+      let dernierId: string | null = null
+      for (const [index, nom] of noms.entries()) {
+        const response = await fetch("/api/planches", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            nom,
+            largeur: source.largeur,
+            longueur: source.longueur,
+            surface: (source.largeur || 0) * (source.longueur || 0),
+            posX: Math.round(((source.posX ?? 0) + pas * (index + 1)) * 10) / 10,
+            posY: source.posY ?? 0,
+            rotation2D: source.rotation2D,
+            parcelleGeoId: selectedParcelleId || undefined,
+          })
         })
-      })
 
-      if (!response.ok) {
-        const err = await response.json()
-        throw new Error(err.error || "Erreur duplication")
+        if (!response.ok) {
+          const err = await response.json()
+          throw new Error(err.error || "Erreur duplication")
+        }
+
+        const created = await response.json()
+        dernierId = created.id
       }
 
-      const created = await response.json()
-      toast({ title: "Planche dupliquée", description: newName })
+      toast({
+        title: copies > 1 ? `${copies} planches créées` : "Planche dupliquée",
+        description: noms.join(", "),
+      })
       await fetchPlanches()
-      setSelection([{ type: 'planche', id: created.id }])
+      if (dernierId) setSelection([{ type: 'planche', id: dernierId }])
     } catch (error) {
+      // Les copies déjà créées avant l'échec sont conservées : on rafraîchit
+      // pour que le plan reflète l'état réel plutôt qu'un compte optimiste.
+      await fetchPlanches()
       toast({
         variant: "destructive",
         title: "Erreur",
         description: error instanceof Error ? error.message : "Erreur inconnue"
+      })
+    }
+  }
+
+  // Reclasser une planche en objet du plan.
+  //
+  // Faute de types bâti, l'outil « planche » servait à dessiner murs et
+  // clôtures. Supprimer puis redessiner ferait perdre le placement, qui est
+  // l'essentiel du travail de tracé. L'API refuse la conversion dès qu'un
+  // historique de culture existe : dans ce cas c'est une vraie planche.
+  const handleConvertirPlanche = async (type: string) => {
+    if (!selectedPlanche) return
+    const source = selectedPlancheData
+    const label = labelTypeObjet(type)
+    if (!(await confirmDialog(
+      `Reclasser « ${source?.nom || selectedPlanche} » en ${label.toLowerCase()} ? La planche disparaît de la liste des planches ; sa position et ses dimensions sont conservées.`
+    ))) return
+
+    try {
+      const response = await fetch(
+        `/api/planches/${encodeURIComponent(selectedPlanche)}/convertir-en-objet`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type }),
+        }
+      )
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(payload?.error || "Erreur conversion")
+
+      toast({ title: `Reclassé en ${label.toLowerCase()}`, description: source?.nom })
+      setSelection(payload?.objet?.id ? [{ type: 'objet', id: payload.objet.id }] : [])
+      await Promise.all([fetchPlanches(), fetchObjets()])
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Conversion impossible",
+        description: error instanceof Error ? error.message : "Erreur inconnue",
       })
     }
   }
@@ -1290,7 +1459,9 @@ function JardinContent() {
 
       toast({ title: "Objet créé" })
       setShowNewObjetDialog(false)
-      setNewObjet({ nom: "", type: "allee", largeur: 0.5, longueur: 5 })
+      // On garde le type qui vient d'être utilisé, avec son gabarit : créer
+      // plusieurs murs à la suite est le cas courant.
+      setNewObjet(o => ({ nom: "", type: o.type, ...gabaritObjet(o.type) }))
       fetchObjets()
     } catch (error) {
       toast({
@@ -1328,39 +1499,71 @@ function JardinContent() {
     }
   }
 
-  // Dupliquer l'objet sélectionné
-  const handleDuplicateObjet = async () => {
+  // Dupliquer l'objet sélectionné, éventuellement en plusieurs exemplaires.
+  //
+  // L'objet n'avait qu'une duplication unitaire, posée en diagonale (+1, +1).
+  // Tracer un mur ou une clôture imposait donc de créer chaque tronçon puis de
+  // le replacer à la main, là où la planche offrait déjà « Dupliquer ×N » — ce
+  // qui poussait à dessiner du bâti avec des planches.
+  // Les copies suivent désormais l'orientation propre de l'objet : un élément
+  // linéaire s'enchaîne bout à bout, le reste se pose côte à côte
+  // (cf. poseCopieObjet).
+  const handleDuplicateObjet = async (nombre = 1) => {
     if (!selectedObjet) return
     const source = objets.find(o => o.id === selectedObjet)
     if (!source) return
 
-    try {
-      const response = await fetch("/api/objets-jardin", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          nom: source.nom ? source.nom + " (copie)" : null,
-          type: source.type,
-          largeur: source.largeur,
-          longueur: source.longueur,
-          posX: source.posX + 1,
-          posY: source.posY + 1,
-          rotation2D: source.rotation2D,
-          couleur: source.couleur,
-          parcelleGeoId: selectedParcelleId || undefined,
-        })
-      })
+    const copies = Math.max(1, Math.min(nombre, MAX_COPIES_PLANCHE))
+    const { lineaire, label } = typeObjet(source.type)
+    // Un objet sans nom le reste : numéroter « (2) » un objet anonyme
+    // n'apporterait rien sur le plan.
+    const noms: (string | null)[] = source.nom
+      ? nomsCopiesEnLot(source.nom, objets.map(o => o.nom || "").filter(Boolean), copies)
+      : Array.from({ length: copies }, () => null)
 
-      if (!response.ok) {
-        const err = await response.json()
-        throw new Error(err.error || "Erreur duplication")
+    try {
+      let dernierId: number | null = null
+      for (const [index, nom] of noms.entries()) {
+        const { posX, posY } = poseCopieObjet(source, index + 1, lineaire)
+        const response = await fetch("/api/objets-jardin", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            nom,
+            type: source.type,
+            largeur: source.largeur,
+            longueur: source.longueur,
+            posX,
+            posY,
+            rotation2D: source.rotation2D,
+            couleur: source.couleur,
+            parcelleGeoId: selectedParcelleId || undefined,
+          })
+        })
+
+        if (!response.ok) {
+          const err = await response.json()
+          throw new Error(err.error || "Erreur duplication")
+        }
+
+        const created = await response.json()
+        dernierId = created.id
       }
 
-      const created = await response.json()
-      toast({ title: "Objet dupliqué" })
+      toast({
+        title: copies === 1
+          ? "Objet dupliqué"
+          : lineaire
+            ? `${copies} tronçons ajoutés`
+            : `${copies} objets créés`,
+        description: source.nom ? noms.join(", ") : label,
+      })
       await fetchObjets()
-      setSelection([{ type: 'objet', id: created.id }])
+      if (dernierId !== null) setSelection([{ type: 'objet', id: dernierId }])
     } catch (error) {
+      // Comme pour les planches : les copies créées avant l'échec sont
+      // conservées, on rafraîchit pour montrer l'état réel.
+      await fetchObjets()
       toast({
         variant: "destructive",
         title: "Erreur",
@@ -1373,6 +1576,18 @@ function JardinContent() {
   const handleCreateArbre = async () => {
     if (!newArbre.nom.trim()) {
       toast({ variant: "destructive", title: "Nom requis" })
+      return
+    }
+    // Friction du 2026-08-12 : un arbre créé ici sans espèce n'obtenait aucun
+    // calendrier d'entretien et sortait « Productif » le jour de sa
+    // plantation (la création rapide force `datePlantation` à aujourd'hui).
+    // L'API la refuse désormais : on le dit avant l'aller-retour.
+    if (!newArbre.espece.trim()) {
+      toast({
+        variant: "destructive",
+        title: "Espèce requise",
+        description: "Elle conditionne le calendrier d'entretien et l'âge d'entrée en production.",
+      })
       return
     }
 
@@ -1398,7 +1613,7 @@ function JardinContent() {
         body: JSON.stringify({
           nom: newArbre.nom.trim(),
           type: newArbre.type,
-          espece: newArbre.espece || null,
+          espece: newArbre.espece.trim(),
           variete: newArbre.variete || null,
           fournisseur: newArbre.fournisseur || null,
           envergure: newArbre.envergure,
@@ -2130,8 +2345,22 @@ function JardinContent() {
             {selectedPlancheData ? (
               <Card>
                 <CardHeader className="pb-2">
-                  <div className="flex items-center justify-between">
-                    <CardTitle className="text-base">{selectedPlancheData.nom || selectedPlancheData.id}</CardTitle>
+                  <div className="flex items-center justify-between gap-2">
+                    {/* Nom modifiable sur place : sans ça, une planche mal
+                        nommée à la duplication le restait définitivement. */}
+                    <input
+                      className="min-w-0 flex-1 rounded border border-transparent bg-transparent px-1 py-0.5 text-base font-semibold hover:border-slate-300 focus:border-slate-400 focus:bg-white focus:outline-none"
+                      value={nomPlancheEdite ?? (selectedPlancheData.nom || selectedPlancheData.id)}
+                      onChange={(e) => setNomPlancheEdite(e.target.value)}
+                      onFocus={() => setNomPlancheEdite(selectedPlancheData.nom || selectedPlancheData.id)}
+                      onBlur={() => void renommerPlanche()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") e.currentTarget.blur()
+                        if (e.key === "Escape") { setNomPlancheEdite(null); e.currentTarget.blur() }
+                      }}
+                      title="Cliquez pour renommer la planche"
+                      aria-label="Nom de la planche"
+                    />
                     <Button variant="ghost" size="icon" onClick={() => setSelection([])}>
                       <X className="h-4 w-4" />
                     </Button>
@@ -2152,7 +2381,7 @@ function JardinContent() {
                           setPlanches(prev => prev.map(p =>
                             p.id === selectedPlancheData.id ? { ...p, largeur: val } : p
                           ))
-                          setHasChanges(true)
+                          marquerChangement()
                         }}
                       />
                     </div>
@@ -2169,7 +2398,7 @@ function JardinContent() {
                           setPlanches(prev => prev.map(p =>
                             p.id === selectedPlancheData.id ? { ...p, longueur: val } : p
                           ))
-                          setHasChanges(true)
+                          marquerChangement()
                         }}
                       />
                     </div>
@@ -2256,13 +2485,53 @@ function JardinContent() {
                         <Plus className="h-4 w-4 mr-1" />
                         Culture
                       </Button>
-                      <Button variant="outline" size="sm" onClick={handleDuplicatePlanche} title="Dupliquer">
-                        <Copy className="h-4 w-4" />
-                      </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="outline" size="sm" title="Dupliquer">
+                            <Copy className="h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          {[1, 2, 3, 5, 10].map(n => (
+                            <DropdownMenuItem key={n} onClick={() => handleDuplicatePlanche(n)}>
+                              {n === 1 ? "Dupliquer" : `Dupliquer ×${n}`}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                       <Button variant="destructive" size="sm" onClick={handleDeletePlanche}>
                         <Trash2 className="h-4 w-4" />
                       </Button>
                     </div>
+                    {/* Aucune culture en cours : la planche est peut-être un
+                        élément du plan saisi comme planche, faute de type bâti
+                        à l'époque. On propose de la reclasser sans perdre son
+                        placement.
+                        Attention : `cultures` ne porte ici que l'année courante
+                        non terminée (cf. /api/jardin), ce n'est donc PAS une
+                        preuve d'absence d'historique. L'autorité reste la route
+                        de conversion, qui refuse dès qu'une culture, une
+                        fertilisation ou une analyse de sol existe. */}
+                    {selectedPlancheData.cultures.length === 0 && (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="sm" className="w-full justify-start text-xs text-muted-foreground">
+                            Ce n&apos;est pas une planche ?
+                            <ChevronDown className="h-3 w-3 ml-auto" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start">
+                          <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+                            Reclasser en élément du plan
+                          </DropdownMenuLabel>
+                          {TYPES_CONVERSION_PLANCHE.map(value => (
+                            <DropdownMenuItem key={value} onClick={() => handleConvertirPlanche(value)}>
+                              {labelTypeObjet(value)}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    )}
                   </div>
                 </CardContent>
               </Card>
@@ -2271,7 +2540,7 @@ function JardinContent() {
                 <CardHeader className="pb-2">
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-base">
-                      {selectedObjetData.nom || TYPES_OBJETS.find(t => t.value === selectedObjetData.type)?.label || "Objet"}
+                      {selectedObjetData.nom || labelTypeObjet(selectedObjetData.type)}
                     </CardTitle>
                     <Button variant="ghost" size="icon" onClick={() => setSelection([])}>
                       <X className="h-4 w-4" />
@@ -2283,29 +2552,16 @@ function JardinContent() {
                     {/* Type */}
                     <div>
                       <Label className="text-xs text-muted-foreground">Type</Label>
-                      <Select
+                      <SelectTypeObjet
+                        className="h-8 text-sm"
                         value={selectedObjetData.type}
                         onValueChange={(v) => {
                           setObjets(prev => prev.map(o =>
                             o.id === selectedObjet ? { ...o, type: v } : o
                           ))
-                          setHasChanges(true)
+                          marquerChangement()
                         }}
-                      >
-                        <SelectTrigger className="h-8 text-sm">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {TYPES_OBJETS.map(t => (
-                            <SelectItem key={t.value} value={t.value}>
-                              <div className="flex items-center gap-2">
-                                <div className="w-3 h-3 rounded" style={{ backgroundColor: t.color }} />
-                                {t.label}
-                              </div>
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
+                      />
                       </div>
 
                       {/* Nom */}
@@ -2318,7 +2574,7 @@ function JardinContent() {
                             setObjets(prev => prev.map(o =>
                               o.id === selectedObjet ? { ...o, nom: e.target.value || null } : o
                             ))
-                            setHasChanges(true)
+                            marquerChangement()
                           }}
                           placeholder="Ex: Allee principale"
                         />
@@ -2339,7 +2595,7 @@ function JardinContent() {
                               setObjets(prev => prev.map(o =>
                                 o.id === selectedObjet ? { ...o, largeur: val } : o
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2356,7 +2612,7 @@ function JardinContent() {
                               setObjets(prev => prev.map(o =>
                                 o.id === selectedObjet ? { ...o, longueur: val } : o
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2368,12 +2624,12 @@ function JardinContent() {
                         <div className="flex gap-2">
                           <input
                             type="color"
-                            value={selectedObjetData.couleur || TYPES_OBJETS.find(t => t.value === selectedObjetData.type)?.color || "#d1d5db"}
+                            value={selectedObjetData.couleur || typeObjet(selectedObjetData.type).color}
                             onChange={(e) => {
                               setObjets(prev => prev.map(o =>
                                 o.id === selectedObjet ? { ...o, couleur: e.target.value } : o
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                             className="h-8 w-12 rounded border border-slate-300 cursor-pointer"
                           />
@@ -2385,7 +2641,7 @@ function JardinContent() {
                               setObjets(prev => prev.map(o =>
                                 o.id === selectedObjet ? { ...o, couleur: null } : o
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           >
                             Par defaut
@@ -2411,10 +2667,27 @@ function JardinContent() {
 
                       {/* Actions */}
                       <div className="flex gap-2">
-                        <Button variant="outline" size="sm" onClick={handleDuplicateObjet} className="flex-1">
-                          <Copy className="h-4 w-4 mr-2" />
-                          Dupliquer
-                        </Button>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button variant="outline" size="sm" className="flex-1">
+                              <Copy className="h-4 w-4 mr-2" />
+                              Dupliquer
+                              <ChevronDown className="h-4 w-4 ml-1" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="start">
+                            {typeObjet(selectedObjetData.type).lineaire && (
+                              <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+                                Copies enchaînées bout à bout
+                              </DropdownMenuLabel>
+                            )}
+                            {[1, 2, 3, 5, 10].map(n => (
+                              <DropdownMenuItem key={n} onClick={() => handleDuplicateObjet(n)}>
+                                {n === 1 ? "Dupliquer" : `Dupliquer ×${n}`}
+                              </DropdownMenuItem>
+                            ))}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
                         <Button variant="destructive" size="sm" onClick={handleDeleteObjet} className="flex-1">
                           <Trash2 className="h-4 w-4 mr-2" />
                           Supprimer
@@ -2445,7 +2718,7 @@ function JardinContent() {
                             setArbres(prev => prev.map(a =>
                               a.id === selectedArbre ? { ...a, nom: e.target.value } : a
                             ))
-                            setHasChanges(true)
+                            marquerChangement()
                           }}
                         />
                       </div>
@@ -2459,7 +2732,7 @@ function JardinContent() {
                             setArbres(prev => prev.map(a =>
                               a.id === selectedArbre ? { ...a, type: v } : a
                             ))
-                            setHasChanges(true)
+                            marquerChangement()
                           }}
                         >
                           <SelectTrigger className="h-8 text-sm">
@@ -2488,7 +2761,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, espece: v || null } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                             options={arbreEspeceOptions}
                             placeholder="Ex: Pommier"
@@ -2503,7 +2776,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, variete: v || null } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                             options={arbreVarieteOptions}
                             placeholder="Ex: Golden"
@@ -2522,7 +2795,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, portGreffe: v || null, porteGreffeId: null } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                             options={arbrePortGreffeOptions}
                             placeholder="Ex: M26"
@@ -2537,7 +2810,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, formeTaille: v === "_none" ? null : v } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           >
                             <SelectTrigger className="h-8 text-sm">
@@ -2562,7 +2835,7 @@ function JardinContent() {
                             setArbres(prev => prev.map(a =>
                               a.id === selectedArbre ? { ...a, parcelleGeoId: v === "__none__" ? null : v } : a
                             ))
-                            setHasChanges(true)
+                            marquerChangement()
                           }}
                         >
                           <SelectTrigger className="h-8 text-sm">
@@ -2600,7 +2873,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, datePlantation: e.target.value || null } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2616,7 +2889,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, age: val } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2631,7 +2904,7 @@ function JardinContent() {
                             setArbres(prev => prev.map(a =>
                               a.id === selectedArbre ? { ...a, fournisseur: v || null } : a
                             ))
-                            setHasChanges(true)
+                            marquerChangement()
                           }}
                           options={arbreFournisseurOptions}
                           placeholder="Ex: Pépinière locale"
@@ -2651,7 +2924,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, dateAchat: e.target.value || null } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2668,7 +2941,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, prixAchat: val } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2689,7 +2962,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, envergure: val } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2707,7 +2980,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, envergureAdulte: Number.isFinite(val as number) ? val : null } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2732,7 +3005,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, hauteur: val } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2749,7 +3022,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, circonferenceCm: val } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                             placeholder="ex: 15"
                           />
@@ -2766,7 +3039,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, etat: v } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           >
                             <SelectTrigger className="h-8 text-sm">
@@ -2787,7 +3060,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, productif: v === "oui" } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           >
                             <SelectTrigger className="h-8 text-sm">
@@ -2816,7 +3089,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, anneeProduction: val } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2833,7 +3106,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, rendementMoyen: val } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           />
                         </div>
@@ -2848,7 +3121,7 @@ function JardinContent() {
                             setArbres(prev => prev.map(a =>
                               a.id === selectedArbre ? { ...a, pollinisateur: v || null } : a
                             ))
-                            setHasChanges(true)
+                            marquerChangement()
                           }}
                           options={arbreVarieteOptions}
                           placeholder="Ex: Granny Smith"
@@ -2867,7 +3140,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, couleur: e.target.value } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                             className="h-8 w-12 rounded border border-slate-300 cursor-pointer"
                           />
@@ -2879,7 +3152,7 @@ function JardinContent() {
                               setArbres(prev => prev.map(a =>
                                 a.id === selectedArbre ? { ...a, couleur: null } : a
                               ))
-                              setHasChanges(true)
+                              marquerChangement()
                             }}
                           >
                             Par defaut
@@ -2898,7 +3171,7 @@ function JardinContent() {
                             setArbres(prev => prev.map(a =>
                               a.id === selectedArbre ? { ...a, notes: e.target.value || null } : a
                             ))
-                            setHasChanges(true)
+                            marquerChangement()
                           }}
                           placeholder="Notes..."
                         />
@@ -3071,7 +3344,7 @@ function JardinContent() {
                 {arbresGpsHorsCadre > 0 && (
                   <p className="text-amber-700">
                     • {arbresGpsHorsCadre} arbre{arbresGpsHorsCadre > 1 ? "s" : ""} {arbresGpsHorsCadre > 1 ? "ont" : "a"} un
-                    relevé GPS situé hors de cette parcelle : {arbresGpsHorsCadre > 1 ? "leur position" : "sa position"} sur
+                    relevé GPS situé hors de cette parcelle : {arbresGpsHorsCadre > 1 ? "leur position" : "sa position"} sur{" "}
                     le plan n&apos;est pas significative. Corrigez le relevé depuis la fiche de l&apos;arbre plutôt
                     qu&apos;en le déplaçant ici, ce qui écraserait les coordonnées réelles.
                   </p>
@@ -3140,21 +3413,13 @@ function JardinContent() {
           <div className="space-y-4 py-4">
             <div>
               <Label htmlFor="objet-type">Type</Label>
-              <Select value={newObjet.type} onValueChange={v => setNewObjet(o => ({ ...o, type: v }))}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {TYPES_OBJETS.map(t => (
-                    <SelectItem key={t.value} value={t.value}>
-                      <div className="flex items-center gap-2">
-                        <div className="w-3 h-3 rounded" style={{ backgroundColor: t.color }} />
-                        {t.label}
-                      </div>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              {/* Changer de type applique son gabarit : sans valeur de départ
+                  crédible, on recrée un modèle par dimension au lieu d'en
+                  redimensionner un. Les champs restent libres. */}
+              <SelectTypeObjet
+                value={newObjet.type}
+                onValueChange={v => setNewObjet(o => ({ ...o, type: v, ...gabaritObjet(v) }))}
+              />
             </div>
             <div>
               <Label htmlFor="objet-nom">Nom (optionnel)</Label>
@@ -3231,13 +3496,14 @@ function JardinContent() {
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <Label htmlFor="arbre-espece">Espèce</Label>
+                <Label htmlFor="arbre-espece">Espèce *</Label>
                 <Combobox
                   value={newArbre.espece}
                   onValueChange={v => setNewArbre(a => ({ ...a, espece: v }))}
                   options={arbreEspeceOptions}
                   placeholder="Ex: Pommier"
                 />
+                <p className="text-xs text-muted-foreground mt-1">Génère le calendrier d&apos;entretien</p>
               </div>
               <div>
                 <Label htmlFor="arbre-variete">Variété</Label>
@@ -3298,6 +3564,9 @@ function JardinContent() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Image de fond du plan</DialogTitle>
+            <DialogDescription>
+              Importez une photo satellite ou drone, puis calibrez son échelle pour la superposer au plan.
+            </DialogDescription>
           </DialogHeader>
           <input
             ref={fondFileInputRef}

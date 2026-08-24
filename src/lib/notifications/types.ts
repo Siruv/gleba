@@ -124,4 +124,11 @@ export interface DestinataireNotification {
   id: string
   email: string
   name: string | null
+  /**
+   * Lien de désabonnement 1 clic (RFC 8058) de l'utilisateur. Résolu par le
+   * sender juste avant l'envoi : ces emails sont récurrents et NON
+   * transactionnels, ils doivent donc porter un désabonnement comme les
+   * campagnes (cf. src/lib/unsubscribe.ts).
+   */
+  unsubscribeUrl?: string
 }

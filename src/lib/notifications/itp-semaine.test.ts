@@ -65,17 +65,24 @@ describe("semaineCourante", () => {
     expect(s.finIso).toBe("2026-08-23")
   })
 
-  it("gère le chevauchement de fin d'année (31 déc. 2026 = semaine 1 de 2026)", () => {
+  // Convention ISO stricte (getISOWeek/getISOWeekYear), la seule utilisée par le
+  // référentiel Gleba : la semaine 1 est celle du premier jeudi de janvier, pas
+  // celle qui contient le 1er janvier. Le 1er janvier 2027 tombe un vendredi —
+  // c'est exactement le cas où les deux conventions divergent (cf. QA cmswxqnaz
+  // dans src/lib/assistant-helpers.ts). Le couple (annee, semaine) doit rester
+  // cohérent, sinon la clé anti-redondance `tache-itp-semaine:AAAA-Sww` désigne
+  // une autre semaine de l'année.
+  it("gère le chevauchement de fin d'année (31 déc. 2026 = semaine 53 de 2026)", () => {
     const s = semaineCourante(new Date(2026, 11, 31))
-    expect(s.semaine).toBe(1)
+    expect(s.semaine).toBe(53)
     expect(s.annee).toBe(2026)
     expect(s.debutIso).toBe("2026-12-28")
     expect(s.finIso).toBe("2027-01-03")
   })
 
-  it("gère la bascule d'année ISO (4 janv. 2027 = semaine 2 de 2027)", () => {
+  it("gère la bascule d'année ISO (4 janv. 2027 = semaine 1 de 2027)", () => {
     const s = semaineCourante(new Date(2027, 0, 4))
-    expect(s.semaine).toBe(2)
+    expect(s.semaine).toBe(1)
     expect(s.annee).toBe(2027)
     expect(s.debutIso).toBe("2027-01-04")
   })
@@ -280,5 +287,60 @@ describe("tachesItpSemainePourCultures", () => {
 
   it("ne génère rien sans aucune culture", () => {
     expect(tachesItpSemainePourCultures([], { aujourdHui: REFERENCE })).toHaveLength(0)
+  })
+})
+
+describe("la date saisie fait foi", () => {
+  // QA C14 : les notifications se calculaient sur les semaines THÉORIQUES de
+  // l'ITP alors que /taches lit les dates stockées. Une courgette semée le 15/04
+  // (S16) avec un ITP à S14/S18/S34 recevait « planter » en S18, quand l'écran
+  // plaçait la plantation au 20/05 (S21) — et rien n'arrivait en S21.
+  const ITP = { id: "Courgette-printemps", zoneClimat: null, semaineSemis: 14, semainePlantation: 18, semaineRecolte: 34 }
+  const base = {
+    id: 346,
+    especeId: "Courgette",
+    annee: 2026,
+    semisFait: true,
+    plantationFaite: false,
+    recolteFaite: false,
+    couleur: null,
+    especeNom: "Courgette",
+    varieteNom: null,
+    plancheName: "B2",
+    ilot: null,
+    itp: ITP,
+  }
+
+  it("ne réclame pas la plantation à la semaine théorique quand une date est saisie", () => {
+    const taches = tachesItpSemainePourCultures(
+      [{ ...base, datePlantation: new Date("2026-05-20T00:00:00Z") }],
+      { aujourdHui: new Date("2026-04-29T12:00:00Z") } // S18
+    )
+    expect(taches.filter((t) => t.type === "plantation")).toHaveLength(0)
+  })
+
+  it("la réclame à la semaine de la date saisie", () => {
+    const taches = tachesItpSemainePourCultures(
+      [{ ...base, datePlantation: new Date("2026-05-20T00:00:00Z") }],
+      { aujourdHui: new Date("2026-05-20T12:00:00Z") } // S21
+    )
+    expect(taches.filter((t) => t.type === "plantation")).toHaveLength(1)
+    expect(taches[0].date).toBe("2026-05-20")
+  })
+
+  it("garde la semaine de l'ITP pour un jalon NON daté", () => {
+    const taches = tachesItpSemainePourCultures(
+      [{ ...base, plantationFaite: true, dateRecolte: null }],
+      { aujourdHui: new Date("2026-08-19T12:00:00Z") } // S34
+    )
+    expect(taches.filter((t) => t.type === "recolte")).toHaveLength(1)
+  })
+
+  it("ne produit jamais deux tâches pour le même jalon", () => {
+    const taches = tachesItpSemainePourCultures(
+      [{ ...base, datePlantation: new Date("2026-04-27T00:00:00Z") }], // S18, comme l'ITP
+      { aujourdHui: new Date("2026-04-29T12:00:00Z") }
+    )
+    expect(taches.filter((t) => t.type === "plantation")).toHaveLength(1)
   })
 })

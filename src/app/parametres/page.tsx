@@ -6,7 +6,7 @@
 
 import * as React from 'react'
 import Link from 'next/link'
-import { ArrowLeft, Settings, Save, Download, Upload, Loader2, ImageIcon, Trash2, Key, Copy, Check, RefreshCw, Bot, CloudSun, Layers, Building2, PawPrint, Bell, DeviceMobile as Smartphone } from 'lucide-react'
+import { ArrowLeft, Settings, Save, Download, Upload, Loader2, ImageIcon, Trash2, Key, Copy, Check, RefreshCw, Bot, CloudSun, Layers, Building2, PawPrint, Bell } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
@@ -19,6 +19,7 @@ import { useModules } from '@/hooks/use-modules'
 import { MODULES, MODULE_IDS, type ModuleId } from '@/lib/modules'
 import { useElevageModes } from '@/hooks/use-elevage-modes'
 import { ELEVAGE_MODES, ELEVAGE_MODE_IDS, type ElevageModeId } from '@/lib/elevage-modes'
+import { signOut } from 'next-auth/react'
 import { confirmDialog } from '@/lib/global-dialog'
 import { todayLocalISO } from '@/lib/format-utils'
 import { DEFAULT_NOTIF_PREFS, parseNotifPrefs, type NotifPrefs } from '@/lib/notifications/prefs'
@@ -81,6 +82,14 @@ export default function ParametresPage() {
   const [deleting, setDeleting] = React.useState(false)
   const [deleteDialogOpen, setDeleteDialogOpen] = React.useState(false)
   const [deleteConfirmation, setDeleteConfirmation] = React.useState('')
+  // Suppression du COMPTE (distincte de la suppression des seules données).
+  const [deletingAccount, setDeletingAccount] = React.useState(false)
+  const [deleteAccountDialogOpen, setDeleteAccountDialogOpen] = React.useState(false)
+  const [deleteAccountConfirmation, setDeleteAccountConfirmation] = React.useState('')
+  const [deleteAccountPassword, setDeleteAccountPassword] = React.useState('')
+  // null = inconnu → on exige le mot de passe par défaut. false = compte créé
+  // via Google, sans mot de passe local : la confirmation « SUPPRIMER » suffit.
+  const [accountHasPassword, setAccountHasPassword] = React.useState<boolean | null>(null)
   // MCP / API Token
   const [mcpLoading, setMcpLoading] = React.useState(false)
   const [mcpToken, setMcpToken] = React.useState<string | null>(null)
@@ -474,6 +483,47 @@ export default function ParametresPage() {
     }
   }
 
+  // Suppression définitive du compte lui-même (exigence Google Play / RGPD).
+  // Le mot de passe est revérifié côté serveur quand le compte en a un ; un
+  // compte Google sans mot de passe local confirme par la saisie « SUPPRIMER ».
+  const handleDeleteAccount = async () => {
+    const passwordRequis = accountHasPassword !== false
+    if (deleteAccountConfirmation !== 'SUPPRIMER' || (passwordRequis && !deleteAccountPassword)) return
+
+    setDeletingAccount(true)
+    try {
+      const response = await fetch('/api/account', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(passwordRequis ? { password: deleteAccountPassword } : {}),
+      })
+
+      const result = await response.json()
+      if (!response.ok) {
+        throw new Error(result.error || 'Erreur lors de la suppression du compte')
+      }
+
+      setDeleteAccountDialogOpen(false)
+      toast({
+        title: 'Compte supprimé',
+        description: 'Vos données ont été effacées. Un email de confirmation vous a été envoyé.',
+      })
+
+      // Le compte n'existe plus : on ferme la session côté client pour éviter
+      // de naviguer avec un JWT qui ne référence plus aucun utilisateur.
+      await signOut({ callbackUrl: '/' })
+    } catch (err) {
+      toast({
+        variant: 'destructive',
+        title: 'Erreur',
+        description: err instanceof Error ? err.message : 'Impossible de supprimer le compte',
+      })
+      setDeletingAccount(false)
+    } finally {
+      setDeleteAccountPassword('')
+    }
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 aurora-bg-subtle">
       <div className="fixed inset-0 dot-grid opacity-40 pointer-events-none" aria-hidden="true" />
@@ -534,20 +584,27 @@ export default function ParametresPage() {
           <CardHeader>
             <CardTitle>Équipe, devise et unités</CardTitle>
             <CardDescription>
-              Configuration multi-utilisateurs, devise et système d&apos;unités
+              Comptes rattachés à l&apos;exploitation, devise et système d&apos;unités
             </CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-4">
+              <div>
+                <p className="text-sm font-medium">Comptes de l&apos;exploitation</p>
+                <p className="text-xs text-muted-foreground">
+                  Invitez un associé, un salarié, un comptable ou un technicien. Deux rôles :
+                  saisie ou consultation en lecture seule.
+                </p>
+              </div>
+              <Button variant="outline" asChild>
+                <Link href="/parametres/equipe">Gérer l&apos;équipe</Link>
+              </Button>
+            </div>
             <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
               <p className="text-sm text-amber-900 font-medium mb-2">
                 À venir — feature sur la roadmap
               </p>
               <ul className="text-xs text-amber-800 space-y-1 list-disc pl-4">
-                <li>
-                  <strong>Multi-utilisateurs</strong> : invitez votre équipe
-                  (employé, saisonnier, comptable) avec rôles et droits par
-                  module — Q3 2026.
-                </li>
                 <li>
                   <strong>Devise</strong> : EUR par défaut ; CHF, USD à la
                   demande. Contactez-nous si besoin urgent.
@@ -653,10 +710,12 @@ export default function ParametresPage() {
               </div>
             </div>
 
-            {/* Couleurs */}
+            {/* Couleurs — 1 colonne sur mobile : le duo pastille + champ hex ne
+                tient pas à trois de front sous 640px (l'input texte ne peut pas
+                rétrécir sous sa largeur intrinsèque, le bloc débordait). */}
             <div>
               <h4 className="text-sm font-medium text-slate-900 mb-3">Couleurs</h4>
-              <div className="grid grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-sm text-slate-600 mb-1">Planches</label>
                   <div className="flex gap-2">
@@ -673,7 +732,7 @@ export default function ParametresPage() {
                       onChange={(e) =>
                         setSettings((prev) => ({ ...prev, plancheColor: e.target.value }))
                       }
-                      className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm"
+                      className="flex-1 min-w-0 rounded-md border border-slate-300 px-3 py-2 text-sm"
                     />
                   </div>
                 </div>
@@ -693,7 +752,7 @@ export default function ParametresPage() {
                       onChange={(e) =>
                         setSettings((prev) => ({ ...prev, plancheSelectedColor: e.target.value }))
                       }
-                      className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm"
+                      className="flex-1 min-w-0 rounded-md border border-slate-300 px-3 py-2 text-sm"
                     />
                   </div>
                 </div>
@@ -713,7 +772,7 @@ export default function ParametresPage() {
                       onChange={(e) =>
                         setSettings((prev) => ({ ...prev, gridColor: e.target.value }))
                       }
-                      className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm"
+                      className="flex-1 min-w-0 rounded-md border border-slate-300 px-3 py-2 text-sm"
                     />
                   </div>
                 </div>
@@ -883,10 +942,10 @@ export default function ParametresPage() {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <CloudSun className="h-5 w-5" />
-              Stations meteo
+              Stations météo
             </CardTitle>
             <CardDescription>
-              Connectez votre station meteo personnelle pour des données ultra-locales sur vos parcelles
+              Connectez votre station météo personnelle pour des données ultra-locales sur vos parcelles
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -1041,8 +1100,8 @@ export default function ParametresPage() {
                     Supprimer toutes mes données
                   </h4>
                   <p className="text-sm text-slate-600">
-                    Supprimé toutes vos cultures, planches, recoltes, arbres et objets.
-                    Les référentiels (especes, ITPs, etc.) sont conservés.
+                    Supprimé toutes vos cultures, planches, récoltes, arbres et objets.
+                    Les référentiels (espèces, ITPs, etc.) sont conservés.
                   </p>
                 </div>
                 <Button
@@ -1070,6 +1129,53 @@ export default function ParametresPage() {
                 <p className="text-xs text-red-700">
                   ⚠️ Cette action est <strong>irréversible</strong>. Exportez vos données avant si vous souhaitez les conserver.
                 </p>
+              </div>
+
+              <div className="flex items-start justify-between gap-4 border-t border-red-200 pt-3">
+                <div className="flex-1">
+                  <h4 className="text-sm font-medium text-slate-900 mb-1">
+                    Supprimer mon compte
+                  </h4>
+                  <p className="text-sm text-slate-600">
+                    Supprime définitivement votre compte, vos données et vos fichiers.
+                    Les fiches de référentiel que vous avez partagées avec la communauté
+                    sont conservées sous le nom « Communauté Gleba ».{' '}
+                    <Link href="/suppression-compte" className="underline underline-offset-2">
+                      En savoir plus
+                    </Link>
+                  </p>
+                </div>
+                <Button
+                  variant="destructive"
+                  onClick={() => {
+                    setDeleteAccountConfirmation('')
+                    setDeleteAccountPassword('')
+                    setDeleteAccountDialogOpen(true)
+                    // Compte Google sans mot de passe local ? Le dialogue
+                    // s'adapte ; en cas d'échec on garde l'exigence par défaut.
+                    fetch('/api/account')
+                      .then((res) => (res.ok ? res.json() : null))
+                      .then((data) => {
+                        if (data && typeof data.hasPassword === 'boolean') {
+                          setAccountHasPassword(data.hasPassword)
+                        }
+                      })
+                      .catch(() => {})
+                  }}
+                  disabled={deletingAccount}
+                >
+                  {deletingAccount ? (
+                    <>
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                      Suppression...
+                    </>
+                  ) : (
+                    <>
+                      <Trash2 className="h-4 w-4 mr-2" />
+                      Supprimer mon compte
+                    </>
+                  )}
+                </Button>
               </div>
             </div>
           </CardContent>
@@ -1111,6 +1217,76 @@ export default function ParametresPage() {
             <Button variant="destructive" onClick={handleDeleteAllData} disabled={deleting || deleteConfirmation !== 'SUPPRIMER'}>
               {deleting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               Supprimer définitivement
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={deleteAccountDialogOpen} onOpenChange={(nextOpen) => {
+        if (!deletingAccount) setDeleteAccountDialogOpen(nextOpen)
+      }}>
+        <DialogContent className="max-h-[calc(100dvh-1rem)] overflow-y-auto sm:max-w-[460px]">
+          <DialogHeader>
+            <div className="mb-2 flex h-11 w-11 items-center justify-center rounded-xl bg-red-100">
+              <Trash2 className="h-5 w-5 text-red-700" />
+            </div>
+            <DialogTitle>Supprimer définitivement votre compte ?</DialogTitle>
+            <DialogDescription>
+              Cette action est irréversible et prend effet immédiatement. Vous serez déconnecté.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-900">
+            <p className="font-medium">Seront définitivement supprimés :</p>
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-red-800">
+              <li>Votre compte et vos identifiants</li>
+              <li>Parcelles, cultures, récoltes et interventions</li>
+              <li>Élevage, verger, comptabilité et boutique</li>
+              <li>Photos, justificatifs et registres archivés</li>
+            </ul>
+            <p className="mt-3 text-xs">
+              Vos fiches de référentiel partagées avec la communauté sont conservées,
+              réattribuées à « Communauté Gleba » et détachées de votre identité.
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="delete-account-confirmation">Tapez <strong>SUPPRIMER</strong> pour confirmer</Label>
+            <Input
+              id="delete-account-confirmation"
+              autoFocus
+              autoComplete="off"
+              value={deleteAccountConfirmation}
+              onChange={(e) => setDeleteAccountConfirmation(e.target.value)}
+              className="h-11"
+            />
+          </div>
+          {accountHasPassword !== false && (
+            <div className="space-y-2">
+              <Label htmlFor="delete-account-password">Votre mot de passe</Label>
+              <Input
+                id="delete-account-password"
+                type="password"
+                autoComplete="current-password"
+                value={deleteAccountPassword}
+                onChange={(e) => setDeleteAccountPassword(e.target.value)}
+                className="h-11"
+              />
+            </div>
+          )}
+          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <Button variant="outline" onClick={() => setDeleteAccountDialogOpen(false)} disabled={deletingAccount}>
+              Conserver mon compte
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleDeleteAccount}
+              disabled={
+                deletingAccount ||
+                deleteAccountConfirmation !== 'SUPPRIMER' ||
+                (accountHasPassword !== false && !deleteAccountPassword)
+              }
+            >
+              {deletingAccount && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              Supprimer mon compte
             </Button>
           </div>
         </DialogContent>
@@ -1404,68 +1580,60 @@ function NotificationsSection() {
   }
 
   return (
-    <>
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Bell className="h-5 w-5 text-emerald-600" />
-            Notifications par email
-          </CardTitle>
-          <CardDescription>
-            Choisissez les types d&apos;alertes métier que vous souhaitez recevoir par email.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {loading ? (
-            notifPreferenceRows.map((row) => (
-              <div
-                key={row.key}
-                className="flex items-center justify-between gap-4 p-3 border rounded-lg animate-pulse"
-              >
-                <div className="flex-1 min-w-0 space-y-2">
-                  <div className="h-4 w-40 bg-slate-200 rounded" />
-                  <div className="h-3 w-64 bg-slate-100 rounded" />
-                </div>
-                <div className="h-5 w-9 bg-slate-200 rounded-full" />
-              </div>
-            ))
-          ) : notifPreferenceRows.map((row) => (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Bell className="h-5 w-5 text-emerald-600" />
+          Notifications
+        </CardTitle>
+        <CardDescription>
+          Gleba peut vous prévenir des alertes météo, des tâches à faire et des stocks bas, par email
+          et par notification push. <strong>Tout est désactivé au départ</strong> : cochez seulement
+          ce que vous voulez recevoir. Vous pouvez revenir ici à tout moment, et chaque email contient
+          un lien de désabonnement.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {loading ? (
+          notifPreferenceRows.map((row) => (
             <div
               key={row.key}
-              className="flex items-center justify-between gap-4 p-3 border rounded-lg hover:bg-slate-50/50 transition-colors"
+              className="flex items-center justify-between gap-4 p-3 border rounded-lg animate-pulse"
             >
-              <div className="flex-1 min-w-0">
-                <Label htmlFor={`notif-${row.key}`} className="font-medium text-sm cursor-pointer">
-                  {row.label}
-                </Label>
-                <p className="text-xs text-muted-foreground mt-0.5">{row.description}</p>
+              <div className="flex-1 min-w-0 space-y-2">
+                <div className="h-4 w-40 bg-slate-200 rounded" />
+                <div className="h-3 w-64 bg-slate-100 rounded" />
               </div>
-              <Switch
-                id={`notif-${row.key}`}
-                checked={prefs[row.key]}
-                disabled={saving}
-                onCheckedChange={(checked) => toggle(row.key, checked)}
-                data-testid={`notif-toggle-${row.key}`}
-              />
+              <div className="h-5 w-9 bg-slate-200 rounded-full" />
             </div>
-          ))}
-          <p className="text-xs text-muted-foreground italic pt-2">
-            Ces réglages s&apos;appliquent aux emails envoyés par Gleba. Les emails transactionnels (mot de passe, vérification) ne sont pas concernés.
-          </p>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Smartphone className="h-5 w-5 text-emerald-600" />
-            Notifications push
-          </CardTitle>
-          <CardDescription>
-            Recevez les alertes urgentes directement dans ce navigateur.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
+          ))
+        ) : notifPreferenceRows.map((row) => (
+          <div
+            key={row.key}
+            className="flex items-center justify-between gap-4 p-3 border rounded-lg hover:bg-slate-50/50 transition-colors"
+          >
+            <div className="flex-1 min-w-0">
+              <Label htmlFor={`notif-${row.key}`} className="font-medium text-sm cursor-pointer">
+                {row.label}
+              </Label>
+              <p className="text-xs text-muted-foreground mt-0.5">{row.description}</p>
+            </div>
+            <Switch
+              id={`notif-${row.key}`}
+              checked={prefs[row.key]}
+              disabled={saving}
+              onCheckedChange={(checked) => toggle(row.key, checked)}
+              data-testid={`notif-toggle-${row.key}`}
+            />
+          </div>
+        ))}
+        <div className="border-t pt-4 mt-4 space-y-3">
+          <div>
+            <h4 className="text-sm font-medium text-slate-900">Notifications push (navigateur)</h4>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Recevez les alertes urgentes directement dans ce navigateur.
+            </p>
+          </div>
           {pushEtat === 'chargement' && <p className="text-sm text-muted-foreground">Vérification du support…</p>}
           {pushEtat === 'non-supporte' && (
             <p className="text-sm text-muted-foreground">Les notifications push ne sont pas supportées par ce navigateur.</p>
@@ -1486,9 +1654,12 @@ function NotificationsSection() {
               {pushLoading ? 'Activation…' : 'Activer les notifications push'}
             </Button>
           )}
-        </CardContent>
-      </Card>
-    </>
+        </div>
+        <p className="text-xs text-muted-foreground italic pt-2">
+          Ces réglages s&apos;appliquent aux emails envoyés par Gleba. Les emails transactionnels (mot de passe, vérification) ne sont pas concernés.
+        </p>
+      </CardContent>
+    </Card>
   )
 }
 

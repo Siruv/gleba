@@ -6,9 +6,11 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { nomItpDepuisSaisie } from '@/lib/itp-nom'
 import { requireAuthApi } from '@/lib/auth-utils'
 import { normalizeVarieteName } from '@/lib/normalize'
 import { invalidateKpi } from '@/lib/kpi'
+import { frequenceIrrigationJours } from '@/lib/irrigation-peremption'
 
 interface ImportData {
   version?: string
@@ -73,6 +75,8 @@ interface ImportData {
   }>
   itps?: Array<{
     id: string
+    /** Libellé exporté ; à défaut l'identifiant fait office de nom. */
+    nom?: string | null
     especeId?: string | null
     semaineSemis?: number | null
     semainePlantation?: number | null
@@ -297,6 +301,10 @@ export async function POST(request: NextRequest) {
       fertilisants: 0,
       planches: 0,
       cultures: 0,
+      // Références de référentiel absentes de la cible, dégradées à NULL plutôt
+      // que de faire tomber la transaction entière.
+      culturesItpIgnore: 0,
+      culturesVarieteIgnore: 0,
       recoltes: 0,
       fertilisations: 0,
       objetsJardin: 0,
@@ -494,9 +502,29 @@ export async function POST(request: NextRequest) {
           if (!especeExists) continue
         }
 
+        // Le libellé et sa clé de dédup accompagnent la création : sans eux,
+        // l'ITP importé s'affiche par son identifiant technique et sort de la
+        // recherche normalisée. À la mise à jour, on ne réécrit le nom que si le
+        // fichier en fournit un — l'import ne doit pas écraser un libellé
+        // corrigé depuis l'interface.
+        const nomImporte =
+          typeof item.nom === 'string' && item.nom.trim() ? item.nom : item.id
+        const nomItp = nomItpDepuisSaisie(nomImporte)
+        // Référence sourcée : intouchable, comme le refusent PUT et DELETE
+        // /api/itps/[id]. Un fichier un peu ancien ramenait sinon les 552
+        // itinéraires INRAE aux semaines du fichier et réactivait les 4
+        // scénarios retirés du service, sans trace ni migration.
+        const existantItp = await tx.iTP.findUnique({
+          where: { id: item.id },
+          select: { sourceRecordId: true },
+        })
+        if (existantItp?.sourceRecordId) continue
         await tx.iTP.upsert({
           where: { id: item.id },
           update: {
+            ...(typeof item.nom === 'string' && item.nom.trim()
+              ? { nom: nomItp.nom, nomNormalise: nomItp.nomNormalise }
+              : {}),
             especeId: item.especeId,
             semaineSemis: item.semaineSemis,
             semainePlantation: item.semainePlantation,
@@ -515,6 +543,8 @@ export async function POST(request: NextRequest) {
           },
           create: {
             id: item.id,
+            nom: nomItp.nom,
+            nomNormalise: nomItp.nomNormalise,
             especeId: item.especeId,
             semaineSemis: item.semaineSemis,
             semainePlantation: item.semainePlantation,
@@ -831,6 +861,34 @@ export async function POST(request: NextRequest) {
           }
         }
 
+        // Références de référentiel absentes de l'instance cible : les dégrader,
+        // pas faire tomber l'import.
+        //
+        // Un membre qui migre vers son instance auto-hébergée exporte ses ITP et
+        // variétés perso, mais l'import ne les recrée pas (branche réservée aux
+        // admins). Ses cultures les référençaient encore : `culture.create`
+        // violait la clé étrangère, la transaction ENTIÈRE était annulée, et il
+        // voyait « Impossible d'importer les données » — ni planches, ni cultures,
+        // ni récoltes, aucune ligne écrite. Le traitement appliqué à `plancheId`
+        // juste au-dessus manquait ici.
+        if (item.itpId) {
+          const itpExists = await tx.iTP.findUnique({ where: { id: item.itpId }, select: { id: true } })
+          if (!itpExists) {
+            item.itpId = null
+            stats.culturesItpIgnore += 1
+          }
+        }
+        if (item.varieteId) {
+          const varieteExists = await tx.variete.findUnique({
+            where: { id: item.varieteId },
+            select: { id: true },
+          })
+          if (!varieteExists) {
+            item.varieteId = null
+            stats.culturesVarieteIgnore += 1
+          }
+        }
+
         // Créer une nouvelle culture (ne pas écraser les existantes)
         const created = await tx.culture.create({
           data: {
@@ -1022,8 +1080,11 @@ export async function POST(request: NextRequest) {
 
       if (!dateDebut) continue
 
-      const besoinEau = culture.espece.besoinEau || 3
-      const frequenceJours = besoinEau >= 4 ? 2 : 3
+      // Cadence partagée avec le planificateur et la péremption. Cette copie
+      // ignorait le palier « besoin faible » (5 j) et arrosait tout tous les
+      // 3 jours : une culture importée périmait donc sur un cycle qu'elle
+      // n'avait jamais suivi.
+      const frequenceJours = frequenceIrrigationJours(culture.espece.besoinEau)
 
       const irrigations: Date[] = []
       let currentDate = new Date(dateDebut)

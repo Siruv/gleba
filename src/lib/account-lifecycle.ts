@@ -12,10 +12,54 @@
  * Fichier SERVEUR uniquement (utilise Prisma) — ne pas importer côté client.
  */
 
+import { rm } from 'node:fs/promises'
+import path from 'node:path'
+
 import type { Prisma } from '@prisma/client'
 
 /** Id fixe du compte système sentinelle (cf. migration 20260713160000_sentinelle_communaute). */
 export const COMMUNAUTE_USER_ID = 'gleba-communaute'
+
+/**
+ * Les quatre emplacements de fichiers rattachés à un compte, tous organisés en
+ * un dossier par `userId` et montés sur un volume Docker distinct. Le cascade
+ * SQL n'emporte que les lignes : sans ce ménage, les fichiers survivraient à la
+ * suppression du compte (cf. RGPD et politique Google Play sur la suppression).
+ */
+function dossiersFichiersUtilisateur(userId: string): string[] {
+  const racine = process.cwd()
+  return [
+    path.join(racine, 'public', 'uploads', userId),
+    path.join(racine, 'storage', 'justificatifs', userId),
+    path.join(racine, 'storage', 'plan-fonds', userId),
+    path.join(racine, 'storage', 'registres', userId),
+  ]
+}
+
+/**
+ * Supprime les fichiers du membre `userId` sur les quatre volumes. À appeler
+ * APRÈS le commit de la transaction de suppression : un échec disque ne doit pas
+ * annuler la suppression en base, qui est ce que l'utilisateur a demandé. Les
+ * erreurs sont donc journalisées et le nombre de dossiers effacés est renvoyé.
+ */
+export async function supprimerFichiersUtilisateur(
+  userId: string
+): Promise<{ dossiersSupprimes: number; echecs: string[] }> {
+  const echecs: string[] = []
+  let dossiersSupprimes = 0
+
+  for (const dossier of dossiersFichiersUtilisateur(userId)) {
+    try {
+      await rm(dossier, { recursive: true, force: true })
+      dossiersSupprimes++
+    } catch (error) {
+      echecs.push(dossier)
+      console.error('supprimerFichiersUtilisateur:', dossier, error)
+    }
+  }
+
+  return { dossiersSupprimes, echecs }
+}
 
 /**
  * Réattribue à la sentinelle « Communauté Gleba » toutes les entrées de référentiel
@@ -47,6 +91,26 @@ export async function reprendreReferentielCommunaute(
     })
   }
 
+  // Même symétrie pour les ITP partagés, qui manquait : `ITP.espece` est
+  // onDelete:SetNull, donc l'itinéraire survit — mais SANS son espèce. Un
+  // « zinnia s1 » proposé à la communauté par un membre dont l'espèce « zinnia »
+  // restait privée se retrouvait dans le catalogue commun avec « - » en espèce,
+  // sans couleur de famille, et écarté de tous les sélecteurs (qui filtrent par
+  // especeId).
+  const itpsPartages = await tx.iTP.findMany({
+    where: { userId, partageCommunaute: true, especeId: { not: null } },
+    select: { especeId: true },
+  })
+  const especeItpParentIds = [
+    ...new Set(itpsPartages.map((i) => i.especeId).filter(Boolean) as string[]),
+  ]
+  if (especeItpParentIds.length > 0) {
+    await tx.espece.updateMany({
+      where: { id: { in: especeItpParentIds }, userId },
+      data: { ...cible, partageCommunaute: true },
+    })
+  }
+
   const racesPartagees = await tx.raceAnimale.findMany({
     where: { userId, partageCommunaute: true },
     select: { especeAnimaleId: true },
@@ -57,6 +121,37 @@ export async function reprendreReferentielCommunaute(
       where: { id: { in: especeAnimParentIds }, userId },
       data: { ...cible, partageCommunaute: true },
     })
+  }
+
+  // Étape 1 bis — sauver les ITP dont d'AUTRES membres dépendent, même restés
+  // privés. `DELETE /api/itps/[id]` refuse en 409 de supprimer un itinéraire
+  // porteur de cultures ou d'étapes de rotation ; la suppression de compte
+  // contournait cette garde : l'itinéraire partait en cascade et les cultures des
+  // autres membres perdaient leur itpId en silence (SetNull). Mêmes critères que
+  // le 409, donc même promesse tenue.
+  const itpsUtilisesAilleurs = await tx.iTP.findMany({
+    where: {
+      userId,
+      partageCommunaute: false,
+      OR: [{ cultures: { some: { userId: { not: userId } } } }, { rotationsDetails: { some: {} } }],
+    },
+    select: { id: true, especeId: true },
+  })
+  if (itpsUtilisesAilleurs.length > 0) {
+    await tx.iTP.updateMany({
+      where: { id: { in: itpsUtilisesAilleurs.map((i) => i.id) } },
+      data: { ...cible, partageCommunaute: true },
+    })
+    // Et leur espèce parente, pour la même raison qu'au-dessus.
+    const parents = [
+      ...new Set(itpsUtilisesAilleurs.map((i) => i.especeId).filter(Boolean) as string[]),
+    ]
+    if (parents.length > 0) {
+      await tx.espece.updateMany({
+        where: { id: { in: parents }, userId },
+        data: { ...cible, partageCommunaute: true },
+      })
+    }
   }
 
   // Étape 2 — réattribuer à la sentinelle toutes les entrées PARTAGÉES du membre

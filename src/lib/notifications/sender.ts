@@ -9,6 +9,7 @@
 
 import { sendMail } from "@/lib/mail"
 import { getSetting } from "@/lib/settings"
+import { getOrCreateUnsubscribeToken, listUnsubscribeHeaders, unsubscribeUrl } from "@/lib/unsubscribe"
 import {
   chargerStocksBas,
   chargerTachesDuJour,
@@ -28,7 +29,12 @@ import { detecterAlertesMeteo } from "./detect"
 import { construireResume } from "./resume"
 import { alerteMeteoEmail, alerteUrgenteEmail, resumeQuotidienEmail } from "./templates"
 import type { AlerteMeteoNotification, DestinataireNotification } from "./types"
-import { DEFAULT_NOTIF_PREFS, typeAlerteEstActivee, type NotifPrefs } from "./prefs"
+import {
+  auMoinsUneAlerteUrgenteActivee,
+  DEFAULT_NOTIF_PREFS,
+  typeAlerteEstActivee,
+  type NotifPrefs,
+} from "./prefs"
 import { fetchOpenMeteoForecast } from "@/lib/meteo"
 import {
   construirePayloadAlerteUrgente,
@@ -37,6 +43,28 @@ import {
 
 /** Nombre maximal d'emails envoyés par utilisateur et par scan (anti-spam). */
 const MAX_EMAILS_PAR_UTILISATEUR = 15
+
+/**
+ * Résout le désabonnement du destinataire : ces emails sont récurrents et non
+ * transactionnels, ils doivent porter un lien 1 clic + les en-têtes
+ * List-Unsubscribe (RFC 8058, exigé par Gmail/Yahoo pour les envois de masse),
+ * comme les campagnes. Une erreur de résolution ne bloque pas l'envoi : on part
+ * alors sans lien plutôt que de perdre l'alerte.
+ */
+async function avecDesabonnement(
+  user: DestinataireNotification
+): Promise<{ user: DestinataireNotification; headers?: Record<string, string> }> {
+  try {
+    const token = await getOrCreateUnsubscribeToken(user.id)
+    return {
+      user: { ...user, unsubscribeUrl: unsubscribeUrl(token) },
+      headers: listUnsubscribeHeaders(token),
+    }
+  } catch (error) {
+    console.warn(`[notifications] Token de désabonnement indisponible pour ${user.email}:`, error)
+    return { user }
+  }
+}
 
 /** Charge les préférences sans laisser une erreur de lecture bloquer l'envoi. */
 async function chargerPrefsNotifAvecFallback(user: DestinataireNotification): Promise<NotifPrefs> {
@@ -84,18 +112,15 @@ async function traiterMeteoUtilisateur(user: DestinataireNotification): Promise<
   const coords = await getCoordsUtilisateur(user.id)
   if (coords.length === 0) return 0
 
-  const [seuilGel, seuilCanicule, seuilVentFort, seuilPluieAbondante] = await Promise.all([
-    getSetting("seuil.gel"),
-    getSetting("seuil.canicule"),
-    getSetting("seuil.ventFort"),
-    getSetting("seuil.pluieAbondante"),
-  ])
   const seuils = {
-    gel: seuilGel,
-    canicule: seuilCanicule,
-    ventFort: seuilVentFort,
-    pluieAbondante: seuilPluieAbondante,
+    gel: await getSetting("seuil.gel"),
+    canicule: await getSetting("seuil.canicule"),
+    ventFort: await getSetting("seuil.ventFort"),
+    pluieAbondante: await getSetting("seuil.pluieAbondante"),
   }
+
+  const { user: destinataire, headers } = await avecDesabonnement(user)
+
 
   const alertes: AlerteMeteoNotification[] = []
   for (const { lat, lng } of coords) {
@@ -124,8 +149,8 @@ async function traiterMeteoUtilisateur(user: DestinataireNotification): Promise<
     const cle = `${user.id}:${alerte.key}`
     if (envoyees.has(cle) || alerteDejaEnvoyee(cle)) continue
     try {
-      const { subject, html } = alerteMeteoEmail(user, alerte)
-      await sendMail({ to: user.email, subject, html })
+      const { subject, html } = alerteMeteoEmail(destinataire, alerte)
+      await sendMail({ to: user.email, subject, html, headers })
       marquerAlerteEnvoyee(cle, { until: alerte.date })
       envoyees.add(cle)
       total++
@@ -147,9 +172,21 @@ export async function envoyerAlertesUrgentes(): Promise<number> {
   for (const user of users) {
     try {
       const prefs = await chargerPrefsNotifAvecFallback(user)
+      // Les alertes sont sur opt-in : sans aucun type demandé, ne pas payer la
+      // détection (une dizaine de requêtes Prisma + météo par utilisateur) pour
+      // en jeter le résultat juste après. Sur 112 comptes toutes les 30 min,
+      // c'est la différence entre un scan inutile et un scan gratuit.
+      if (!auMoinsUneAlerteUrgenteActivee(prefs)) continue
+
       const urgentes = (await detecterAlertesUrgentes(user.id)).filter((alerte) =>
         typeAlerteEstActivee(alerte.type, prefs)
       )
+      if (urgentes.length === 0) continue
+
+      // Résolu seulement quand il y a réellement quelque chose à envoyer :
+      // getOrCreateUnsubscribeToken peut ÉCRIRE (création du token au premier
+      // usage), inutile de le faire à chaque scan pour tout le monde.
+      const { user: destinataire, headers } = await avecDesabonnement(user)
       let envoyees = 0
       for (const alerte of urgentes) {
         if (envoyees >= MAX_EMAILS_PAR_UTILISATEUR) {
@@ -160,8 +197,8 @@ export async function envoyerAlertesUrgentes(): Promise<number> {
         if (alerteDejaEnvoyee(cle)) continue
         let emailEnvoye = false
         try {
-          const { subject, html } = alerteUrgenteEmail(user, alerte)
-          await sendMail({ to: user.email, subject, html })
+          const { subject, html } = alerteUrgenteEmail(destinataire, alerte)
+          await sendMail({ to: user.email, subject, html, headers })
           emailEnvoye = true
         } catch (error) {
           console.error(`[notifications] Envoi alerte urgente échoué pour ${user.email}:`, error)
@@ -198,15 +235,20 @@ export async function envoyerResumeQuotidien(): Promise<number> {
     try {
       const prefs = await chargerPrefsNotifAvecFallback(user)
       if (!prefs.resume) continue
+      // Le résumé embarquait les blocs « Cette semaine » (tâches ITP) et
+      // « Stocks bas » quel que soit l'état de leurs cases dans /parametres :
+      // décocher « Tâches ITP de la semaine » n'avait aucun effet ici, seulement
+      // sur l'alerte dédiée. On respecte la préférence des deux côtés.
       const [taches, alertesMeteo, tachesItpSemaine, stocksBas] = await Promise.all([
         chargerTachesDuJour(user.id),
         recupererAlertesMeteoJour(user.id),
-        chargerTachesItpSemaine(user.id),
-        chargerStocksBas(user.id),
+        prefs.itpSemaine ? chargerTachesItpSemaine(user.id) : Promise.resolve([]),
+        prefs.stocks ? chargerStocksBas(user.id) : Promise.resolve([]),
       ])
       const resume = construireResume(taches, alertesMeteo, { tachesItpSemaine, stocksBas })
-      const { subject, html } = resumeQuotidienEmail(user, resume)
-      await sendMail({ to: user.email, subject, html })
+      const { user: destinataire, headers } = await avecDesabonnement(user)
+      const { subject, html } = resumeQuotidienEmail(destinataire, resume)
+      await sendMail({ to: user.email, subject, html, headers })
       total++
     } catch (error) {
       console.error(`[notifications] Résumé quotidien échoué pour ${user.email}:`, error)

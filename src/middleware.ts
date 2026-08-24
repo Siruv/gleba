@@ -7,6 +7,10 @@ import {
   estSurfaceAdministration,
   motifInterdictionConsultation,
 } from "@/lib/impersonation-policy"
+import {
+  EN_TETE_MUTATION,
+  valeurEnteteMutation,
+} from "@/lib/exploitation/entete-mutation"
 import { NextResponse } from "next/server"
 
 export default auth((req) => {
@@ -17,8 +21,19 @@ export default auth((req) => {
   // La racine reste une landing statique pour les visiteurs et les moteurs.
   // Une session active reçoit le tableau de bord par réécriture interne afin
   // de conserver l'URL historique `/` et tous les liens applicatifs existants.
+  // Le middleware est le SEUL endroit qui connaisse la méthode HTTP avant que
+  // la route ne s'exécute (227 routes appellent `requireAuthApi()` sans requête).
+  // Il transmet donc l'information au serveur, qui seul peut lire en base si
+  // l'acteur a le droit d'écrire. L'en-tête est toujours écrasé : impossible à
+  // forger depuis le client. Cf. `lib/exploitation/entete-mutation.ts`.
+  const enTetesTransmises = new Headers(req.headers)
+  enTetesTransmises.set(EN_TETE_MUTATION, valeurEnteteMutation(req.method, pathname))
+  const suite = () => NextResponse.next({ request: { headers: enTetesTransmises } })
+
   if (pathname === "/" && isLoggedIn) {
-    return NextResponse.rewrite(new URL("/dashboard", req.nextUrl))
+    return NextResponse.rewrite(new URL("/dashboard", req.nextUrl), {
+      request: { headers: enTetesTransmises },
+    })
   }
 
   // Compatibilité des anciens justificatifs stockés sous public/uploads :
@@ -42,6 +57,9 @@ export default auth((req) => {
     "/impersonation",
     // RGPD / LCEN : doivent rester accessibles sans authentification
     "/cgv", "/mentions-legales", "/confidentialite",
+    // Politique Google Play : l'URL de demande de suppression de compte est
+    // publiée sur la fiche Play Store, donc consultable sans session.
+    "/suppression-compte",
     // Pages cibles SEO (marketing)
     "/logiciel-maraichage", "/logiciel-micro-ferme", "/logiciel-permaculture",
     "/logiciel-verger", "/logiciel-elevage", "/calendrier-semis",
@@ -99,11 +117,18 @@ export default auth((req) => {
     if (isLoggedIn && (pathname === "/login" || pathname === "/register")) {
       return NextResponse.redirect(new URL("/", req.nextUrl))
     }
-    return NextResponse.next()
+    return suite()
   }
 
   // Si non connecté, rediriger vers login
   if (!isLoggedIn) {
+    // QA cmsnnybbg — un fetch() applicatif suit silencieusement une
+    // redirection : la page /login revenait en HTML avec un statut 200, que
+    // les handlers `res.ok` prenaient pour un succès (mutation « enregistrée »
+    // jamais écrite). Une API sans session répond 401 JSON, jamais un 302.
+    if (pathname.startsWith("/api/")) {
+      return NextResponse.json({ error: "Non authentifié" }, { status: 401 })
+    }
     const loginUrl = new URL("/login", req.nextUrl)
     loginUrl.searchParams.set("callbackUrl", pathname)
     return NextResponse.redirect(loginUrl)
@@ -116,14 +141,21 @@ export default auth((req) => {
     return NextResponse.redirect(new URL("/", req.nextUrl))
   }
 
-  return NextResponse.next()
+  return suite()
 })
 
 export const config = {
   matcher: [
     // Les anciens justificatifs image seraient sinon exclus par l'extension.
     "/uploads/:path*",
-    // Matcher tout sauf les fichiers statiques
-    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
+    // Matcher tout sauf les fichiers statiques.
+    // Les service workers (`/sw-*.js`) sont exclus explicitement : ils vivent
+    // dans /public, donc le matcher les attrapait faute d'extension image, et
+    // le middleware répondait 307 vers /login. Un service worker doit être
+    // servi SANS session — le navigateur le récupère hors de tout contexte
+    // authentifié. Constaté le 2026-08-19 à la mise en service du push : la
+    // route répondait 307, et `/sw-elevage.js` était dans le même cas depuis
+    // sa création, donc jamais enregistré en production.
+    "/((?!_next/static|_next/image|favicon.ico|sw-[^/]*\\.js|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
   ],
 }

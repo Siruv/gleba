@@ -69,3 +69,24 @@ export function estHeureResume(
 
   return heureLocale === resumeHeure.trim()
 }
+
+/**
+ * Expression cron du scan météo/urgences.
+ *
+ * Le champ « minutes » de cron ne va que de 0 à 59 : `*` /90 ou `*` /1440 n'est
+ * PAS une expression valide et node-cron la rejette. Comme l'intervalle est
+ * borné à 1440 (24 h), on bascule sur le champ « heures » dès 60 minutes,
+ * en arrondissant à l'heure pleine inférieure les valeurs qui ne tombent pas
+ * juste (90 min → toutes les heures) : cron ne sait pas exprimer un pas de
+ * 1 h 30. Sans cela, toute valeur >= 60 faisait lever cron.schedule() — et
+ * comme le scan est planifié AVANT le résumé quotidien, le résumé n'était plus
+ * planifié du tout.
+ */
+export function getMeteoCronExpression(
+  env: Record<string, string | undefined> = process.env
+): string {
+  const minutes = getMeteoIntervalMinutes(env)
+  if (minutes < 60) return `*/${minutes} * * * *`
+  const heures = Math.min(Math.floor(minutes / 60), 24)
+  return heures <= 1 ? "0 * * * *" : `0 */${heures} * * *`
+}

@@ -37,16 +37,34 @@ export async function POST(
       )
     }
 
-    const profile = findTreeCareProfile(arbre.espece)
+    // Ticket cmsofzh0w — le type de l'arbre borne la recherche : un
+    // Châtaignier FORESTIER ne doit pas recevoir le calendrier fruitier.
+    const profile = findTreeCareProfile(arbre.espece, arbre.type)
     if (!profile) {
-      return NextResponse.json(
-        { error: `Aucun calendrier d'entretien connu pour "${arbre.espece}"` },
-        { status: 404 }
-      )
+      // Message explicite quand l'espèce existe au référentiel mais que la
+      // conduite de l'arbre (forestier, ornement, haie) l'exclut.
+      const profilAutreConduite = findTreeCareProfile(arbre.espece)
+      const message = profilAutreConduite
+        ? `"${arbre.espece}" est enregistré comme arbre de type "${arbre.type}" : le calendrier ${profilAutreConduite.type} du référentiel ne s'applique pas à cette conduite`
+        : `Aucun calendrier d'entretien connu pour "${arbre.espece}"`
+      return NextResponse.json({ error: message }, { status: 404 })
     }
 
     const body = await request.json().catch(() => ({}))
-    const year = body.year || new Date().getFullYear()
+    const currentYear = new Date().getFullYear()
+    const year = body.year || currentYear
+
+    // Plancher anti-retards artificiels : sur l'année courante (défaut), ne pas
+    // recréer les opérations dont la FENÊTRE est déjà refermée — elles
+    // naîtraient irréalisables (retour utilisateur 2026-07-31). Une fenêtre
+    // encore ouverte est bien créée, même si sa date conseillée est passée. Une
+    // année explicitement demandée via body.year reste générée en entier
+    // (rattrapage historique).
+    let from: Date | null = null
+    if (!body.year || body.year === currentYear) {
+      const now = new Date()
+      from = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    }
 
     // Supprimer les anciennes opérations auto-générées pour cette annee
     const startOfYear = new Date(year, 0, 1)
@@ -60,14 +78,19 @@ export async function POST(
         // On ne supprime que les opérations non faites : les ops
         // auto-générées déjà réalisées sont de l'historique à préserver.
         fait: false,
+        // Une fenêtre soldée explicitement ne doit pas être ressuscitée par une
+        // régénération : l'utilisateur a acté qu'il ne la ferait pas cette année.
+        abandonneeLe: null,
         datePrevue: { gte: startOfYear, lte: endOfYear },
       },
     })
 
     // QA Hélène 2026-05-15 — Bug #10 : passer la variété pour caler la
     // date de récolte sur les cultivars tardifs connus.
-    const operations = generateCareOperations(profile, year, arbreId, session!.user.id, arbre.variete)
-    await prisma.operationArbre.createMany({ data: operations })
+    const operations = generateCareOperations(profile, year, arbreId, session!.user.id, arbre.variete, from)
+    if (operations.length > 0) {
+      await prisma.operationArbre.createMany({ data: operations })
+    }
 
     return NextResponse.json({
       count: operations.length,

@@ -4,8 +4,11 @@
  */
 
 import { NextResponse } from "next/server"
-import { auth } from "@/lib/auth"
+import { requireAuthApi } from "@/lib/auth-utils"
+import { refusSiPasProprietaire } from "@/lib/exploitation/garde-session"
 import prisma from "@/lib/prisma"
+import { normalizeReferentielKey } from "@/lib/normalize"
+import { productifParDefaut } from "@/lib/tree-care-calendar"
 import {
   familles,
   fournisseurs,
@@ -25,10 +28,12 @@ import {
 
 export async function POST() {
   try {
-    const session = await auth()
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: "Non authentifié" }, { status: 401 })
-    }
+    // Les données d'exemple sont chargées DANS l'exploitation courante, et
+    // seul son propriétaire peut le faire.
+    const { error, session } = await requireAuthApi()
+    if (error) return error
+    const refus = refusSiPasProprietaire(session)
+    if (refus) return refus
 
     const userId = session.user.id
 
@@ -124,6 +129,9 @@ export async function POST() {
         update: {},
         create: {
           id: itp.id,
+          // Même règle que le seed et /api/import : libellé + clé de dédup.
+          nom: itp.id,
+          nomNormalise: normalizeReferentielKey(itp.id),
           especeId: itp.especeId || null,
           semaineSemis: itp.semaineSemis || null,
           semainePlantation: itp.semainePlantation || null,
@@ -254,6 +262,11 @@ export async function POST() {
           variete: arbre.variete || null,
           portGreffe: arbre.portGreffe || null,
           datePlantation: arbre.datePlantation || null,
+          // Le jeu importé ne porte pas de statut `productif` : sans cette
+          // dérivation, le défaut Prisma `true` s'appliquait à l'aveugle et un
+          // jeune arbre entrait dans le KPI « fruitiers productifs »
+          // (friction du 2026-08-12, même défaut que les autres chemins).
+          productif: productifParDefaut(arbre.espece, arbre.datePlantation || null),
           posX: arbre.posX,
           posY: arbre.posY,
           envergure: arbre.envergure || 2,
@@ -322,10 +335,12 @@ export async function POST() {
 // GET pour vérifier si l'utilisateur peut importer
 export async function GET() {
   try {
-    const session = await auth()
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: "Non authentifié" }, { status: 401 })
-    }
+    // Les données d'exemple sont chargées DANS l'exploitation courante, et
+    // seul son propriétaire peut le faire.
+    const { error, session } = await requireAuthApi()
+    if (error) return error
+    const refus = refusSiPasProprietaire(session)
+    if (refus) return refus
 
     const userId = session.user.id
 

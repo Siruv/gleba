@@ -19,11 +19,23 @@ import type {
   TacheItpSemaine,
 } from "./types"
 
+/**
+ * Écran d'atterrissage des rappels de tâches.
+ *
+ * Les emails et les notifications push pointaient `/calendrier`, une route qui
+ * n'existe pas : le bouton du résumé quotidien et le clic sur toute alerte
+ * urgente — dont « tâches ITP de la semaine » — tombaient en 404. L'écran des
+ * tâches est celui qui porte réellement ces rappels.
+ */
+export const CHEMIN_TACHES = "/taches"
+
 function layoutNotification(options: {
   headerTitle: string
   headerSubtitle?: string
   accent?: "red" | "amber" | "green"
   content: string
+  /** Lien de désabonnement 1 clic, quand le destinataire en a un. */
+  unsubscribeUrl?: string
 }): string {
   const accent = options.accent ?? "green"
   const gradient =
@@ -53,7 +65,11 @@ function layoutNotification(options: {
         <tr>
           <td style="padding:20px 40px 28px;border-top:1px solid #f1f5f9;">
             <p style="margin:0;font-size:12px;color:#94a3b8;text-align:center;">
-              Gleba — Gestion agricole · <a href="${APP_URL}" style="color:#10b981;text-decoration:none;">${APP_URL}</a>
+              Gleba — Gestion agricole · <a href="${APP_URL}" style="color:#10b981;text-decoration:none;">${APP_URL}</a>${
+                options.unsubscribeUrl
+                  ? `<br><a href="${escapeHtml(options.unsubscribeUrl)}" style="color:#94a3b8;text-decoration:underline;">Se désabonner de ces emails</a> · <a href="${APP_URL}/parametres" style="color:#94a3b8;text-decoration:underline;">Choisir mes notifications</a>`
+                  : ""
+              }
             </p>
           </td>
         </tr>
@@ -175,6 +191,7 @@ export function resumeQuotidienEmail(
   return {
     subject: `[Gleba] Résumé du jour - ${dateLabel}`,
     html: layoutNotification({
+      unsubscribeUrl: user.unsubscribeUrl,
       headerTitle: `Quoi faire ce matin ?`,
       headerSubtitle: `Résumé du jour — ${dateLabel}`,
       content: `
@@ -184,8 +201,8 @@ export function resumeQuotidienEmail(
         <table cellpadding="0" cellspacing="0" style="margin:24px 0 0;">
           <tr>
             <td style="background:linear-gradient(135deg,#059669,#0d9488);border-radius:10px;">
-              <a href="${APP_URL}/calendrier" style="display:inline-block;padding:12px 28px;font-size:14px;font-weight:600;color:#ffffff;text-decoration:none;">
-                Voir le calendrier →
+              <a href="${APP_URL}${CHEMIN_TACHES}" style="display:inline-block;padding:12px 28px;font-size:14px;font-weight:600;color:#ffffff;text-decoration:none;">
+                Voir mes tâches →
               </a>
             </td>
           </tr>
@@ -202,6 +219,7 @@ export function alerteMeteoEmail(
   return {
     subject: `[Gleba] Alerte météo : ${libelle}${alerte.type === "gel" || alerte.type === "canicule" || alerte.type === "vent" || alerte.type === "pluie" ? ` (${formatDateFr(alerte.date)})` : ""}`,
     html: layoutNotification({
+      unsubscribeUrl: user.unsubscribeUrl,
       headerTitle: `Alerte météo : ${libelle}`,
       headerSubtitle: alerte.niveau === "danger" ? "Niveau danger" : "Niveau attention",
       accent: alerte.niveau === "danger" ? "red" : "amber",
@@ -254,6 +272,7 @@ export function alerteUrgenteEmail(
             ? `[Gleba] Stock critique : ${alerte.titre}`
             : `[Gleba] Action urgente : ${alerte.titre}`,
     html: layoutNotification({
+      unsubscribeUrl: user.unsubscribeUrl,
       headerTitle: estIrrigationRappel
         ? "Irrigation à faire"
         : estTacheItpSemaine
@@ -272,8 +291,8 @@ export function alerteUrgenteEmail(
         <table cellpadding="0" cellspacing="0" style="margin:24px 0 0;">
           <tr>
             <td style="background:linear-gradient(135deg,#059669,#0d9488);border-radius:10px;">
-              <a href="${estStockBas ? `${APP_URL}/comptabilite/stocks` : `${APP_URL}/calendrier`}" style="display:inline-block;padding:12px 28px;font-size:14px;font-weight:600;color:#ffffff;text-decoration:none;">
-                ${estIrrigationRappel ? "Voir le calendrier →" : estStockBas ? "Gérer les stocks →" : "Gérer dans Gleba →"}
+              <a href="${estStockBas ? `${APP_URL}/comptabilite/stocks` : `${APP_URL}${CHEMIN_TACHES}`}" style="display:inline-block;padding:12px 28px;font-size:14px;font-weight:600;color:#ffffff;text-decoration:none;">
+                ${estIrrigationRappel ? "Voir mes tâches →" : estStockBas ? "Gérer les stocks →" : "Gérer dans Gleba →"}
               </a>
             </td>
           </tr>

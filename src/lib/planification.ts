@@ -6,9 +6,16 @@
 import prisma from '@/lib/prisma'
 import { getISOWeek, getISOWeekYear } from 'date-fns'
 import { calculerDateDepuisSemaine, dateSemaineChrono } from './assistant-helpers'
+import { whereItpUtilisable } from './itp-acces'
 import { alertesAssociations } from './associations-alertes'
-import { appliquerDecalageItp, decalageItpPourZone } from './calendrier-climat'
+import { appliquerDecalageItp, decalageItpPourLecteur } from './calendrier-climat'
+import { moisDepuisSemaine, semaineSemisEffective } from './cultures/dates-itp'
+import { projectionRecolteKg } from './recolte/projection'
+import type { StatutSemence } from './semences/calcul'
 import { zoneEffectiveUser } from './terroir'
+import { etapeCycleRotation } from './rotation/etape-cycle'
+
+export { etapeCycleRotation, EPOCH_ROTATION_SANS_ANCRAGE } from './rotation/etape-cycle'
 
 /**
  * Bug #4 — Si la planche n'a pas d'îlot explicite, dériver depuis le préfixe
@@ -34,9 +41,42 @@ export interface CulturePrevue {
   plancheSurface: number | null
   /** Portion de longueur réellement allouée à la culture, si saisie. */
   cultureLongueur: number | null
+  /**
+   * Nombre de plants calculé et ENREGISTRÉ par la fiche culture (champ
+   * `quantite`). C'est le chiffre que l'utilisateur a validé : les écrans
+   * de besoins doivent le reprendre tel quel plutôt que de le recalculer
+   * (QA cmsqm5f3f : Poireau 198 plants sur la fiche, 66 à l'écran Plants).
+   */
+  cultureQuantite: number | null
+  /**
+   * Date de récolte RÉELLEMENT stockée sur la culture, quand elle existe.
+   *
+   * `semaineRecolte` en est dérivée et perd de l'information : une semaine ISO
+   * chevauche deux mois, si bien qu'une récolte du 2 juillet appartient à une
+   * semaine dont le lundi tombe le 29 juin. Ventiler les kilos sur la semaine
+   * plaçait donc cette récolte en juin sur Planification, quand le tableau de
+   * bord et le Calendrier la lisent en juillet depuis la même date. La date
+   * fait foi partout ailleurs : elle doit descendre jusqu'ici.
+   *
+   * Null pour les suggestions de rotation, qui n'ont pas de date par
+   * construction — la semaine de l'ITP est alors la seule information
+   * disponible.
+   */
+  cultureDateRecolte: Date | null
   ilot: string | null
   rotationId: string | null
   rotationAnnee: number // Annee dans le cycle (1, 2, 3...)
+  /**
+   * QA cmswy9fyr — deux planches sur la MÊME rotation et la même année peuvent
+   * légitimement être à des étapes différentes : la phase est ancrée sur
+   * `Planche.annee` (« l'année où cette planche est à l'étape 1 »), ce qui permet
+   * d'étaler un même cycle sur plusieurs planches. Mais rien ne l'exposait, et
+   * une planche SANS année d'ancrage retombe sur un epoch fixe, donc sur une
+   * phase arbitraire. Les écrans peuvent désormais nommer l'ancrage et la
+   * position dans le cycle — ou signaler qu'il n'y en a pas.
+   */
+  rotationNbAnnees: number | null
+  rotationAncrage: number | null
   itpId: string | null
   especeId: string | null
   especeCouleur: string | null
@@ -65,6 +105,9 @@ export interface RecoltePrevue {
   totalKg: number
   totalSurface: number
 }
+
+/** Unités possibles de `Espece.uniteDose` (cf. prisma/schema.prisma). */
+export type UniteDoseSemence = 'g_m2' | 'pieces_m2' | 'graines_plant' | 'caieux_m2' | null
 
 export interface BesoinSemence {
   especeId: string
@@ -97,8 +140,11 @@ export interface BesoinSemence {
   aCommander: number
   /** Manque à commander (en unités pour mode bulbe_caieu). */
   caieuxACommander: number
-  /** Statut métier : OK / LOW / MISSING / IGNORE. */
-  statut: 'OK' | 'LOW' | 'MISSING' | 'IGNORE'
+  /**
+   * Statut métier : OK / LOW / MISSING / IGNORE / DONNEE_MANQUANTE
+   * (QA cmswxo3ri — culture planifiée dont le référentiel ne permet aucun calcul).
+   */
+  statut: StatutSemence
   /** Date de la dernière mise à jour du stock pour la variété (null si absent). */
   stockDateMaj: string | null
 }
@@ -172,14 +218,6 @@ function calculerNbPlants(
   const longueurCm = longueur * 100
   const nbPlantsParRang = Math.floor(longueurCm / espacement)
   return nbPlantsParRang * nbRangs
-}
-
-/**
- * Convertit un numero de semaine en mois (1-12)
- */
-function semainVersMois(semaine: number): number {
-  // Approximation: 4.33 semaines par mois
-  return Math.min(12, Math.max(1, Math.ceil(semaine / 4.33)))
 }
 
 /**
@@ -289,6 +327,12 @@ export async function getCulturesPrevues(
      * historique quand cette option est absente.
      */
     includeAllCultures?: boolean
+    /**
+     * QA cmsbterw9 — une culture « en récolte » (recolteFaite=true mais non
+     * terminée) occupe encore physiquement la planche : les associations
+     * doivent la voir comme voisine. Les cultures terminées restent exclues.
+     */
+    inclureEnRecolte?: boolean
   }
 ): Promise<CulturePrevue[]> {
   const userZone = await zoneEffectiveUser(prisma, userId)
@@ -327,6 +371,7 @@ export async function getCulturesPrevues(
           datePlantation: true,
           dateRecolte: true,
           longueur: true,
+          quantite: true,
           nbRangs: true,
           espacement: true,
           recolteFaite: true,
@@ -337,6 +382,11 @@ export async function getCulturesPrevues(
   })
 
   const culturesPrevues: CulturePrevue[] = []
+  /** Position dans le cycle de rotation, par planche (cf. QA cmswy9fyr). */
+  const phaseParPlanche = new Map<
+    string,
+    { etape: number; nbAnnees: number; ancrage: number | null }
+  >()
 
   for (const planche of planches) {
     if (!planche.rotation || planche.rotation.details.length === 0) continue
@@ -349,8 +399,16 @@ export async function getCulturesPrevues(
     // la même étape ressortait chaque année (audit 2026-07, #26). Repli sur un
     // epoch fixe si planche.annee absent : la phase est alors arbitraire mais
     // progresse correctement d'une année sur l'autre.
-    const anneeRef = planche.annee ?? 2000
-    const etapeCourante = ((((annee - anneeRef) % nbAnneesCycle) + nbAnneesCycle) % nbAnneesCycle) + 1
+    const etapeCourante = etapeCycleRotation(annee, planche.annee, nbAnneesCycle)
+    // QA cmswy9fyr — la phase doit aussi être lisible sur les planches DÉJÀ
+    // cultivées : elles passent par le mode 2 ci-dessous, qui ne connaît pas le
+    // cycle. Sans ça, comparer une planche neuve à une planche en culture sur la
+    // même rotation était impossible — c'est exactement ce qui a été signalé.
+    phaseParPlanche.set(planche.id, {
+      etape: etapeCourante,
+      nbAnnees: nbAnneesCycle,
+      ancrage: planche.annee ?? null,
+    })
 
     for (const detail of planche.rotation.details) {
       if (detail.annee !== etapeCourante) continue
@@ -372,7 +430,8 @@ export async function getCulturesPrevues(
       if (
         cultureExistante &&
         !options?.includeAllCultures &&
-        (cultureExistante.recolteFaite || cultureExistante.terminee !== null)
+        (cultureExistante.terminee !== null ||
+          (cultureExistante.recolteFaite && !options?.inclureEnRecolte))
       ) {
         continue
       }
@@ -391,7 +450,7 @@ export async function getCulturesPrevues(
       const itpCalibreM1 = detail.itp
         ? appliquerDecalageItp(
             detail.itp,
-            decalageItpPourZone(detail.itp.zoneClimat, userZone)
+            decalageItpPourLecteur(detail.itp, userZone, userId)
           )
         : null
       const semainesM1 = coherenceSemaines({
@@ -414,9 +473,13 @@ export async function getCulturesPrevues(
         plancheLargeur: planche.largeur,
         plancheSurface: planche.surface,
         cultureLongueur: cultureExistante?.longueur ?? null,
+        cultureQuantite: cultureExistante?.quantite ?? null,
+        cultureDateRecolte: cultureExistante?.dateRecolte ?? null,
         ilot: deriveIlot(planche.ilot, planche.nom),
         rotationId: planche.rotationId,
         rotationAnnee: detail.annee,
+        rotationNbAnnees: nbAnneesCycle,
+        rotationAncrage: planche.annee ?? null,
         itpId: detail.itpId,
         especeId: detail.itp?.especeId || null,
         especeCouleur: detail.itp?.espece?.couleur || null,
@@ -452,7 +515,7 @@ export async function getCulturesPrevues(
       annee,
       ...(!options?.includeAllCultures && {
         terminee: null,
-        recolteFaite: false,
+        ...(options?.inclureEnRecolte ? {} : { recolteFaite: false }),
       }),
       ...(options?.especeId && { especeId: options.especeId }),
       ...(options?.plancheId && { planche: { nom: options.plancheId } }),
@@ -480,8 +543,16 @@ export async function getCulturesPrevues(
     // rotation. L'identifiant de culture est globalement unique et suffit.
     const dejaPresente = culturesPrevues.some(cp => cp.cultureId === culture.id)
 
-    if (!dejaPresente && culture.planche) {
-      const surfacePlanche = (culture.planche.longueur || 0) * (culture.planche.largeur || 0)
+    // QA cmsw8wni8 (2026-08-16) — une culture SANS planche (saisie sans
+    // planche, ou orpheline après suppression de sa planche) était écartée
+    // silencieusement du tableau et des compteurs : Planification annonçait
+    // 23 cultures quand l'écran Cultures et le tableau de bord en comptaient
+    // 25. La planche est optionnelle sur Culture : on inclut ces lignes avec
+    // plancheId vide (affiché « sans planche ») au lieu de les perdre.
+    if (!dejaPresente) {
+      const planche = culture.planche
+      const phase = planche ? phaseParPlanche.get(planche.id) : undefined
+      const surfacePlanche = (planche?.longueur || 0) * (planche?.largeur || 0)
 
       // Bug R19/R26 : la DATE RÉELLE saisie sur la culture prime sur la semaine
       // théorique de l'ITP (sinon 2 cultures en succession affichent la même
@@ -492,7 +563,7 @@ export async function getCulturesPrevues(
       const itpCalibreM2 = culture.itp
         ? appliquerDecalageItp(
             culture.itp,
-            decalageItpPourZone(culture.itp.zoneClimat, userZone)
+            decalageItpPourLecteur(culture.itp, userZone, userId)
           )
         : null
       const semainesM2 = coherenceSemaines({
@@ -509,14 +580,20 @@ export async function getCulturesPrevues(
       })
 
       culturesPrevues.push({
-        plancheId: culture.planche.nom || culture.plancheId || '',
-        plancheLongueur: culture.planche.longueur,
-        plancheLargeur: culture.planche.largeur,
-        plancheSurface: culture.planche.surface,
+        plancheId: planche?.nom || '',
+        plancheLongueur: planche?.longueur ?? null,
+        plancheLargeur: planche?.largeur ?? null,
+        plancheSurface: planche?.surface ?? null,
         cultureLongueur: culture.longueur,
-        ilot: deriveIlot(culture.planche.ilot, culture.planche.nom),
-        rotationId: culture.planche.rotationId,
-        rotationAnnee: 0, // Pas de rotation
+        cultureQuantite: culture.quantite ?? null,
+        cultureDateRecolte: culture.dateRecolte ?? null,
+        ilot: planche ? deriveIlot(planche.ilot, planche.nom) : null,
+        rotationId: planche?.rotationId ?? null,
+        // 0 = planche sans rotation. Si elle en a une, on expose sa position
+        // réelle dans le cycle et son ancrage (QA cmswy9fyr).
+        rotationAnnee: phase?.etape ?? 0,
+        rotationNbAnnees: phase?.nbAnnees ?? null,
+        rotationAncrage: phase?.ancrage ?? planche?.annee ?? null,
         itpId: culture.itpId,
         especeId: culture.especeId,
         especeCouleur: culture.espece?.couleur || null,
@@ -528,8 +605,8 @@ export async function getCulturesPrevues(
         dureeCulture: culture.itp?.dureeCulture || null,
         nbRangs: culture.nbRangs || culture.itp?.nbRangs || null,
         espacement: culture.espacement || culture.itp?.espacement || null,
-        surface: culture.longueur && culture.planche.largeur
-          ? culture.longueur * culture.planche.largeur
+        surface: culture.longueur && planche?.largeur
+          ? culture.longueur * planche.largeur
           : surfacePlanche,
         existante: true, // Culture déjà créée
         cultureId: culture.id,
@@ -543,12 +620,43 @@ export async function getCulturesPrevues(
 /**
  * Recupere les recoltes prevues groupees par mois ou semaine
  */
+/**
+ * Détail des récoltes prévues : les périodes affichées ET la ventilation de la
+ * projection entre cultures déjà créées et suggestions de rotation.
+ *
+ * QA cmswxpaer — l'écran « Récoltes prévues » affichait « 0,0 kg attendu » en
+ * en-tête et sur ses trois cartes alors que sa ligne Juillet annonçait 361,9 kg.
+ * Les deux nombres ne venaient pas de la même population : les cartes lisent
+ * `getRecoltesAnneeAggregat`, borné aux cultures RÉELLEMENT créées, tandis que
+ * le tableau projette aussi les cultures suggérées par les rotations. En 2028,
+ * une seule culture était créée → cartes à zéro, tableau à 361,9 kg. La
+ * ventilation permet à l'écran d'annoncer un total qui couvre ce qu'il montre,
+ * comme le font déjà Semences et Plants (QA cmsob4f5t).
+ */
+export interface RecoltesPrevuesDetail {
+  periodes: RecoltePrevue[]
+  /** Projection des cultures déjà créées (kg) — déjà comprise dans l'agrégat annuel. */
+  projectionCreeesKg: number
+  /** Projection des cultures suggérées par les rotations, pas encore créées (kg). */
+  projectionSuggestionsKg: number
+}
+
 export async function getRecoltesPrevues(
   userId: string,
   annee: number,
   groupBy: 'mois' | 'semaine' = 'mois'
 ): Promise<RecoltePrevue[]> {
+  return (await getRecoltesPrevuesDetail(userId, annee, groupBy)).periodes
+}
+
+export async function getRecoltesPrevuesDetail(
+  userId: string,
+  annee: number,
+  groupBy: 'mois' | 'semaine' = 'mois'
+): Promise<RecoltesPrevuesDetail> {
   const culturesPrevues = await getCulturesPrevues(userId, annee)
+  let projectionCreeesKg = 0
+  let projectionSuggestionsKg = 0
 
   // Grouper par periode
   const groupedMap = new Map<number, {
@@ -559,15 +667,25 @@ export async function getRecoltesPrevues(
   const especeIds = [...new Set(culturesPrevues.map(c => c.especeId).filter(Boolean))]
   const especes = await prisma.espece.findMany({
     where: { id: { in: especeIds as string[] } },
-    select: { id: true, rendement: true, couleur: true },
+    // `rendement` est un nombre dont le sens dépend de `uniteRendement` : sans
+    // elle, un Kiwi à 25 kg/ARBRE était projeté à 750 kg sur 30 m².
+    select: { id: true, rendement: true, uniteRendement: true, couleur: true },
   })
   const especeMap = new Map(especes.map(e => [e.id, e]))
 
   for (const culture of culturesPrevues) {
     if (!culture.semaineRecolte || !culture.especeId) continue
 
+    // La DATE stockée fait foi pour le mois : c'est elle que le tableau de
+    // bord et le Calendrier lisent. La semaine ISO ne sert que pour les
+    // cultures qui n'ont pas de date (suggestions de rotation), où elle est la
+    // seule information disponible — et son lundi peut alors tomber dans le
+    // mois précédent, ce qui est sans conséquence puisque rien d'autre ne
+    // projette ces lignes.
     const periodeNum = groupBy === 'mois'
-      ? semainVersMois(culture.semaineRecolte)
+      ? (culture.cultureDateRecolte
+          ? culture.cultureDateRecolte.getMonth() + 1
+          : moisDepuisSemaine(culture.annee, culture.semaineRecolte))
       : culture.semaineRecolte
 
     if (!groupedMap.has(periodeNum)) {
@@ -576,9 +694,14 @@ export async function getRecoltesPrevues(
 
     const group = groupedMap.get(periodeNum)!
     const especeData = especeMap.get(culture.especeId)
-    const rendement = especeData?.rendement || 0
 
-    const quantite = culture.surface * rendement
+    const quantite = projectionRecolteKg(
+      culture.surface,
+      especeData?.rendement,
+      especeData?.uniteRendement,
+    )
+    if (culture.existante) projectionCreeesKg += quantite
+    else projectionSuggestionsKg += quantite
     const key = culture.especeId
 
     if (!group.especes.has(key)) {
@@ -614,7 +737,97 @@ export async function getRecoltesPrevues(
     })
   }
 
-  return result
+  return {
+    periodes: result,
+    projectionCreeesKg: Math.round(projectionCreeesKg * 100) / 100,
+    projectionSuggestionsKg: Math.round(projectionSuggestionsKg * 100) / 100,
+  }
+}
+
+/**
+ * Ce que « pèse » une culture pour les écrans de besoins : sa surface et son
+ * nombre de plants.
+ *
+ * Il en existait DEUX implémentations, qui ne rendaient pas les mêmes chiffres
+ * pour la même ligne de base — Plants nécessaires annonçait 1 000 plants de
+ * tomate là où Semences en annonçait 100, et la fiche culture 1 000. Deux
+ * divergences en cause :
+ *
+ *  1. `Culture.quantite` — le nombre de plants que l'utilisateur a validé sur
+ *     la fiche — faisait foi côté Plants et était purement ignoré côté
+ *     Semences, qui repartait d'un calcul géométrique.
+ *  2. Le prorata 1/N des planches partagées, conçu pour ne pas compter N fois
+ *     la SURFACE d'une planche, était appliqué côté Semences au nombre de
+ *     plants et à la surface propre de la culture : l'oignon annonçait
+ *     « 37 bulbilles » pour 100 plants, la carotte 1,5 g pour 5 m² de rang.
+ *     L'utilisateur commandait le tiers de ses semences.
+ *
+ * Une seule règle, ici, pour les deux écrans :
+ *  - la quantité enregistrée sur la fiche est la vérité quand elle existe ;
+ *  - le prorata ne s'applique QU'AUX grandeurs dérivées de la planche entière.
+ *    Une culture qui porte sa propre longueur décrit déjà sa part : 198
+ *    poireaux plantés demandent 198 plants, quelle que soit la colocation de
+ *    la planche.
+ */
+export type MesureCulture = {
+  /** Surface imputable à cette culture (m²). */
+  surfaceM2: number
+  /** Plants imputables à cette culture. */
+  nbPlants: number
+}
+
+export function mesurerCulture(
+  culture: CulturePrevue,
+  refs: {
+    culturesParPlanche: Map<string, number>
+    itpFallback: Map<string, { nbRangs: number; espacement: number }>
+    densiteFallback: Map<string, number>
+  },
+): MesureCulture {
+  const partageFactor = culture.plancheId
+    ? 1 / (refs.culturesParPlanche.get(culture.plancheId) ?? 1)
+    : 1
+
+  // La culture porte sa propre longueur : sa surface est déjà la sienne, et
+  // tout ce qui en dérive aussi. Sinon la mesure vient de la planche entière,
+  // partagée entre ses N occupantes.
+  const longueurPropre = culture.cultureLongueur ?? null
+  const facteurPlanche = longueurPropre ? 1 : partageFactor
+
+  const surfaceM2 = culture.surface * facteurPlanche
+
+  if (culture.cultureQuantite && culture.cultureQuantite > 0) {
+    return { surfaceM2, nbPlants: Math.round(culture.cultureQuantite) }
+  }
+
+  // Fallbacks en cascade quand la fiche est incomplètement saisie :
+  // nbRangs/espacement de la culture, puis d'un ITP de l'espèce, puis
+  // densité (plants/m²) de l'espèce.
+  const especeId = culture.especeId
+  const fb = especeId ? refs.itpFallback.get(especeId) : undefined
+  const nbRangs = culture.nbRangs ?? fb?.nbRangs ?? null
+  const espacement = culture.espacement ?? fb?.espacement ?? null
+  const longueurEffective =
+    longueurPropre ??
+    (culture.plancheLargeur && culture.surface > 0
+      ? culture.surface / culture.plancheLargeur
+      : culture.plancheLongueur)
+
+  let nbPlantsBrut = calculerNbPlants(
+    longueurEffective,
+    culture.plancheLargeur,
+    nbRangs,
+    espacement,
+  )
+  if (nbPlantsBrut === 0 && especeId) {
+    const dens = refs.densiteFallback.get(especeId)
+    // Ce repli part de `culture.surface`, donc de la planche entière quand la
+    // culture n'a pas de longueur propre : il suit le même facteur que tout
+    // le reste.
+    if (dens && culture.surface > 0) nbPlantsBrut = Math.ceil(culture.surface * dens)
+  }
+
+  return { surfaceM2, nbPlants: Math.round(nbPlantsBrut * facteurPlanche) }
 }
 
 /**
@@ -629,11 +842,14 @@ export async function getBesoinsSemences(
   annee: number
 ): Promise<BesoinSemence[]> {
   const { calculerBesoin, defaultGrainesParGramme } = await import('./semences/calcul')
-  // Bug #8 (testeur Marc) : la commande de semences ne doit porter que sur les
-  // cultures RÉELLEMENT créées. Les cultures « à créer » (suggestions de rotation,
-  // virtuelles) gonflaient les surfaces (80 m² de haricot > planche réelle) et
-  // faussaient la commande de graines.
-  const culturesPrevues = (await getCulturesPrevues(userId, annee)).filter((c) => c.existante)
+  // QA cmsob4f5t — les suggestions (existante: false) comptent dans les
+  // besoins, comme le fait déjà getBesoinsPlants : l'écran Plants incluait
+  // les tomates suggérées, Semences ignorait les haricots suggérés. Le
+  // Bug #8 historique (testeur Marc : suggestions gonflant les surfaces)
+  // est couvert depuis par deux garde-fous dans getCulturesPrevues : pas de
+  // suggestion sur une planche déjà occupée par des cultures réelles, et
+  // prorata 1/N multi-cultures (BUG-21) — identiques à ceux de Plants.
+  const culturesPrevues = await getCulturesPrevues(userId, annee)
 
   // Référentiel : modes/dose par espèce, graines/g par variété, stocks user.
   // Feedback Marc 2026-05-16 — Bug 12 : on ajoute `densite` au select
@@ -693,6 +909,26 @@ export async function getBesoinsSemences(
     }
   }
 
+  // Doses de l'ITP RATTACHÉ à la culture.
+  //
+  // Deux doses de semis contradictoires cohabitaient : celle de l'ITP ne
+  // servait qu'au décrément automatique de stock, cet écran ne lisait que
+  // celle de l'espèce. Un épinard rattaché à un ITP affichant « Dose semis
+  // 30 g/m² » recevait ici le bandeau « aucune dose de semis n'est renseignée
+  // au référentiel », et corriger la dose de l'ITP ne déplaçait pas un gramme.
+  // L'itinéraire décrit la conduite choisie : sa dose prime sur celle,
+  // générique, de l'espèce.
+  const itpIdsRattaches = [
+    ...new Set(culturesPrevues.map(c => c.itpId).filter((v): v is string => !!v)),
+  ]
+  const itpsRattaches = itpIdsRattaches.length
+    ? await prisma.iTP.findMany({
+        where: { id: { in: itpIdsRattaches } },
+        select: { id: true, doseSemis: true, nbGrainesPlant: true },
+      })
+    : []
+  const itpDoseMap = new Map(itpsRattaches.map(i => [i.id, i]))
+
   // BUG-21 (audit Marc 2026-05-14) : double comptage de surface quand
   // plusieurs cultures partagent une même planche dans l'année (rotation
   // courte, ITPs multiples). Avant : Carotte 30 m² (B1) + Actinidia 30 m²
@@ -712,47 +948,51 @@ export async function getBesoinsSemences(
     varieteId: string | null
     surfaceTotale: number
     nbPlants: number
+    /** Dose de semis (g/m²) portée par l'ITP rattaché, si elle existe. */
+    doseItpGParM2: number | null
+    /** Graines par plant portées par l'ITP rattaché, si elles existent. */
+    grainesParPlantItp: number | null
   }
+  const densiteFallbackSemences = new Map<string, number>()
+  for (const e of especes) {
+    if (e.densite) densiteFallbackSemences.set(e.id, e.densite)
+  }
+
   const accMap = new Map<string, Acc>()
   for (const culture of culturesPrevues) {
     if (!culture.especeId) continue
     const key = `${culture.especeId}|${culture.varieteId || ''}`
-    // Feedback Marc 2026-05-16 — Bug 12 : fallback nbRangs/espacement
-    // (ITP référentiel) + fallback final densite (plants/m²) pour ne
-    // pas retourner nbPlants=0 quand la culture est incomplètement
-    // saisie.
-    const fb = itpFallbackSemences.get(culture.especeId)
-    const nbRangs = culture.nbRangs ?? fb?.nbRangs ?? null
-    const espacement = culture.espacement ?? fb?.espacement ?? null
-    const longueurEffective =
-      culture.cultureLongueur ??
-      (culture.plancheLargeur && culture.surface > 0
-        ? culture.surface / culture.plancheLargeur
-        : culture.plancheLongueur)
-    let nbPlants = calculerNbPlants(
-      longueurEffective,
-      culture.plancheLargeur,
-      nbRangs,
-      espacement
-    )
-    if (nbPlants === 0) {
-      const dens = especeMap.get(culture.especeId)?.densite
-      if (dens && culture.surface > 0) {
-        nbPlants = Math.ceil(culture.surface * dens)
-      }
-    }
-    const partageFactor = culture.plancheId
-      ? 1 / (culturesParPlanche.get(culture.plancheId) ?? 1)
-      : 1
+
+    // Mesure commune aux deux écrans de besoins (cf. `mesurerCulture`) :
+    // `Culture.quantite` fait foi, et le prorata de planche partagée ne
+    // touche que ce qui dérive de la planche entière.
+    const mesure = mesurerCulture(culture, {
+      culturesParPlanche,
+      itpFallback: itpFallbackSemences,
+      densiteFallback: densiteFallbackSemences,
+    })
+
     const cur = accMap.get(key) || {
       especeId: culture.especeId,
       especeCouleur: culture.especeCouleur,
       varieteId: culture.varieteId,
       surfaceTotale: 0,
       nbPlants: 0,
+      doseItpGParM2: null,
+      grainesParPlantItp: null,
     }
-    cur.surfaceTotale += culture.surface * partageFactor
-    cur.nbPlants += Math.round(nbPlants * partageFactor)
+    cur.surfaceTotale += mesure.surfaceM2
+    cur.nbPlants += mesure.nbPlants
+    // Dose de l'itinéraire rattaché : première renseignée du groupe.
+    if (culture.itpId) {
+      const dosesItp = itpDoseMap.get(culture.itpId)
+      if (cur.doseItpGParM2 == null && dosesItp?.doseSemis != null) {
+        cur.doseItpGParM2 = dosesItp.doseSemis
+      }
+      if (cur.grainesParPlantItp == null && dosesItp?.nbGrainesPlant != null) {
+        cur.grainesParPlantItp = dosesItp.nbGrainesPlant
+      }
+    }
     accMap.set(key, cur)
   }
 
@@ -763,12 +1003,28 @@ export async function getBesoinsSemences(
     const variete = acc.varieteId ? varieteMap.get(acc.varieteId) : null
     const stock = acc.varieteId ? userStockMap.get(acc.varieteId) : undefined
 
+    // Dose : l'itinéraire rattaché prime, l'espèce sert de repli. L'ITP
+    // exprime sa dose de semis en g/m² et ses graines/plant dans un champ
+    // distinct : chacune ne peut suppléer l'espèce que dans l'unité qui lui
+    // correspond. Une espèce comptée en pièces/m² ou en caïeux/m² garde donc
+    // la sienne — substituer des g/m² à des pièces/m² changerait la grandeur.
+    const uniteEspece = (espece?.uniteDose ?? null) as UniteDoseSemence
+    const doseItp =
+      uniteEspece === 'graines_plant'
+        ? acc.grainesParPlantItp
+        : uniteEspece === null || uniteEspece === 'g_m2'
+          ? acc.doseItpGParM2
+          : null
+    const doseEffective = doseItp ?? espece?.doseSemis ?? null
+    const uniteEffective: UniteDoseSemence =
+      doseItp != null && uniteEspece === null ? 'g_m2' : uniteEspece
+
     const calc = calculerBesoin({
       mode: (espece?.modeSemis ?? 'graine_directe') as 'graine_directe' | 'plant_repique' | 'bulbe_caieu' | 'bouture',
       surfaceM2: acc.surfaceTotale,
       nbPlants: acc.nbPlants,
-      doseGParM2: espece?.doseSemis ?? null,
-      uniteDose: (espece?.uniteDose ?? null) as 'g_m2' | 'pieces_m2' | 'graines_plant' | 'caieux_m2' | null,
+      doseGParM2: doseEffective,
+      uniteDose: uniteEffective,
       tauxGerminationPct: espece?.tauxGermination ?? null,
       // Fallback PMG par espèce si la variété n'a pas de graines/g saisi
       // (évite « 0 g / — à commander » silencieux — cmpm700xw).
@@ -795,8 +1051,8 @@ export async function getBesoinsSemences(
       // On expose la valeur réellement utilisée + un flag « estimé » pour la transparence.
       nbGrainesG: variete?.nbGrainesG ?? defaultGrainesParGramme(acc.especeId),
       nbGrainesGEstime: variete?.nbGrainesG == null,
-      doseSemis: espece?.doseSemis ?? null,
-      uniteDose: (espece?.uniteDose ?? null) as 'g_m2' | 'pieces_m2' | 'graines_plant' | 'caieux_m2' | null,
+      doseSemis: doseEffective,
+      uniteDose: uniteEffective,
       tauxGerminationPct: espece?.tauxGermination ?? null,
       aCommander: calc.manqueGrammes,
       caieuxACommander: calc.manqueCaieux,
@@ -893,35 +1149,23 @@ export async function getBesoinsPlants(
   for (const culture of culturesAvecPlantation) {
     if (!culture.especeId) continue
 
-    const key = `${culture.especeId}|${culture.varieteId || ''}`
-    const partageFactor = culture.plancheId
-      ? 1 / (culturesParPlanche.get(culture.plancheId) ?? 1)
-      : 1
-    const surfaceEffective = culture.surface * partageFactor
-    // BUG #4 — fallback ITP référentiel si nbRangs/espacement manquants
-    const fb = itpFallback.get(culture.especeId)
-    const nbRangs = culture.nbRangs ?? fb?.nbRangs ?? null
-    const espacement = culture.espacement ?? fb?.espacement ?? null
-    const longueurEffective =
-      culture.cultureLongueur ??
-      (culture.plancheLargeur && culture.surface > 0
-        ? culture.surface / culture.plancheLargeur
-        : culture.plancheLongueur)
-    let nbPlantsBrut = calculerNbPlants(
-      longueurEffective,
-      culture.plancheLargeur,
-      nbRangs,
-      espacement
-    )
-    // Feedback Marc 2026-05-16 — Bug 12 : si ni la culture ni l'ITP ne
-    // fournissent nbRangs/espacement, dériver depuis surface × densite.
-    if (nbPlantsBrut === 0) {
-      const dens = densiteFallback.get(culture.especeId)
-      if (dens && culture.surface > 0) {
-        nbPlantsBrut = Math.ceil(culture.surface * dens)
-      }
-    }
-    const nbPlants = Math.round(nbPlantsBrut * partageFactor)
+    // La semaine de plantation entre dans la clé : sans elle, une succession
+    // (Poireau planté S29 puis S32) s'agrégeait en une seule ligne portant la
+    // semaine de la PREMIÈRE culture rencontrée. L'écran annonçait « S29 —
+    // 112 plants » : le maraîcher produisait 112 poireaux pour la semaine 29,
+    // dont 60 ne sont plantés qu'en S32, et n'avait plus rien pour la seconde
+    // plantation.
+    const key = `${culture.especeId}|${culture.varieteId || ''}|${culture.semainePlantation}`
+
+    // QA cmsqm5f3f — mesure commune aux deux écrans de besoins : la quantité
+    // enregistrée sur la fiche fait foi, et le prorata 1/N des planches
+    // partagées ne touche que ce qui dérive de la planche entière (cf.
+    // `mesurerCulture`).
+    const { nbPlants, surfaceM2: surfaceEffective } = mesurerCulture(culture, {
+      culturesParPlanche,
+      itpFallback,
+      densiteFallback,
+    })
 
     if (!besoinsMap.has(key)) {
       besoinsMap.set(key, {
@@ -945,14 +1189,43 @@ export async function getBesoinsPlants(
     })
   }
 
-  // Calculer les plants a commander
+  // Calculer les plants a commander.
+  //
+  // Le stock de plants est détenu par VARIÉTÉ, alors qu'une succession produit
+  // désormais une ligne par semaine de plantation. Le déduire intégralement de
+  // chaque ligne annoncerait « OK » partout : 100 plants en stock couvriraient
+  // à la fois les 52 poireaux de S29 et les 60 de S32. On l'alloue donc dans
+  // l'ordre chronologique — les premières plantations consomment le stock —,
+  // ce qui conserve l'invariant « somme des à commander = besoin total − stock ».
+  // `stockActuel` porte alors la part allouée à la ligne, pour que son
+  // arithmétique reste lisible (plants + marge − stock = à commander).
+  const parVariete = new Map<string, BesoinPlant[]>()
   for (const besoin of besoinsMap.values()) {
-    // Ajouter 10% de marge pour pertes
-    const nbPlantsAvecMarge = Math.ceil(besoin.nbPlants * 1.1)
-    besoin.aCommander = Math.max(0, nbPlantsAvecMarge - besoin.stockActuel)
+    const cle = `${besoin.especeId}|${besoin.varieteId || ''}`
+    const lignes = parVariete.get(cle) ?? []
+    lignes.push(besoin)
+    parVariete.set(cle, lignes)
+  }
+  for (const lignes of parVariete.values()) {
+    lignes.sort(
+      (a, b) => (a.semainePlantation ?? Infinity) - (b.semainePlantation ?? Infinity)
+    )
+    let stockRestant = lignes[0]?.stockActuel ?? 0
+    for (const besoin of lignes) {
+      // Ajouter 10% de marge pour pertes
+      const nbPlantsAvecMarge = Math.ceil(besoin.nbPlants * 1.1)
+      const couvert = Math.min(stockRestant, nbPlantsAvecMarge)
+      besoin.stockActuel = couvert
+      besoin.aCommander = Math.max(0, nbPlantsAvecMarge - couvert)
+      stockRestant -= couvert
+    }
   }
 
-  return Array.from(besoinsMap.values()).sort((a, b) => a.especeId.localeCompare(b.especeId))
+  return Array.from(besoinsMap.values()).sort(
+    (a, b) =>
+      a.especeId.localeCompare(b.especeId) ||
+      (a.semainePlantation ?? Infinity) - (b.semainePlantation ?? Infinity)
+  )
 }
 
 /**
@@ -962,7 +1235,9 @@ export async function getAssociations(
   userId: string,
   annee: number
 ): Promise<AssociationCulture[]> {
-  const culturesPrevues = await getCulturesPrevues(userId, annee)
+  // QA cmsbterw9 — une culture « en récolte » occupe encore la planche : elle
+  // compte comme voisine (les terminées restent hors jeu).
+  const culturesPrevues = await getCulturesPrevues(userId, annee, { inclureEnRecolte: true })
 
   // Bug cmp8sbe6d (Marc 2026-05-16) — Avant : on lisait uniquement le champ
   // CSV `planchesInfluencees` qui n'est exposé nulle part dans l'UI, donc
@@ -984,7 +1259,15 @@ export async function getAssociations(
     },
   })
   const plancheMap = new Map(planches.map(p => [p.nom, p]))
-  const cultureMap = new Map(culturesPrevues.map(c => [c.plancheId, c]))
+  // QA cmsbterw9 — une planche peut porter plusieurs cultures la même année
+  // (successions) : multimap, sinon seule la dernière culture était visible
+  // comme voisine.
+  const cultureMap = new Map<string, CulturePrevue[]>()
+  for (const c of culturesPrevues) {
+    const list = cultureMap.get(c.plancheId)
+    if (list) list.push(c)
+    else cultureMap.set(c.plancheId, [c])
+  }
 
   const SEUIL_VOISINAGE_M = 2
 
@@ -1058,10 +1341,8 @@ export async function getAssociations(
       : []
     const planchesVoisines = csv.length > 0 ? csv : voisinsGeographiques(planche)
 
-    const culturesVoisines = planchesVoisines
-      .map(pvId => {
-        const cv = cultureMap.get(pvId)
-        if (!cv) return null
+    const culturesVoisines = planchesVoisines.flatMap(pvId =>
+      (cultureMap.get(pvId) ?? []).map(cv => {
         let evalType: "favorable" | "defavorable" | "neutre" = "neutre"
         let evalMessage: string | null = null
         if (culture.especeId && cv.especeId) {
@@ -1073,7 +1354,7 @@ export async function getAssociations(
         }
         return { plancheId: pvId, especeId: cv.especeId, eval: evalType, evalMessage }
       })
-      .filter((cv): cv is { plancheId: string; especeId: string | null; eval: "favorable" | "defavorable" | "neutre"; evalMessage: string | null } => cv !== null)
+    )
 
     const aDefavorable = culturesVoisines.some(cv => cv.eval === "defavorable")
     const aFavorable = culturesVoisines.some(cv => cv.eval === "favorable")
@@ -1103,13 +1384,26 @@ export async function getAssociations(
 export async function creerCulturesBatch(
   userId: string,
   cultures: { plancheId: string; itpId: string; annee: number; varieteId?: string }[]
-): Promise<{ created: number; cultures: { id: number; plancheId: string; especeId: string }[] }> {
+): Promise<{
+  created: number
+  cultures: { id: number; plancheId: string; especeId: string }[]
+  ignorees: { plancheId: string; itpId: string; motif: string }[]
+}> {
   const results: { id: number; plancheId: string; especeId: string }[] = []
+  // Quatre motifs faisaient jusqu'ici disparaître une ligne en silence : la
+  // réponse annonçait « 3 cultures créées » sur 5 demandées sans dire lesquelles
+  // ni pourquoi. Même famille que la QA cmsw8wni8 (2 cultures absentes du
+  // total) : on n'écarte plus rien sans le nommer.
+  const ignorees: { plancheId: string; itpId: string; motif: string }[] = []
 
   // Recuperer les ITPs pour avoir les infos necessaires
   const itpIds = [...new Set(cultures.map(c => c.itpId))]
+  // Le correctif IDOR de 2026-07 avait borné la résolution des PLANCHES à
+  // celles de l'utilisateur (cf. plus bas) mais laissé l'ITP en accès libre :
+  // n'importe quel identifiant faisait l'affaire, y compris l'itinéraire privé
+  // d'un autre membre ou un itinéraire retiré du service.
   const itps = await prisma.iTP.findMany({
-    where: { id: { in: itpIds } },
+    where: { AND: [{ id: { in: itpIds } }, whereItpUtilisable(userId)] },
     include: { espece: true },
   })
   const itpMap = new Map(itps.map(itp => [itp.id, itp]))
@@ -1129,16 +1423,38 @@ export async function creerCulturesBatch(
 
   for (const culture of cultures) {
     const itp = itpMap.get(culture.itpId)
-    if (!itp || !itp.especeId) continue
+    if (!itp) {
+      ignorees.push({
+        plancheId: culture.plancheId,
+        itpId: culture.itpId,
+        motif: "itinéraire introuvable, privé ou retiré du service",
+      })
+      continue
+    }
+    if (!itp.especeId) {
+      ignorees.push({
+        plancheId: culture.plancheId,
+        itpId: culture.itpId,
+        motif: "itinéraire sans espèce rattachée",
+      })
+      continue
+    }
     const itpCalibre = appliquerDecalageItp(
       itp,
-      decalageItpPourZone(itp.zoneClimat, userZone)
+      decalageItpPourLecteur(itp, userZone, userId)
     )
 
     // Resolve planche nom → cuid (appartenance vérifiée : nom OU id de l'user)
     const plancheCuidId = plancheNomToId.get(culture.plancheId)
       ?? (plancheIdsUser.has(culture.plancheId) ? culture.plancheId : null)
-    if (!plancheCuidId) continue // planche inconnue pour cet utilisateur → on ignore
+    if (!plancheCuidId) {
+      ignorees.push({
+        plancheId: culture.plancheId,
+        itpId: culture.itpId,
+        motif: "planche inconnue dans votre exploitation",
+      })
+      continue
+    }
 
     // Verifier si la culture existe deja
     const existing = await prisma.culture.findFirst({
@@ -1150,22 +1466,38 @@ export async function creerCulturesBatch(
       },
     })
 
-    if (existing) continue
+    if (existing) {
+      ignorees.push({
+        plancheId: culture.plancheId,
+        itpId: culture.itpId,
+        motif: `déjà une culture de ${itp.especeId} sur cette planche en ${culture.annee}`,
+      })
+      continue
+    }
 
     // Calculer les dates a partir des semaines
     const annee = culture.annee
     // Chronologie : récolte/plantation antérieures au semis tombent l'année suivante.
-    const dateSemis = itpCalibre.semaineSemis
-      ? calculerDateDepuisSemaine(annee, itpCalibre.semaineSemis)
+    // QA cmsfxvbab — 173 ITP du référentiel n'ont ni semaine de semis ni semaine
+    // de plantation : la culture concrétisée n'obtenait qu'une date de récolte,
+    // sans début de cycle (état « Non défini », aucun décrément de semences).
+    // La fenêtre d'implantation sert de jalon de semis.
+    // QA cmswxqnaz — ce chemin écrit des dates en base, relues en semaine ISO :
+    // `calculerDateDepuisSemaine` est désormais ancrée sur l'ISO (jan. 4) comme
+    // `dates-itp.ts`. Avant, la culture 2028 matérialisée en S31 se relisait en
+    // S30 (convention « semaine contenant le 1er janvier »).
+    const semaineSemisEff = semaineSemisEffective(itpCalibre)
+    const dateSemis = semaineSemisEff
+      ? calculerDateDepuisSemaine(annee, semaineSemisEff)
       : null
     const datePlantation = itpCalibre.semainePlantation
-      ? dateSemaineChrono(annee, itpCalibre.semainePlantation, itpCalibre.semaineSemis)
+      ? dateSemaineChrono(annee, itpCalibre.semainePlantation, semaineSemisEff)
       : null
     const dateRecolte = itpCalibre.semaineRecolte
       ? dateSemaineChrono(
           annee,
           itpCalibre.semaineRecolte,
-          itpCalibre.semainePlantation ?? itpCalibre.semaineSemis
+          itpCalibre.semainePlantation ?? semaineSemisEff
         )
       : null
 
@@ -1185,65 +1517,13 @@ export async function creerCulturesBatch(
       },
     })
 
-    // Décrément automatique du stock de semences (per-user)
-    if (culture.varieteId && dateSemis) {
-      try {
-        const variete = await prisma.variete.findUnique({
-          where: { id: culture.varieteId },
-          select: { nbGrainesG: true },
-        })
-
-        const userStock = await prisma.userStockVariete.findFirst({
-          where: { userId, varieteId: culture.varieteId },
-        })
-
-        const currentStock = userStock?.stockGraines || 0
-
-        const planche = await prisma.planche.findUnique({
-          where: { id: plancheCuidId },
-          select: { largeur: true },
-        })
-
-        if (variete && currentStock > 0 && variete.nbGrainesG && planche && planche.largeur) {
-          const longueur = newCulture.longueur || 0
-          const nbRangs = newCulture.nbRangs || 1
-          const espacement = newCulture.espacement || 0
-
-          let grammesNecessaires = 0
-
-          if (espacement > 0 && variete.nbGrainesG > 0) {
-            // Semis en ligne
-            const nbGrainesPlant = itp.nbGrainesPlant || 1
-            grammesNecessaires = Math.ceil(
-              (longueur * nbRangs / espacement * 100 * nbGrainesPlant) /
-              variete.nbGrainesG
-            )
-          } else if (itp.doseSemis && planche.largeur > 0) {
-            // Semis à la volée
-            grammesNecessaires = Math.ceil(longueur * planche.largeur * itp.doseSemis)
-          }
-
-          if (grammesNecessaires > 0) {
-            await prisma.userStockVariete.upsert({
-              where: { userId_varieteId: { userId, varieteId: culture.varieteId } },
-              create: {
-                userId,
-                varieteId: culture.varieteId,
-                stockGraines: Math.max(0, -grammesNecessaires),
-                dateStock: new Date(),
-              },
-              update: {
-                stockGraines: Math.max(0, currentStock - grammesNecessaires),
-                dateStock: new Date(),
-              },
-            })
-          }
-        }
-      } catch (stockError) {
-        console.warn('Erreur décrément stock (culture batch):', stockError)
-        // Ne pas bloquer la création
-      }
-    }
+    // Pas de décrément automatique du stock de semences ici.
+    //
+    // Ce chemin en portait un, mort depuis toujours : la culture est créée
+    // sans `longueur`, dont dépendaient les deux formules — aucun gramme n'a
+    // jamais bougé par « Créer les cultures », là où le formulaire unitaire
+    // débitait. Le stock est désormais tenu par le seul écran Semences, qui
+    // affiche le besoin et le manque (cf. POST /api/cultures).
 
     results.push({
       id: newCulture.id,
@@ -1255,6 +1535,7 @@ export async function creerCulturesBatch(
   return {
     created: results.length,
     cultures: results,
+    ignorees,
   }
 }
 
