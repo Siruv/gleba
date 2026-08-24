@@ -200,7 +200,7 @@ export function EspeceCombobox({
           <ChevronsUpDown className="h-4 w-4 opacity-50 shrink-0" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
+      <PopoverContent className="w-[--radix-popover-trigger-width] p-0 z-50" align="start" forcePortal={true}>
         <div className="flex flex-wrap gap-1 p-2 border-b bg-slate-50">
           {TABS.filter((t) => visibleTabs.includes(t.key)).map((t) => (
             <button

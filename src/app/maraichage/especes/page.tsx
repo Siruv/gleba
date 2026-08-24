@@ -40,7 +40,9 @@ const ESPECE_TYPES = [
   { value: 'arbre_fruitier', label: 'Arbres fruitiers', icon: TreeDeciduous, arbresOnly: true },
   { value: 'petit_fruit', label: 'Petits fruits', icon: Cherry, arbresOnly: true },
   { value: 'aromatique', label: 'Aromatiques', icon: Flower2, arbresOnly: false },
+  { value: 'fleur', label: 'Fleurs', icon: Flower2, arbresOnly: false },
   { value: 'engrais_vert', label: 'Engrais verts', icon: Sprout, arbresOnly: false },
+  { value: 'fleur', label: 'Fleurs', icon: Flower2, arbresOnly: false },
 ] as const
 
 // Types pour le mode arbres (filtrés)
@@ -53,6 +55,7 @@ const ESPECE_TYPES_ARBRES = [
 // Labels pour l'affichage
 const TYPE_LABELS: Record<string, string> = {
   legume: 'Légume',
+  fleur: 'Fleur',
   arbre_fruitier: 'Arbre fruitier',
   petit_fruit: 'Petit fruit',
   aromatique: 'Aromatique',
