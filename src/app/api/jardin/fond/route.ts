@@ -136,15 +136,14 @@ export async function POST(request: NextRequest) {
   await mkdir(dir, { recursive: true })
   const fichier = `${key}.${ext}`
   const buffer = Buffer.from(await (file as Blob).arrayBuffer())
-  /* turbopackIgnore: true */
-  await writeFile(path.join(dir, fichier), buffer)
+  await writeFile(path.join(/*turbopackIgnore: true*/ dir, fichier), buffer)
 
   const existing = await prisma.fondPlan.findUnique({
     where: { userId_parcelleKey: { userId, parcelleKey: key } },
   })
   // L'extension a pu changer (png → jpg) : purger l'ancien binaire orphelin
   if (existing && existing.fichier !== fichier) {
-    await unlink(path.join(dir, path.basename(existing.fichier))).catch(() => {})
+    await unlink(path.join(/*turbopackIgnore: true*/ dir, path.basename(existing.fichier))).catch(() => {})
   }
 
   // Contour de parcelle (px image) : lié à l'image, il est remplacé — ou
@@ -209,7 +208,7 @@ export async function DELETE(request: NextRequest) {
   if (!fond) return NextResponse.json({ exists: false }, { headers: NO_STORE })
 
   await prisma.fondPlan.delete({ where: { id: fond.id } })
-  await unlink(path.join(fondStorageDir(userId), path.basename(fond.fichier))).catch(() => {})
+  await unlink(path.join(/*turbopackIgnore: true*/ fondStorageDir(userId), path.basename(fond.fichier))).catch(() => {})
 
   return NextResponse.json({ exists: false }, { headers: NO_STORE })
 }
