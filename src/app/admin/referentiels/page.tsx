@@ -29,7 +29,7 @@ import { todayLocalISO } from '@/lib/format-utils'
 const REFERENTIELS = [
   { id: "familles", label: "Familles botaniques", count: 0, icon: "🌿" },
   { id: "fournisseurs", label: "Fournisseurs", count: 0, icon: "🏪" },
-  { id: "especes", label: "Espèces", count: 0, icon: "🌱" },
+  { id: "especes", label: "Espèces", count: 0, icon: "🌱", href: "/maraichage/especes" },
   { id: "varietes", label: "Variétés", count: 0, icon: "🌾" },
   { id: "itps", label: "ITPs (Itinéraires techniques)", count: 0, icon: "📋" },
   { id: "fertilisants", label: "Fertilisants", count: 0, icon: "🧪" },
@@ -220,50 +220,55 @@ export default function ReferentielsAdminPage() {
             const count = stats[ref.id] || 0
             const isLoading = loading === ref.id
 
+            const CardComponent = ref.href ? Link : React.Fragment
+            const cardProps = ref.href ? { href: ref.href, className: "block hover:scale-[1.02] transition-transform" } : {}
+
             return (
-              <Card key={ref.id}>
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
-                    <span className="text-2xl">{ref.icon}</span>
-                    <div className="flex-1">
-                      <div className="text-base">{ref.label}</div>
-                      <div className="text-sm text-muted-foreground font-normal">
-                        {count > 0 ? `${count} enregistrements` : "Aucune donnée"}
+              <CardComponent key={ref.id} {...cardProps}>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <span className="text-2xl">{ref.icon}</span>
+                      <div className="flex-1">
+                        <div className="text-base">{ref.label}</div>
+                        <div className="text-sm text-muted-foreground font-normal">
+                          {count > 0 ? `${count} enregistrements` : "Aucune donnée"}
+                        </div>
                       </div>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex gap-2">
+                      <Button
+                        variant="outline"
+                        onClick={() => handleExport(ref.id)}
+                        disabled={isLoading || count === 0}
+                        className="flex-1"
+                      >
+                        {isLoading ? (
+                          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                        ) : (
+                          <Download className="h-4 w-4 mr-2" />
+                        )}
+                        Exporter
+                      </Button>
+                      <Button
+                        variant="outline"
+                        onClick={() => handleImportClick(ref.id)}
+                        disabled={isLoading}
+                        className="flex-1"
+                      >
+                        {isLoading ? (
+                          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                        ) : (
+                          <Upload className="h-4 w-4 mr-2" />
+                        )}
+                        Importer
+                      </Button>
                     </div>
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="flex gap-2">
-                    <Button
-                      variant="outline"
-                      onClick={() => handleExport(ref.id)}
-                      disabled={isLoading || count === 0}
-                      className="flex-1"
-                    >
-                      {isLoading ? (
-                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      ) : (
-                        <Download className="h-4 w-4 mr-2" />
-                      )}
-                      Exporter
-                    </Button>
-                    <Button
-                      variant="outline"
-                      onClick={() => handleImportClick(ref.id)}
-                      disabled={isLoading}
-                      className="flex-1"
-                    >
-                      {isLoading ? (
-                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      ) : (
-                        <Upload className="h-4 w-4 mr-2" />
-                      )}
-                      Importer
-                    </Button>
-                  </div>
-                </CardContent>
-              </Card>
+                  </CardContent>
+                </Card>
+              </CardComponent>
             )
           })}
         </div>
