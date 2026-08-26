@@ -325,7 +325,7 @@ export function UserTable({ users }: UserTableProps) {
                         disabled={loading === user.id}
                       >
                         <UserCheck className="mr-2 h-4 w-4" />
-                        Marquer l'email comme vérifié
+                        Marquer l&apos;email comme vérifié
                       </DropdownMenuItem>
                     )}
                     <DropdownMenuSeparator />
