@@ -13,6 +13,8 @@
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
     "db:seed": "tsx prisma/seed.ts",
+    "db:seed-arbres": "tsx scripts/seed-varietes-arbres.ts",
+    "db:import-enriched": "tsx scripts/import-enriched-csv.ts",
     "db:studio": "prisma studio",
     "db:reset": "prisma migrate reset --force",
     "db:seed-admin": "tsx prisma/seed-admin.ts",
