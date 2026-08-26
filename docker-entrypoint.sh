@@ -27,6 +27,12 @@ node node_modules/prisma/build/index.js migrate deploy
 echo "==> Seeding database (if empty)..."
 npx tsx prisma/seed.ts 2>/dev/null || echo "Database already seeded or seed skipped"
 
+echo "==> Importing enriched CSV data (especes, ITP, varietes, idempotent)."
+npx tsx scripts/import-enriched-csv.ts 2>/dev/null || echo "Enriched CSV import skipped"
+
+echo "==> Seeding verger/arboriculture referential (seed-varietes-arbres.sql, idempotent)."
+npx tsx scripts/seed-varietes-arbres.ts 2>/dev/null || echo "Arboriculture seed skipped"
+
 echo "==> Creating demo account (if not exists)..."
 npx tsx prisma/seed-demo.ts 2>/dev/null || echo "Demo account already exists or creation skipped"
 
