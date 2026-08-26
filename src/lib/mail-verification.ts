@@ -42,12 +42,17 @@ export async function envoyerVerification(
   verify: { subject: string; html: string },
 ): Promise<ResultatEnvoiVerification> {
   try {
-    await Promise.race([
+    const resultat = await Promise.race([
       sendMail({ to: destinataire, subject: verify.subject, html: verify.html }),
       new Promise((_, rejeter) =>
         setTimeout(() => rejeter(new Error('SMTP_TIMEOUT')), TIMEOUT_ENVOI_MS),
       ),
     ])
+    // sendMail retourne undefined quand le SMTP n'est pas configuré :
+    // l'email n'est pas parti, il faut dire honnêtement à l'écran.
+    if (!resultat) {
+      return { envoye: false, cause: 'envoi_impossible' }
+    }
     return { envoye: true }
   } catch (erreur) {
     console.error('Erreur envoi email verification:', erreur)
