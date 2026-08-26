@@ -22,6 +22,7 @@ export default async function UsersPage() {
       active: true,
       createdAt: true,
       updatedAt: true,
+      emailVerified: true,
       _count: {
         select: {
           cultures: true,

@@ -29,6 +29,7 @@ export async function GET() {
         active: true,
         createdAt: true,
         updatedAt: true,
+        emailVerified: true,
         _count: {
           select: {
             cultures: true,
@@ -89,6 +90,7 @@ export async function POST(request: NextRequest) {
     const hashedPassword = await hashPassword(password)
 
     // Creation
+    // Compte créé par un admin : pas besoin de vérification email
     const user = await prisma.user.create({
       data: {
         email,
@@ -96,6 +98,7 @@ export async function POST(request: NextRequest) {
         name: name || null,
         role: role || "USER",
         active: active !== false,
+        emailVerified: true,
       },
       select: {
         id: true,

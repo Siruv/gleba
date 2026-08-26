@@ -44,6 +44,7 @@ interface User {
   active: boolean
   createdAt: Date
   updatedAt: Date
+  emailVerified: boolean
   _count: {
     cultures: number
     planches: number
@@ -111,6 +112,32 @@ export function UserTable({ users }: UserTableProps) {
       toast({
         title: "Erreur",
         description: "Impossible de modifier l'utilisateur",
+        variant: "destructive",
+      })
+    } finally {
+      setLoading(null)
+    }
+  }
+
+  async function marquerVerifie(userId: string) {
+    setLoading(userId)
+    try {
+      const res = await fetch(`/api/admin/users/${userId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ emailVerified: true }),
+      })
+
+      if (!res.ok) throw new Error("Erreur")
+
+      toast({
+        title: "Email marqué comme vérifié",
+      })
+      router.refresh()
+    } catch {
+      toast({
+        title: "Erreur",
+        description: "Impossible de marquer l'email comme vérifié",
         variant: "destructive",
       })
     } finally {
@@ -203,15 +230,26 @@ export function UserTable({ users }: UserTableProps) {
                 )}
               </TableCell>
               <TableCell>
-                {user.active ? (
-                  <Badge variant="outline" className="border-green-500 text-green-600">
-                    Actif
-                  </Badge>
-                ) : (
-                  <Badge variant="outline" className="border-slate-300 text-slate-500">
-                    Inactif
-                  </Badge>
-                )}
+                <div className="flex gap-1">
+                  {user.active ? (
+                    <Badge variant="outline" className="border-green-500 text-green-600">
+                      Actif
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="border-slate-300 text-slate-500">
+                      Inactif
+                    </Badge>
+                  )}
+                  {user.emailVerified ? (
+                    <Badge variant="outline" className="border-green-500 text-green-600">
+                      Email vérifié
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="border-orange-400 text-orange-600">
+                      Email non vérifié
+                    </Badge>
+                  )}
+                </div>
               </TableCell>
               <TableCell className="text-center text-sm text-muted-foreground">
                 {user._count.cultures} cultures / {user._count.planches} planches / {user._count.recoltes} recoltes
@@ -280,6 +318,16 @@ export function UserTable({ users }: UserTableProps) {
                         </>
                       )}
                     </DropdownMenuItem>
+                    {!user.emailVerified && (
+                      <DropdownMenuItem
+                        className="cursor-pointer"
+                        onClick={() => marquerVerifie(user.id)}
+                        disabled={loading === user.id}
+                      >
+                        <UserCheck className="mr-2 h-4 w-4" />
+                        Marquer l'email comme vérifié
+                      </DropdownMenuItem>
+                    )}
                     <DropdownMenuSeparator />
                     <DropdownMenuItem
                       className="cursor-pointer text-red-600 focus:text-red-600"
