@@ -18,6 +18,13 @@ type SettingDefinition<T extends SettingValue = SettingValue> = {
 }
 
 type SettingsRegistry = {
+  "chat.provider": SettingDefinition<string>
+  "chat.model": SettingDefinition<string>
+  "chat.apiKey": SettingDefinition<string>
+  "chat.baseUrl": SettingDefinition<string>
+  "chat.ollamaHost": SettingDefinition<string>
+  "chat.codexAccessToken": SettingDefinition<string>
+  "chat.codexRefreshToken": SettingDefinition<string>
   "notif.enabled": SettingDefinition<boolean>
   "notif.resumeHeure": SettingDefinition<string>
   "notif.meteoIntervalMin": SettingDefinition<number>
@@ -38,6 +45,49 @@ type SettingsRegistry = {
 
 /** Registre des réglages exposables par l'interface d'administration. */
 export const settingsRegistry: SettingsRegistry = {
+  "chat.provider": {
+    name: "chat.provider",
+    type: "texte",
+    defaultValue: "ollama",
+    envKey: "CHAT_PROVIDER",
+  },
+  "chat.model": {
+    name: "chat.model",
+    type: "texte",
+    defaultValue: "",
+    envKey: "CHAT_MODEL",
+  },
+  "chat.apiKey": {
+    name: "chat.apiKey",
+    type: "texte",
+    defaultValue: "",
+    envKey: "CHAT_API_KEY",
+    secret: true,
+  },
+  "chat.baseUrl": {
+    name: "chat.baseUrl",
+    type: "texte",
+    defaultValue: "",
+    envKey: "CHAT_BASE_URL",
+  },
+  "chat.ollamaHost": {
+    name: "chat.ollamaHost",
+    type: "texte",
+    defaultValue: "http://localhost:11434",
+    envKey: "OLLAMA_HOST",
+  },
+  "chat.codexAccessToken": {
+    name: "chat.codexAccessToken",
+    type: "texte",
+    defaultValue: "",
+    secret: true,
+  },
+  "chat.codexRefreshToken": {
+    name: "chat.codexRefreshToken",
+    type: "texte",
+    defaultValue: "",
+    secret: true,
+  },
   "notif.enabled": {
     name: "notif.enabled",
     type: "boolean",

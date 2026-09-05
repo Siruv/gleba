@@ -57,8 +57,17 @@ fi
 # Il passe AVANT l'import des CSV parce qu'il crée 15 espèces que le CSV sait
 # ensuite enrichir : dans cet ordre, une installation neuve converge en un seul
 # démarrage au lieu de deux.
-echo "==> Seeding tree/berry varieties referential (idempotent)..."
-npx tsx prisma/seed-varietes-arbres.ts || echo "Tree varieties seed skipped"
+#
+# OPT-IN : par défaut, on n'exécute PAS ce seed (évite ~900 lignes d'INSERT
+# sur des instances maraîchage pur qui n'ont pas de verger). Pour activer,
+# définir SEED_ARBRES=true (ou 1) au lancement du conteneur. Le seed reste
+# idempotent : on peut l'activer plus tard sans dupliquer.
+if [ "${SEED_ARBRES:-false}" = "true" ] || [ "${SEED_ARBRES:-false}" = "1" ]; then
+  echo "==> Seeding tree/berry varieties referential (idempotent, SEED_ARBRES=true)..."
+  npx tsx prisma/seed-varietes-arbres.ts || echo "Tree varieties seed skipped"
+else
+  echo "==> Tree varieties seed skipped (set SEED_ARBRES=true to enable)"
+fi
 
 # Issue #29 (Siruv, 2026-08-26) : `varietes_enriched.csv` était bien copié dans
 # l'image (Dockerfile) et le script d'import existait, mais personne ne l'appelait

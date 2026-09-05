@@ -17,7 +17,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { LogIn, BarChart3, ChevronLeft, ChevronRight, AlertTriangle, CheckCircle2, Loader2 } from "lucide-react"
+import { LogIn, BarChart3, Bot, ChevronLeft, ChevronRight, AlertTriangle, CheckCircle2, Loader2 } from "lucide-react"
+import { ReglagesChat } from "./ReglagesChat"
 
 interface LoginLog {
   id: number
@@ -98,6 +99,10 @@ export function AdminTabs() {
           <BarChart3 className="h-4 w-4" />
           Metriques
         </TabsTrigger>
+        <TabsTrigger value="chat" className="gap-2">
+          <Bot className="h-4 w-4" />
+          Chat / IA
+        </TabsTrigger>
       </TabsList>
 
       <TabsContent value="logs">
@@ -106,6 +111,10 @@ export function AdminTabs() {
 
       <TabsContent value="metrics">
         <MetricsPanel />
+      </TabsContent>
+
+      <TabsContent value="chat">
+        <ReglagesChat />
       </TabsContent>
     </Tabs>
   )
