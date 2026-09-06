@@ -1,5 +1,4 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
-import { NextResponse } from "next/server"
 
 const mocks = vi.hoisted(() => ({
   requireAdminApi: vi.fn(),
@@ -47,7 +46,7 @@ describe("/api/admin/chat/models", () => {
       ok: true,
       json: () => Promise.resolve(mockModels),
       status: 200
-    }) as any
+    }) as unknown as typeof fetch
 
     // Mock getSetting
     mocks.getSetting.mockImplementation((key: string) => {
@@ -65,7 +64,7 @@ describe("/api/admin/chat/models", () => {
     expect(Array.isArray(data.modeles)).toBe(true)
     
     // Should only include gpt models, not embedding/tts/whisper/dall-e
-    const modelIds = data.modeles.map((m: any) => m.id)
+    const modelIds = data.modeles.map((m: { id: string }) => m.id)
     expect(modelIds).toContain("gpt-4o")
     expect(modelIds).toContain("gpt-4o-mini")
     expect(modelIds).not.toContain("text-embedding-ada-002")
@@ -74,7 +73,7 @@ describe("/api/admin/chat/models", () => {
     expect(modelIds).not.toContain("dall-e-3")
     
     // All OpenAI models should have functionCalling=true
-    expect(data.modeles.every((m: any) => m.functionCalling === true)).toBe(true)
+    expect(data.modeles.every((m: { functionCalling: boolean }) => m.functionCalling === true)).toBe(true)
   })
 
   it("should return 400 when API key is missing for non-ollama provider", async () => {
@@ -118,7 +117,7 @@ describe("/api/admin/chat/models", () => {
       ok: true,
       json: () => Promise.resolve(mockOllamaResponse),
       status: 200
-    }) as any
+    }) as unknown as typeof fetch
 
     // Mock getSetting for ollama host
     mocks.getSetting.mockImplementation((key: string) => {
@@ -136,6 +135,6 @@ describe("/api/admin/chat/models", () => {
     expect(data.modeles.length).toBe(2) // empty name filtered out
     
     // Ollama models should have functionCalling=false
-    expect(data.modeles.every((m: any) => m.functionCalling === false)).toBe(true)
+    expect(data.modeles.every((m: { functionCalling: boolean }) => m.functionCalling === false)).toBe(true)
   })
 })

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { outilsFormatOpenAI, envoyerMessageAvecOutils } from "@/lib/chat-openai-tools"
 
 describe("chat-openai-tools", () => {
-  let mockFetch: any
+  let mockFetch: unknown
 
   beforeEach(() => {
     mockFetch = vi.fn()

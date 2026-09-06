@@ -9,9 +9,9 @@ import prisma from "@/lib/prisma"
 import { fetchOpenMeteoForecast } from "@/lib/meteo"
 import type { Prisma } from "@prisma/client"
 import { createPlancheSchema } from "@/lib/validations/planche"
-import { createVarieteSchema } from "@/lib/validations/variete"
+
 import { cleanReferentielName, normalizeVarieteName } from "@/lib/normalize"
-import { attributionCreation } from "@/lib/referentiel-communaute"
+
 import { invalidateKpi } from "@/lib/kpi"
 
 // ============================================================

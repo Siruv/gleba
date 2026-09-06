@@ -31,15 +31,25 @@ export async function GET() {
     }
 
     // Filtrer : uniquement les modèles avec completion_chat
-    const modeles = data.data
-      .filter((m: any) => m.capabilities?.completion_chat === true)
-      .map((m: any) => ({
+    type MistralModel = {
+      id: string
+      name?: string
+      description?: string
+      capabilities?: {
+        completion_chat?: boolean
+        function_calling?: boolean
+      }
+    }
+
+    const modeles = (data.data as MistralModel[])
+      .filter((m) => m.capabilities?.completion_chat === true)
+      .map((m) => ({
         id: m.id,
         nom: m.name || m.id,
         description: m.description || "",
         functionCalling: m.capabilities?.function_calling === true,
       }))
-      .sort((a: any, b: any) => a.id.localeCompare(b.id))
+      .sort((a, b) => a.id.localeCompare(b.id))
 
     return NextResponse.json({ modeles })
   } catch (error) {
