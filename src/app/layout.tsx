@@ -12,6 +12,7 @@ import { GlobalDialogHost } from "@/components/ui/global-dialog-host";
 import { ImpersonationBanner } from "@/components/admin/ImpersonationBanner";
 import { BandeauExploitation } from "@/components/exploitation/BandeauExploitation";
 import { ChatBubble } from "@/components/chat/ChatBubble";
+import { DailyBriefingPopup } from "@/components/chat/DailyBriefingPopup";
 import { PushRegister } from "@/components/notifications/push-register";
 
 
@@ -205,6 +206,7 @@ export default function RootLayout({
           <BandeauExploitation />
           <OnboardingRedirect />
           {children}
+          <DailyBriefingPopup />
           <ChatBubble />
           <GlobalSearch />
           <Toaster />
