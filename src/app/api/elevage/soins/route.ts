@@ -15,7 +15,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { Prisma } from '@prisma/client'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
-import { createDepenseFromSoinAnimal, deleteAutoEntry } from '@/lib/auto-compta'
+import { createDepenseFromSoinAnimal } from '@/lib/auto-compta'
 import { invalidateKpi } from '@/lib/kpi'
 import { soinPatchSchema, soinSchema } from '@/lib/validations/elevage-soin'
 import { calendrierInjections, derniereInjectionActive, ajouterJours } from '@/lib/elevage/injections'
@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto'
 // (recompute-from-truth), cross-granularité individu↔lot et symétrique
 // POST/PATCH/DELETE. Cf. src/lib/elevage/attente-lait.ts.
 import { ciblesAffectees, resyncEcartementLait } from '@/lib/elevage/attente-lait'
+import { fenetreSoin, supprimerSoin } from '@/lib/elevage/suppression-soin'
 import { estEspeceSansDelaiLait } from '@/lib/elevage/cibles-collecte-lait'
 import {
   PLANCHER_CASCADE_LAIT_J,
@@ -45,14 +46,6 @@ const TYPES_MEDICAMENTEUX = new Set([
   'Traitement vétérinaire',
 ])
 
-// Fenêtre couverte par un soin (pour cibler le resync) : de sa date à la plus
-// lointaine de ses fins d'attente. Bornes filtrées des nulls.
-function fenetreSoin(...dates: (Date | null | undefined)[]): { min: Date; max: Date } | null {
-  const ds = dates.filter((x): x is Date => x != null)
-  if (ds.length === 0) return null
-  const t = ds.map((d) => d.getTime())
-  return { min: new Date(Math.min(...t)), max: new Date(Math.max(...t)) }
-}
 
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
@@ -66,8 +59,13 @@ export async function GET(request: NextRequest) {
     const fait = searchParams.get('fait')
     const rappels = searchParams.get('rappels') === '1'
     const filiere = searchParams.get('filiere')
-    const limit = parseInt(searchParams.get('limit') || '100')
-    const annee = parseInt(searchParams.get('annee') || String(new Date().getFullYear()))
+    const limit = Math.min(Math.max(parseInt(searchParams.get('limit') || '100') || 100, 1), 1000)
+    // `annee=all` : toutes les années (liste de gestion d'un historique
+    // ressaisi, signalement 2026-09-27). Sinon l'exercice demandé, ou l'année
+    // civile courante.
+    const anneeParam = searchParams.get('annee')
+    const toutesAnnees = anneeParam === 'all'
+    const annee = parseInt(anneeParam && !toutesAnnees ? anneeParam : String(new Date().getFullYear()))
     const yearStart = new Date(annee, 0, 1)
     const yearEnd = new Date(annee, 11, 31, 23, 59, 59)
 
@@ -77,7 +75,9 @@ export async function GET(request: NextRequest) {
     // son filtre annuel et sa pagination existants.
     const where: any = rappels
       ? { userId: session.user.id, fait: false, datePrevue: { not: null } }
-      : { userId: session.user.id, date: { gte: yearStart, lte: yearEnd } }
+      : toutesAnnees
+        ? { userId: session.user.id }
+        : { userId: session.user.id, date: { gte: yearStart, lte: yearEnd } }
     if (animalId) where.animalId = parseInt(animalId)
     if (lotId) where.lotId = parseInt(lotId)
     if (type) where.type = type
@@ -99,8 +99,10 @@ export async function GET(request: NextRequest) {
       orderBy: [{ date: 'desc' }, { id: 'desc' }],
       ...(rappels ? {} : { take: limit }),
       include: {
-        animal: { select: { id: true, nom: true, identifiant: true, especeAnimale: { select: { id: true, filiere: true } } } },
-        lot: { select: { id: true, nom: true, especeAnimale: { select: { id: true, filiere: true } } } },
+        // statut/sexe/dateSortie : un soin d'un animal sorti reste modifiable,
+        // le sélecteur de l'écran annonce l'état de sa cible.
+        animal: { select: { id: true, nom: true, identifiant: true, statut: true, sexe: true, dateSortie: true, especeAnimale: { select: { id: true, filiere: true } } } },
+        lot: { select: { id: true, nom: true, statut: true, especeAnimale: { select: { id: true, filiere: true } } } },
         produitVeterinaire: { select: { id: true, nom: true, substanceActive: true } },
         stockMedicament: {
           select: {
@@ -684,8 +686,15 @@ export async function PATCH(request: NextRequest) {
         `
         for (const injection of calendrier) {
           const realisee = realisees.get(injection.numero)
-          const marquerPremiereFaite = injection.numero === 1 && fait === true && !realisee
-          const rouvrirPremiere = injection.numero === 1 && fait === false && realisee
+          // Ces deux drapeaux sont interpolés dans le SQL brut ci-dessous : ils
+          // doivent être de VRAIS booléens. `a && b && realisee` rendait la LIGNE
+          // de la Map (un objet) quand la première injection était réalisée,
+          // Prisma l'envoyait en jsonb et Postgres refusait le CASE WHEN —
+          // rouvrir un traitement effectué échouait en 500 (api_errors du
+          // 2026-09-19 19:27, deux essais). Le cast `::boolean` posé le même
+          // soir ne suffisait pas : un objet jsonb ne se caste pas en booléen.
+          const marquerPremiereFaite = injection.numero === 1 && fait === true && realisee === undefined
+          const rouvrirPremiere = injection.numero === 1 && fait === false && realisee !== undefined
           const statut = marquerPremiereFaite ? 'realisee' : rouvrirPremiere ? 'a_faire' : injection.statut
           const dateRealisee = marquerPremiereFaite ? ((updateData.date as Date | undefined) ?? new Date()) : null
           await tx.$executeRaw`
@@ -697,13 +706,13 @@ export async function PATCH(request: NextRequest) {
             ON CONFLICT (soin_id, numero) DO UPDATE SET
               date_prevue = CASE WHEN injections_soins.statut = 'realisee' THEN injections_soins.date_prevue ELSE EXCLUDED.date_prevue END,
               statut = CASE
-                WHEN ${marquerPremiereFaite} THEN 'realisee'
-                WHEN ${rouvrirPremiere} THEN 'a_faire'
+                WHEN ${marquerPremiereFaite}::boolean THEN 'realisee'
+                WHEN ${rouvrirPremiere}::boolean THEN 'a_faire'
                 ELSE injections_soins.statut
               END,
               date_realisee = CASE
-                WHEN ${marquerPremiereFaite} THEN ${dateRealisee}
-                WHEN ${rouvrirPremiere} THEN NULL
+                WHEN ${marquerPremiereFaite}::boolean THEN ${dateRealisee}
+                WHEN ${rouvrirPremiere}::boolean THEN NULL
                 ELSE injections_soins.date_realisee
               END,
               updated_at = NOW()
@@ -791,31 +800,10 @@ export async function DELETE(request: NextRequest) {
     const id = searchParams.get('id')
     if (!id) return NextResponse.json({ error: 'ID requis' }, { status: 400 })
 
-    const existing = await prisma.soinAnimal.findFirst({
-      where: { id: parseInt(id), userId: session.user.id },
-    })
-    if (!existing) return NextResponse.json({ error: 'Soin non trouvé' }, { status: 404 })
-
-    // Réintégration recompute-from-truth : on supprime d'abord le soin, puis on
-    // recalcule l'écartement sur sa fenêtre et ses cibles (cross-granularité).
-    // Les collectes couvertes uniquement par ce soin redeviennent
-    // commercialisables ; celles couvertes par un autre soin restent écartées.
-    await prisma.$transaction(async (tx) => {
-      await deleteAutoEntry('soin_animal', existing.id, 'depense', session.user.id, tx)
-      if (existing.stockMedicamentId && existing.quantitePreleveeStock > 0) {
-        await tx.stockMedicamentElevage.update({
-          where: { id: existing.stockMedicamentId },
-          data: { quantite: { increment: existing.quantitePreleveeStock } },
-        })
-      }
-      await tx.soinAnimal.delete({ where: { id: parseInt(id) } })
-      if (existing.finAttenteLait) {
-        const cibles = await ciblesAffectees(tx, session.user.id, existing.animalId, existing.lotId)
-        const f = fenetreSoin(existing.date, existing.finAttenteLait)
-        if (f) await resyncEcartementLait(tx, session.user.id, cibles, f.min, f.max)
-      }
-    })
-    invalidateKpi(session.user.id)
+    const soinId = parseInt(id)
+    if (Number.isNaN(soinId)) return NextResponse.json({ error: 'ID invalide' }, { status: 400 })
+    const resultat = await supprimerSoin(session.user.id, soinId)
+    if (!resultat.ok) return NextResponse.json({ error: resultat.error }, { status: resultat.status })
 
     return NextResponse.json({ success: true })
   } catch (error) {

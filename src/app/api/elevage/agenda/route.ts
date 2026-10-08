@@ -43,7 +43,7 @@ type Echeance = {
   gravite: Gravite
   // QA caprin cms1v3fso — permet à la Tournée d'agir directement sur
   // l'échéance (valider une injection, marquer un soin fait).
-  action?: { soinId?: number; injectionId?: string }
+  action?: { soinId?: number; injectionId?: string; stockMedicamentId?: string; href?: string }
 }
 
 const DELAI_DIAGNOSTIC_J = 35 // une saillie « En attente » au-delà → diagnostic à faire
@@ -124,7 +124,7 @@ export async function GET(request: NextRequest) {
       }),
       prisma.stockMedicamentElevage.findMany({
         where: { userId, quantite: { gt: 0 }, datePeremption: { not: null, lte: horizon } },
-        select: { id: true, produitId: true, numeroLot: true, datePeremption: true },
+        select: { id: true, produitId: true, numeroLot: true, datePeremption: true, quantite: true, unite: true, produit: { select: { nom: true } } },
       }),
       prisma.prophylaxieElevage.findMany({
         where: { userId, statut: 'a_faire', datePrevue: { lte: horizon } },
@@ -193,17 +193,21 @@ export async function GET(request: NextRequest) {
     for (const s of gestantes) {
       if (s.dateMiseBasAttendue) {
         const jr = jours(now, s.dateMiseBasAttendue)
-        // Une saillie restée « Gestante » ne doit pas polluer l'agenda à vie.
-        // Au-delà de 30 jours de retard, elle relève d'une correction de donnée,
-        // pas des prochaines échéances quotidiennes.
-        if (jr <= horizonJours && jr >= -30) {
+        // Revue 2026-09-28 — la borne basse de 30 j faisait disparaître une
+        // gestation jamais soldée (9 saillies « Gestante » d'un éleveur réel,
+        // mise-bas attendue en mars 2024, qu'aucun écran ne signalait plus).
+        // Un retard n'a pas de borne basse : la ligne reste, nommée comme une
+        // régularisation à faire, jusqu'à la naissance ou la correction.
+        if (jr <= horizonJours) {
           echeances.push({
             id: `mb-${s.id}`,
             kind: 'mise_bas',
             date: s.dateMiseBasAttendue.toISOString(),
             joursRestants: jr,
-            titre: `Mise-bas — ${nomAnimal(s.femelle)}`,
-            detail: jr < 0 ? 'échéance dépassée' : `dans ${jr} j`,
+            titre: jr < 0 ? `Mise-bas dépassée — ${nomAnimal(s.femelle)}` : `Mise-bas — ${nomAnimal(s.femelle)}`,
+            detail: jr < 0
+              ? `attendue il y a ${-jr} j : enregistrer la naissance ou corriger la saillie (Reproduction)`
+              : `dans ${jr} j`,
             gravite: jr <= 3 ? 'urgent' : 'attention',
           })
         }
@@ -386,12 +390,15 @@ export async function GET(request: NextRequest) {
     for (const med of medicaments) {
       if (!med.datePeremption) continue
       const jr = jours(now, med.datePeremption)
+      // Signalement 2026-09-25 — l'alerte nommait le produit par son identifiant
+      // technique et ne menait nulle part : l'éleveur ne retrouvait pas la saisie.
       echeances.push({
         id: `med-${med.id}`, kind: 'medicament_peremption',
         date: med.datePeremption.toISOString(), joursRestants: jr,
-        titre: `Médicament à contrôler — lot ${med.numeroLot}`,
-        detail: `${med.produitId}${jr < 0 ? ' · périmé' : ` · péremption dans ${jr} j`}`,
+        titre: `Médicament à contrôler — ${med.produit?.nom ?? med.produitId}, lot ${med.numeroLot}`,
+        detail: `${Number(med.quantite)} ${med.unite} en stock${jr < 0 ? ` · périmé depuis ${-jr} j` : jr === 0 ? ' · périme aujourd’hui' : ` · péremption dans ${jr} j`} · registre sanitaire & pharmacie : corriger la date ou mettre au rebut`,
         gravite: jr <= 0 ? 'urgent' : 'attention',
+        action: { stockMedicamentId: med.id, href: '/elevage?tab=alimentation&sub=registre' },
       })
     }
     for (const p of prophylaxies) {

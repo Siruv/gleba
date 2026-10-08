@@ -26,6 +26,7 @@ import {
   type TypeJustificatifEquarrissage,
 } from "@/lib/elevage/justificatifs-equarrissage"
 import { confirmDialog } from "@/lib/global-dialog"
+import { CANAL_HORS_GLEBA, declarationATraiter } from "@/lib/elevage/declarations-constantes"
 import { SyntheseSanitaireCheptel } from "@/components/elevage/SyntheseSanitaireCheptel"
 
 type Produit = { id: string; nom: string; amm: string | null; especesCibles?: string[] }
@@ -214,7 +215,7 @@ const statutDeclarationLabel: Record<Declaration["statut"], string> = {
   TRANSMISE: "Transmise",
   ACCEPTEE: "Acceptée",
   REJETEE: "Rejetée",
-  ANNULEE: "Annulée",
+  ANNULEE: "Sans objet",
 }
 const actionReglementaireLabel: Record<string, string> = {
   STATUT_MODIFIE: "Statut modifié",
@@ -273,6 +274,10 @@ export function SanitaireReglementaireSubTab() {
   const [equarrissageForm, setEquarrissageForm] =
     React.useState(justificatifEquarrissageVide)
   const [equarrissageFile, setEquarrissageFile] = React.useState<File | null>(null)
+  // Exercice consulté : l'année en cours par défaut, les précédentes pour une
+  // reprise d'historique (signalement 2026-09-25 : un éleveur ressaisissant
+  // 2021-2025 ne pouvait ni voir ni solder les déclarations de ces années).
+  const [annee, setAnnee] = React.useState(anneeCourante)
   const [declarations, setDeclarations] = React.useState<Declaration[]>([])
   const [declarationResume, setDeclarationResume] = React.useState<DeclarationResume | null>(null)
   const [declarationsLoading, setDeclarationsLoading] = React.useState(true)
@@ -355,12 +360,12 @@ export function SanitaireReglementaireSubTab() {
         fetch('/api/elevage/stock-medicaments'),
         fetch('/api/elevage/prophylaxies'),
         fetch('/api/elevage/produits-veterinaires'),
-        fetch(`/api/elevage/declarations-reglementaires?year=${anneeCourante}`),
+        fetch(`/api/elevage/declarations-reglementaires?year=${annee}`),
         fetch('/api/elevage/aliments'),
-        fetch(`/api/elevage/justificatifs-aliments?year=${anneeCourante}`),
-        fetch(`/api/elevage/mortalites?annee=${anneeCourante}`),
-        fetch(`/api/elevage/justificatifs-equarrissage?year=${anneeCourante}`),
-        fetch(`/api/elevage/registres-archives?year=${anneeCourante}`),
+        fetch(`/api/elevage/justificatifs-aliments?year=${annee}`),
+        fetch(`/api/elevage/mortalites?annee=${annee}`),
+        fetch(`/api/elevage/justificatifs-equarrissage?year=${annee}`),
+        fetch(`/api/elevage/registres-archives?year=${annee}`),
       ])
       if (s.ok) setStocks((await s.json()).data)
       if (p.ok) setProphylaxies((await p.json()).data)
@@ -391,14 +396,14 @@ export function SanitaireReglementaireSubTab() {
     } finally {
       setDeclarationsLoading(false)
     }
-  }, [])
+  }, [annee])
   React.useEffect(() => { void reload() }, [reload])
 
   async function archiverRegistreComplet() {
     setArchivageLoading(true)
     try {
       const response = await fetch(
-        `/api/elevage/registre-elevage-complet?year=${anneeCourante}&format=archive`,
+        `/api/elevage/registre-elevage-complet?year=${annee}&format=archive`,
       )
       if (!response.ok) {
         const payload = await response.json().catch(() => null)
@@ -408,7 +413,7 @@ export function SanitaireReglementaireSubTab() {
       const disposition = response.headers.get("content-disposition") || ""
       const nomFichier =
         /filename="([^"]+)"/.exec(disposition)?.[1]
-        || `dossier-reglementaire-elevage-${anneeCourante}.zip`
+        || `dossier-reglementaire-elevage-${annee}.zip`
       const url = URL.createObjectURL(blob)
       const lien = document.createElement("a")
       lien.href = url
@@ -419,7 +424,7 @@ export function SanitaireReglementaireSubTab() {
       URL.revokeObjectURL(url)
 
       const archivesResponse = await fetch(
-        `/api/elevage/registres-archives?year=${anneeCourante}`,
+        `/api/elevage/registres-archives?year=${annee}`,
       )
       if (archivesResponse.ok) {
         setArchivesRegistre((await archivesResponse.json()).data)
@@ -714,9 +719,69 @@ export function SanitaireReglementaireSubTab() {
     if (res.ok) await reload()
   }
 
-  async function supprimerStock(id: string) {
-    const res = await fetch(`/api/elevage/stock-medicaments?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
-    if (res.ok) await reload()
+  // Signalement 2026-09-25 (éleveur caprin) — le refus de suppression d'un lot
+  // lié à des soins (409) était avalé : clic sans effet, alerte « périmé »
+  // impossible à éteindre. Le refus s'affiche et propose la mise au rebut.
+  async function mettreAuRebut(s: Stock) {
+    if (!(await confirmDialog(
+      `Mettre au rebut le lot ${s.numeroLot} (${s.produit?.nom || s.produitId}) ? Son stock passe à zéro, la ligne reste au registre pour la traçabilité et l'alerte de péremption s'éteint.`,
+      { title: "Mettre au rebut", confirmLabel: "Mettre au rebut" },
+    ))) return
+    const res = await fetch('/api/elevage/stock-medicaments', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: s.id, rebut: true }),
+    })
+    const payload = await res.json().catch(() => null)
+    if (!res.ok) {
+      toast({ variant: 'destructive', title: 'Mise au rebut impossible', description: payload?.error || `HTTP ${res.status}` })
+      return
+    }
+    toast({ title: 'Lot mis au rebut', description: `${s.numeroLot} : stock à zéro, ligne conservée au registre.` })
+    await reload()
+  }
+
+  async function corrigerPeremption(s: Stock) {
+    const saisie = window.prompt(
+      `Nouvelle date de péremption du lot ${s.numeroLot} (AAAA-MM-JJ, vide pour effacer) :`,
+      s.datePeremption ? s.datePeremption.slice(0, 10) : '',
+    )
+    if (saisie === null) return
+    const valeur = saisie.trim()
+    if (valeur && !/^\d{4}-\d{2}-\d{2}$/.test(valeur)) {
+      toast({ variant: 'destructive', title: 'Date invalide', description: 'Format attendu : AAAA-MM-JJ.' })
+      return
+    }
+    const res = await fetch('/api/elevage/stock-medicaments', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: s.id, datePeremption: valeur || null }),
+    })
+    const payload = await res.json().catch(() => null)
+    if (!res.ok) {
+      toast({ variant: 'destructive', title: 'Correction impossible', description: payload?.error || `HTTP ${res.status}` })
+      return
+    }
+    toast({ title: 'Péremption corrigée' })
+    await reload()
+  }
+
+  async function supprimerStock(s: Stock) {
+    const res = await fetch(`/api/elevage/stock-medicaments?id=${encodeURIComponent(s.id)}`, { method: 'DELETE' })
+    if (res.ok) {
+      toast({ title: 'Lot supprimé' })
+      await reload()
+      return
+    }
+    const payload = await res.json().catch(() => null)
+    if (res.status === 409 && payload?.code === 'LIE_A_DES_SOINS') {
+      if (await confirmDialog(
+        `${payload.error}\n\nMettre ce lot au rebut maintenant ?`,
+        { title: "Suppression impossible", confirmLabel: "Mettre au rebut" },
+      )) {
+        await mettreAuRebut(s)
+      }
+      return
+    }
+    toast({ variant: 'destructive', title: 'Suppression impossible', description: payload?.error || `HTTP ${res.status}` })
   }
 
   function ouvrirTransmission(declaration: Declaration) {
@@ -741,7 +806,7 @@ export function SanitaireReglementaireSubTab() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           key: declarationSelectionnee.key,
-          year: anneeCourante,
+          year: annee,
           statut: 'TRANSMISE',
           ...transmissionForm,
         }),
@@ -768,7 +833,7 @@ export function SanitaireReglementaireSubTab() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         key: declaration.key,
-        year: anneeCourante,
+        year: annee,
         statut: 'A_DECLARER',
       }),
     })
@@ -782,12 +847,70 @@ export function SanitaireReglementaireSubTab() {
     await reload()
   }
 
+  async function patcherDeclaration(corps: Record<string, unknown>, succes: string) {
+    const res = await fetch('/api/elevage/declarations-reglementaires', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ year: annee, ...corps }),
+    })
+    if (!res.ok) {
+      const payload = await res.json().catch(() => null)
+      return toast({ variant: 'destructive', title: 'Statut non modifié', description: payload?.error })
+    }
+    await reload()
+    toast({ title: succes })
+  }
+
+  // Reprise d'historique (signalement 2026-09-25) : un mouvement ressaisi après
+  // coup a souvent été déclaré à l'époque, sur papier ou sur le portail EDE.
+  async function marquerHorsGleba(declaration: Declaration) {
+    if (!(await confirmDialog(
+      `« ${declaration.libelle} » a déjà été déclaré en dehors de Gleba (papier, portail EDE…) ? Gleba l’enregistre comme fait, sans rien transmettre.`,
+      { title: 'Déjà déclarée hors Gleba', confirmLabel: 'Oui, déjà déclarée', variant: 'default' },
+    ))) return
+    await patcherDeclaration(
+      { key: declaration.key, statut: 'TRANSMISE', horsGleba: true },
+      'Déclaration marquée « déjà déclarée hors Gleba »',
+    )
+  }
+
+  async function marquerHorsGlebaGroupe() {
+    const cibles = declarations.filter((declaration) => declaration.statut === 'HORS_DELAI')
+    if (cibles.length === 0) return
+    if (!(await confirmDialog(
+      `Les ${cibles.length} déclaration(s) hors délai de ${annee} ont-elles déjà été faites en dehors de Gleba (papier, portail EDE…) ? C’est le cas quand vous ressaisissez des mouvements passés. Gleba les enregistre comme faites, sans rien transmettre ; chacune peut être remise à faire.`,
+      { title: 'Reprise d’historique', confirmLabel: `Oui, marquer les ${cibles.length}`, variant: 'default' },
+    ))) return
+    const res = await fetch('/api/elevage/declarations-reglementaires/hors-gleba', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ year: annee, keys: cibles.map((declaration) => declaration.key) }),
+    })
+    const payload = await res.json().catch(() => null)
+    if (!res.ok) {
+      return toast({ variant: 'destructive', title: 'Statut non modifié', description: payload?.error })
+    }
+    await reload()
+    toast({ title: `${payload?.data?.marquees ?? cibles.length} déclaration(s) marquée(s) « déjà déclarée hors Gleba »` })
+  }
+
+  async function marquerSansObjet(declaration: Declaration) {
+    if (!(await confirmDialog(
+      `« ${declaration.libelle} » n’a pas à être déclaré (par exemple un abattage à la ferme pour votre consommation, ou une réforme sans sortie de l’exploitation) ? La déclaration passe en « Sans objet » ; vous pourrez la remettre à faire.`,
+      { title: 'Déclaration sans objet', confirmLabel: 'Marquer sans objet', variant: 'default' },
+    ))) return
+    await patcherDeclaration(
+      { key: declaration.key, statut: 'ANNULEE', notes: 'Sans objet' },
+      'Déclaration marquée « sans objet »',
+    )
+  }
+
   async function ouvrirCirculation(declaration: Declaration) {
     setCirculationLoading(true)
     setDeclarationSelectionnee(declaration)
     try {
       const query = new URLSearchParams({
-        year: String(anneeCourante),
+        year: String(annee),
         key: declaration.key,
       })
       const res = await fetch(
@@ -826,7 +949,7 @@ export function SanitaireReglementaireSubTab() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             key: declarationSelectionnee.key,
-            year: anneeCourante,
+            year: annee,
             ...circulationForm,
           }),
         },
@@ -881,7 +1004,7 @@ export function SanitaireReglementaireSubTab() {
 
   const lienPdfCirculation = declarationSelectionnee
     ? `/api/elevage/declarations-reglementaires/document-circulation?${new URLSearchParams({
-        year: String(anneeCourante),
+        year: String(annee),
         key: declarationSelectionnee.key,
         format: "pdf",
       })}`
@@ -900,6 +1023,23 @@ export function SanitaireReglementaireSubTab() {
   )
 
   return <div className="space-y-4">
+    {caps.productionRente && (
+      <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-white p-3">
+        <Label htmlFor="exercice-registre" className="text-sm font-medium">Exercice</Label>
+        <Select value={String(annee)} onValueChange={(valeur) => setAnnee(Number(valeur))}>
+          <SelectTrigger id="exercice-registre" className="w-28"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            {Array.from({ length: 10 }, (_, i) => anneeCourante - i).map((a) => (
+              <SelectItem key={a} value={String(a)}>{a}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <span className="text-xs text-muted-foreground">
+          Registres, déclarations, mortalités et justificatifs de l’année choisie.
+        </span>
+      </div>
+    )}
+
     {/* Registres BDNI / inventaire du cheptel : documents de rente. */}
     {caps.productionRente && (
       <div className="flex flex-wrap items-end gap-2">
@@ -908,8 +1048,8 @@ export function SanitaireReglementaireSubTab() {
               on les relit avant de les archiver ou de les transmettre. */}
           <a
             href={urlApercu(
-              `/api/elevage/registre-elevage-complet?year=${new Date().getFullYear()}`,
-              `Registre d'élevage complet ${new Date().getFullYear()}`,
+              `/api/elevage/registre-elevage-complet?year=${annee}`,
+              `Registre d'élevage complet ${annee}`,
             )}
             target="_blank"
             rel="noreferrer"
@@ -960,8 +1100,8 @@ export function SanitaireReglementaireSubTab() {
         <Button asChild variant="outline">
           <a
             href={urlApercu(
-              `/api/elevage/registre-sanitaire?year=${new Date().getFullYear()}`,
-              `Registre sanitaire ${new Date().getFullYear()}`,
+              `/api/elevage/registre-sanitaire?year=${annee}`,
+              `Registre sanitaire ${annee}`,
             )}
             target="_blank"
             rel="noreferrer"
@@ -972,8 +1112,8 @@ export function SanitaireReglementaireSubTab() {
         <Button asChild variant="outline">
           <a
             href={urlApercu(
-              `/api/elevage/registre-elevage?year=${new Date().getFullYear()}`,
-              `Registre d'élevage ${new Date().getFullYear()}`,
+              `/api/elevage/registre-elevage?year=${annee}`,
+              `Registre d'élevage ${annee}`,
             )}
             target="_blank"
             rel="noreferrer"
@@ -991,7 +1131,7 @@ export function SanitaireReglementaireSubTab() {
     {caps.productionRente && (
       <Card>
         <CardHeader>
-          <CardTitle>Archives du registre {anneeCourante}</CardTitle>
+          <CardTitle>Archives du registre {annee}</CardTitle>
           <CardDescription>
             Copies immuables conservées dans l’espace privé avec empreinte SHA-256,
             manifeste et annexes disponibles au moment de la génération.
@@ -1000,7 +1140,7 @@ export function SanitaireReglementaireSubTab() {
         <CardContent className="space-y-3">
           {archivesRegistre.length === 0 && (
             <div className="rounded-lg border border-dashed p-5 text-sm text-muted-foreground">
-              Aucune archive figée pour {anneeCourante}. Le PDF seul n’incorpore pas
+              Aucune archive figée pour {annee}. Le PDF seul n’incorpore pas
               les justificatifs : utilisez « Archiver le dossier ZIP » pour créer
               une copie durable.
             </div>
@@ -1050,8 +1190,13 @@ export function SanitaireReglementaireSubTab() {
             </CardDescription>
           </div>
           <div className="flex flex-wrap gap-2">
+            {(declarationResume?.horsDelai ?? 0) > 0 && (
+              <Button size="sm" variant="outline" onClick={() => void marquerHorsGlebaGroupe()}>
+                <Check className="mr-1 h-4 w-4" />Hors délai déjà déclarées…
+              </Button>
+            )}
             <Button asChild size="sm" variant="outline">
-              <a href={`/api/elevage/declarations-reglementaires/export?year=${anneeCourante}`}>
+              <a href={`/api/elevage/declarations-reglementaires/export?year=${annee}`}>
                 <FileSpreadsheet className="mr-1 h-4 w-4" />Export CSV
               </a>
             </Button>
@@ -1067,8 +1212,16 @@ export function SanitaireReglementaireSubTab() {
               <div className="rounded-lg border p-3"><div className="text-muted-foreground">À compléter</div><div className="text-xl font-semibold">{declarationResume.aCompleter}</div></div>
               <div className="rounded-lg border p-3"><div className="text-muted-foreground">À déclarer</div><div className="text-xl font-semibold">{declarationResume.aDeclarer}</div></div>
               <div className="rounded-lg border border-red-200 bg-red-50 p-3"><div className="text-red-700">Hors délai</div><div className="text-xl font-semibold text-red-800">{declarationResume.horsDelai}</div></div>
-              <div className="rounded-lg border border-green-200 bg-green-50 p-3"><div className="text-green-700">Exportées</div><div className="text-xl font-semibold text-green-800">{declarationResume.transmises}</div></div>
+              <div className="rounded-lg border border-green-200 bg-green-50 p-3"><div className="text-green-700">Déclarées</div><div className="text-xl font-semibold text-green-800">{declarationResume.transmises}</div></div>
             </div>
+          )}
+
+          {(declarationResume?.horsDelai ?? 0) > 0 && (
+            <p className="text-sm text-muted-foreground">
+              Vous ressaisissez des mouvements passés ? S’ils ont été déclarés à l’époque (papier,
+              portail EDE), indiquez-le avec « Déjà déclarée hors Gleba » : ils quittent les alertes
+              « hors délai ». Un mouvement qui n’avait pas à être déclaré se marque « Sans objet ».
+            </p>
           )}
 
           <div className="rounded-lg border border-blue-200 bg-blue-50 p-3">
@@ -1105,11 +1258,13 @@ export function SanitaireReglementaireSubTab() {
           )}
           {!declarationsLoading && declarations.length === 0 && (
             <div className="rounded-lg border border-dashed p-6 text-center text-muted-foreground">
-              Aucune naissance, entrée, sortie ou mortalité couverte sur {anneeCourante}.
+              Aucune naissance, entrée, sortie ou mortalité couverte sur {annee}.
             </div>
           )}
           {!declarationsLoading && declarations.map((declaration) => {
             const finalisee = ["TRANSMISE", "ACCEPTEE"].includes(declaration.statut)
+            const aTraiter = declarationATraiter(declaration.statut)
+            const horsGleba = finalisee && declaration.canalTransmission === CANAL_HORS_GLEBA
             const circulation =
               ["OVIN", "CAPRIN"].includes(declaration.categorie)
               && ["ENTREE", "SORTIE"].includes(declaration.type)
@@ -1123,7 +1278,9 @@ export function SanitaireReglementaireSubTab() {
                   <div>
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-medium">{declaration.libelle}</span>
-                      <Badge variant={badgeVariant}>{statutDeclarationLabel[declaration.statut]}</Badge>
+                      <Badge variant={badgeVariant}>
+                        {horsGleba ? "Déclarée hors Gleba" : statutDeclarationLabel[declaration.statut]}
+                      </Badge>
                     </div>
                     <div className="mt-1 text-sm text-muted-foreground">
                       Événement le {new Date(declaration.dateEvenement).toLocaleDateString('fr-FR')}
@@ -1149,7 +1306,7 @@ export function SanitaireReglementaireSubTab() {
                     >
                       <History className="mr-1 h-4 w-4" />Historique
                     </Button>
-                    {declaration.anomalies.length > 0 && (
+                    {aTraiter && declaration.anomalies.length > 0 && (
                       <Button asChild size="sm" variant="outline">
                         <a href={declaration.sourceUrl}>Corriger la source</a>
                       </Button>
@@ -1159,7 +1316,17 @@ export function SanitaireReglementaireSubTab() {
                         <Send className="mr-1 h-4 w-4" />Marquer exportée
                       </Button>
                     )}
-                    {(finalisee || declaration.statut === "REJETEE") && (
+                    {aTraiter && (
+                      <Button size="sm" variant="outline" onClick={() => void marquerHorsGleba(declaration)}>
+                        <Check className="mr-1 h-4 w-4" />Déjà déclarée hors Gleba
+                      </Button>
+                    )}
+                    {aTraiter && (
+                      <Button size="sm" variant="ghost" onClick={() => void marquerSansObjet(declaration)}>
+                        Sans objet
+                      </Button>
+                    )}
+                    {(finalisee || declaration.statut === "REJETEE" || declaration.statut === "ANNULEE") && (
                       <Button size="sm" variant="outline" onClick={() => void remettreADeclarer(declaration)}>
                         <RotateCcw className="mr-1 h-4 w-4" />Remettre à faire
                       </Button>
@@ -1167,7 +1334,7 @@ export function SanitaireReglementaireSubTab() {
                   </div>
                 </div>
 
-                {declaration.anomalies.length > 0 && (
+                {aTraiter && declaration.anomalies.length > 0 && (
                   <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
                     <div className="mb-1 flex items-center gap-2 font-medium"><AlertTriangle className="h-4 w-4" />Informations à compléter</div>
                     <ul className="list-disc space-y-1 pl-5">
@@ -1182,9 +1349,15 @@ export function SanitaireReglementaireSubTab() {
                 )}
                 {declaration.transmisAt && (
                   <div className="text-sm text-muted-foreground">
-                    Transmise le {new Date(declaration.transmisAt).toLocaleDateString('fr-FR')}
-                    {declaration.canalTransmission ? ` via ${declaration.canalTransmission}` : ''}
-                    {declaration.referenceTransmission ? ` · preuve ${declaration.referenceTransmission}` : ''}
+                    {horsGleba ? (
+                      <>Déjà déclarée en dehors de Gleba · indiqué le {new Date(declaration.transmisAt).toLocaleDateString('fr-FR')}</>
+                    ) : (
+                      <>
+                        Transmise le {new Date(declaration.transmisAt).toLocaleDateString('fr-FR')}
+                        {declaration.canalTransmission ? ` via ${declaration.canalTransmission}` : ''}
+                        {declaration.referenceTransmission ? ` · preuve ${declaration.referenceTransmission}` : ''}
+                      </>
+                    )}
                   </div>
                 )}
               </div>
@@ -1455,7 +1628,7 @@ export function SanitaireReglementaireSubTab() {
             <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
               <div className="flex items-center gap-2 font-medium">
                 <AlertTriangle className="h-4 w-4" />
-                {mortalitesSansBon.length} mortalité(s) individuelle(s) sans bon actif en {anneeCourante}
+                {mortalitesSansBon.length} mortalité(s) individuelle(s) sans bon actif en {annee}
               </div>
               <p className="mt-1">
                 Ajoutez le bon reçu ou sa référence de classement pour compléter le registre.
@@ -1464,7 +1637,7 @@ export function SanitaireReglementaireSubTab() {
           )}
           {justificatifsEquarrissage.length === 0 && (
             <div className="rounded-lg border border-dashed p-6 text-center text-muted-foreground">
-              Aucun bon d’enlèvement référencé pour {anneeCourante}.
+              Aucun bon d’enlèvement référencé pour {annee}.
             </div>
           )}
           {justificatifsEquarrissage.map((justificatif) => {
@@ -1626,7 +1799,7 @@ export function SanitaireReglementaireSubTab() {
           </div>
 
           <div className="space-y-2">
-            <Label>Mortalités individuelles de {anneeCourante}</Label>
+            <Label>Mortalités individuelles de {annee}</Label>
             <div className="max-h-52 space-y-2 overflow-y-auto rounded-lg border p-3">
               {mortalites.length === 0 && (
                 <p className="text-sm text-muted-foreground">
@@ -1750,7 +1923,7 @@ export function SanitaireReglementaireSubTab() {
           <div>
             <CardTitle>Justificatifs d’alimentation</CardTitle>
             <CardDescription>
-              Factures, bons, étiquettes et fiches techniques référencés dans le registre de {anneeCourante}.
+              Factures, bons, étiquettes et fiches techniques référencés dans le registre de {annee}.
             </CardDescription>
           </div>
           <Button size="sm" onClick={() => ouvrirJustificatif()}>
@@ -1760,7 +1933,7 @@ export function SanitaireReglementaireSubTab() {
         <CardContent className="space-y-3">
           {justificatifsAliments.length === 0 && (
             <div className="rounded-lg border border-dashed p-6 text-center text-muted-foreground">
-              Aucun justificatif d’aliment référencé pour {anneeCourante}.
+              Aucun justificatif d’aliment référencé pour {annee}.
             </div>
           )}
           {justificatifsAliments.map((justificatif) => (
@@ -2012,7 +2185,7 @@ export function SanitaireReglementaireSubTab() {
         </DialogContent></Dialog>
       </CardHeader>
       <CardContent><div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>Produit</TableHead><TableHead>Lot</TableHead><TableHead>Stock</TableHead><TableHead>Péremption</TableHead><TableHead>Ordonnance</TableHead><TableHead /></TableRow></TableHeader><TableBody>
-        {stocks.map(s => { const expire = s.datePeremption && new Date(s.datePeremption) < new Date(); return <TableRow key={s.id}><TableCell>{s.produit?.nom || s.produitId}</TableCell><TableCell>{s.numeroLot}</TableCell><TableCell>{s.quantite} {s.unite}</TableCell><TableCell className={expire ? 'text-red-700 font-medium' : ''}>{s.datePeremption ? new Date(s.datePeremption).toLocaleDateString('fr-FR') : '—'} {expire && <AlertTriangle className="inline h-4 w-4" />}</TableCell><TableCell>{s.ordonnanceUrl ? <a className="underline" href={s.ordonnanceUrl} target="_blank" rel="noreferrer">Ouvrir</a> : '—'}</TableCell><TableCell><Button size="icon" variant="ghost" onClick={() => supprimerStock(s.id)} aria-label="Supprimer"><Trash2 className="h-4 w-4" /></Button></TableCell></TableRow> })}
+        {stocks.map(s => { const expire = s.datePeremption && new Date(s.datePeremption) < new Date(); return <TableRow key={s.id}><TableCell>{s.produit?.nom || s.produitId}</TableCell><TableCell>{s.numeroLot}</TableCell><TableCell>{s.quantite} {s.unite}</TableCell><TableCell className={expire ? 'text-red-700 font-medium' : ''}>{s.datePeremption ? new Date(s.datePeremption).toLocaleDateString('fr-FR') : '—'} {expire && <AlertTriangle className="inline h-4 w-4" />}</TableCell><TableCell>{s.ordonnanceUrl ? <a className="underline" href={s.ordonnanceUrl} target="_blank" rel="noreferrer">Ouvrir</a> : '—'}</TableCell><TableCell className="whitespace-nowrap">{s.datePeremption && <Button size="icon" variant="ghost" onClick={() => corrigerPeremption(s)} aria-label="Corriger la date de péremption" title="Corriger la date de péremption"><Pencil className="h-4 w-4" /></Button>}{s.quantite > 0 && <Button size="icon" variant="ghost" onClick={() => mettreAuRebut(s)} aria-label="Mettre au rebut (stock à zéro)" title="Mettre au rebut (stock à zéro)"><Archive className="h-4 w-4" /></Button>}<Button size="icon" variant="ghost" onClick={() => supprimerStock(s)} aria-label="Supprimer" title="Supprimer"><Trash2 className="h-4 w-4" /></Button></TableCell></TableRow> })}
         {!stocks.length && <TableRow><TableCell colSpan={6} className="text-center text-muted-foreground py-8">Pharmacie non inventoriée</TableCell></TableRow>}
       </TableBody></Table></div></CardContent>
     </Card>

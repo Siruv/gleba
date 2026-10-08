@@ -6,6 +6,7 @@
 
 import * as React from "react"
 import { useSession } from "next-auth/react"
+import { useRouter } from "next/navigation"
 import {
   Egg,
   ShoppingCart,
@@ -25,6 +26,7 @@ import {
   Flower2,
 } from "lucide-react"
 import { LaitSubTab } from "./LaitSubTab"
+import { SelecteurPeriodeExercice, parametreAnnee, type PeriodeListe } from "./SelecteurPeriodeExercice"
 import { EconomieLaitSubTab } from "./EconomieLaitSubTab"
 import { ProduitsRucheSubTab } from "./ProduitsRucheSubTab"
 
@@ -85,6 +87,12 @@ export function ProductionTab({ year }: { year?: number } = {}) {
 
   React.useEffect(() => {
     if (!productionTabKey) return
+    // Lien « Corriger la source » d'une déclaration d'abattage de lot : il
+    // ouvre l'onglet Abattages, quel que soit le dernier onglet mémorisé.
+    if (new URLSearchParams(window.location.search).get("editAbattage")) {
+      setActive("abattages")
+      return
+    }
     let annule = false
     const stored = window.localStorage.getItem(productionTabKey)
     if (stored && (PROD_TABS as readonly string[]).includes(stored)) {
@@ -150,10 +158,10 @@ export function ProductionTab({ year }: { year?: number } = {}) {
         <ProduitsRucheSubTab year={year} />
       </TabsContent>
       <TabsContent value="ventes">
-        <VentesSubTab />
+        <VentesSubTab year={year} />
       </TabsContent>
       <TabsContent value="abattages">
-        <AbattagesSubTab />
+        <AbattagesSubTab year={year} />
       </TabsContent>
       <TabsContent value="economie">
         <EconomieLaitSubTab year={year} />
@@ -1147,9 +1155,14 @@ const PREFIXE_CESSION_GRATUITE = '[Cession gratuite]'
 const estCessionGratuite = (notes: string | null | undefined) =>
   (notes ?? '').startsWith(PREFIXE_CESSION_GRATUITE)
 
-function VentesSubTab() {
+function VentesSubTab({ year }: { year?: number } = {}) {
   const { toast } = useToast()
   const [isLoading, setIsLoading] = React.useState(true)
+  // Revue 2026-09-28 — la liste ne demandait que l'année civile courante :
+  // 13 ventes 2023-2025 d'un éleveur réel étaient invisibles, donc ni
+  // modifiables ni annulables. Elle suit l'exercice du module, ou toutes les années.
+  const anneeExercice = year ?? new Date().getFullYear()
+  const [periode, setPeriode] = React.useState<PeriodeListe>("exercice")
   const [ventes, setVentes] = React.useState<Vente[]>([])
   const [stats, setStats] = React.useState<any>(null)
   const [isDialogOpen, setIsDialogOpen] = React.useState(false)
@@ -1211,7 +1224,7 @@ function VentesSubTab() {
   const fetchData = React.useCallback(async () => {
     setIsLoading(true)
     try {
-      const response = await fetch('/api/elevage/ventes?limit=100')
+      const response = await fetch(`/api/elevage/ventes?limit=500&${parametreAnnee(periode, anneeExercice)}`)
       if (response.ok) {
         const result = await response.json()
         setVentes(result.data)
@@ -1222,7 +1235,7 @@ function VentesSubTab() {
     } finally {
       setIsLoading(false)
     }
-  }, [toast])
+  }, [toast, periode, anneeExercice])
 
   React.useEffect(() => { fetchData() }, [fetchData])
 
@@ -1379,6 +1392,7 @@ function VentesSubTab() {
 
       {/* Actions */}
       <div className="flex items-center justify-end gap-2">
+        <SelecteurPeriodeExercice annee={anneeExercice} periode={periode} onChange={setPeriode} libelle="Période des ventes affichées" />
         <Button variant="outline" size="sm" onClick={fetchData}>
           <RefreshCw className="h-4 w-4" />
         </Button>
@@ -1606,6 +1620,7 @@ interface Abattage {
   destination: string
   prixVente: number | null
   lieu: string | null
+  nEtablissementDestination?: string | null
   notes: string | null
   animal: { id: number; nom: string; identifiant: string; race: string; especeAnimale: { id: string; nom: string; couleur: string | null } } | null
   lot: { id: number; nom: string; especeAnimale: { id: string; nom: string; couleur: string | null } } | null
@@ -1623,9 +1638,14 @@ function getEspeceFromAbattage(a: Abattage): { id: string; nom: string; couleur:
   return a.lot?.especeAnimale || a.animal?.especeAnimale || null
 }
 
-function AbattagesSubTab() {
+function AbattagesSubTab({ year }: { year?: number } = {}) {
   const { toast } = useToast()
   const [isLoading, setIsLoading] = React.useState(true)
+  // Revue 2026-09-28 — même défaut que les ventes : 15 abattages 2023-2025
+  // d'un éleveur réel invisibles, et le lien « déclaration à compléter »
+  // (editAbattage=) muet pour un abattage d'une autre année.
+  const anneeExercice = year ?? new Date().getFullYear()
+  const [periode, setPeriode] = React.useState<PeriodeListe>("exercice")
   const [abattages, setAbattages] = React.useState<Abattage[]>([])
   const [lots, setLots] = React.useState<LotActif[]>([])
   const [stats, setStats] = React.useState<any>(null)
@@ -1638,11 +1658,12 @@ function AbattagesSubTab() {
   const [formData, setFormData] = React.useState({
     lotId: "", date: todayLocalISO(), quantite: "1",
     poidsVif: "", poidsCarcasse: "", destination: "auto_consommation", prixVente: "", lieu: "", notes: "",
+    nEtablissementDestination: "",
   })
 
   const resetForm = () => {
     setEditingId(null)
-    setFormData({ lotId: "", date: todayLocalISO(), quantite: "1", poidsVif: "", poidsCarcasse: "", destination: "auto_consommation", prixVente: "", lieu: "", notes: "" })
+    setFormData({ lotId: "", date: todayLocalISO(), quantite: "1", poidsVif: "", poidsCarcasse: "", destination: "auto_consommation", prixVente: "", lieu: "", notes: "", nEtablissementDestination: "" })
   }
 
   const handleEdit = (a: Abattage) => {
@@ -1657,6 +1678,7 @@ function AbattagesSubTab() {
       prixVente: a.prixVente ? a.prixVente.toString() : "",
       lieu: a.lieu ?? "",
       notes: a.notes ?? "",
+      nEtablissementDestination: a.nEtablissementDestination ?? "",
     })
     setIsDialogOpen(true)
   }
@@ -1665,7 +1687,7 @@ function AbattagesSubTab() {
     setIsLoading(true)
     try {
       const [abatRes, lotsRes] = await Promise.all([
-        fetch('/api/elevage/abattages?limit=100'),
+        fetch(`/api/elevage/abattages?limit=500&${parametreAnnee(periode, anneeExercice)}`),
         fetch('/api/elevage/lots?statut=actif'),
       ])
       if (abatRes.ok) { const r = await abatRes.json(); setAbattages(r.data); setStats(r.stats) }
@@ -1675,9 +1697,24 @@ function AbattagesSubTab() {
     } finally {
       setIsLoading(false)
     }
-  }, [toast])
+  }, [toast, periode, anneeExercice])
 
   React.useEffect(() => { fetchData() }, [fetchData])
+
+  // /elevage?tab=production&editAbattage=<id> (déclaration à compléter) : on
+  // ouvre la fiche de l'abattage dès la liste chargée, une seule fois.
+  const router = useRouter()
+  const editAbattageTraiteRef = React.useRef(false)
+  React.useEffect(() => {
+    if (editAbattageTraiteRef.current || isLoading) return
+    const cible = Number(new URLSearchParams(window.location.search).get("editAbattage"))
+    if (!Number.isInteger(cible) || cible <= 0) return
+    editAbattageTraiteRef.current = true
+    const abattage = abattages.find((a) => a.id === cible)
+    if (abattage) handleEdit(abattage)
+    router.replace("/elevage?tab=production", { scroll: false })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoading, abattages])
 
   // Espèces uniques extraites des abattages
   const especesUniques = React.useMemo(() => {
@@ -1734,6 +1771,7 @@ function AbattagesSubTab() {
         destination: formData.destination,
         prixVente: formData.prixVente ? parseFloat(formData.prixVente) : null,
         lieu: formData.lieu || null,
+        nEtablissementDestination: formData.nEtablissementDestination.trim() || null,
         notes: formData.notes || null,
       }
       const response = await fetch('/api/elevage/abattages', {
@@ -1823,6 +1861,7 @@ function AbattagesSubTab() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          <SelecteurPeriodeExercice annee={anneeExercice} periode={periode} onChange={setPeriode} libelle="Période des abattages affichés" />
           <Button variant="outline" size="sm" onClick={fetchData}>
             <RefreshCw className="h-4 w-4" />
           </Button>
@@ -1871,6 +1910,14 @@ function AbattagesSubTab() {
               </div>
               {/* Ticket cmsog52qx — lieu et notes étaient persistés (formData/API) mais absents du dialog. */}
               <div className="space-y-2"><Label>Lieu</Label><Input value={formData.lieu} onChange={(e) => setFormData(f => ({ ...f, lieu: e.target.value }))} placeholder="Abattoir, à la ferme…" /></div>
+              <div className="space-y-2">
+                <Label>N° de l’abattoir ou de l’établissement destinataire</Label>
+                <Input
+                  value={formData.nEtablissementDestination}
+                  onChange={(e) => setFormData(f => ({ ...f, nEtablissementDestination: e.target.value }))}
+                  placeholder="(optionnel) exigé pour déclarer la sortie d’un lot"
+                />
+              </div>
               <div className="space-y-2"><Label>Notes</Label><Textarea rows={2} value={formData.notes} onChange={(e) => setFormData(f => ({ ...f, notes: e.target.value }))} placeholder="Remarques (découpe, congélation…)" /></div>
               <div className="flex justify-end gap-2 pt-4">
                 <Button type="button" variant="outline" onClick={() => setIsDialogOpen(false)}>Annuler</Button>

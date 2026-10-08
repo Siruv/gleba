@@ -44,17 +44,20 @@ import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Checkbox } from "@/components/ui/checkbox"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
+import { confirmDialog } from "@/lib/global-dialog"
 import { useToast } from "@/hooks/use-toast"
 import { verifierPrixAliment, type CategorieAliment } from "@/lib/elevage/prix-aliment-seuils"
 import { todayLocalISO } from '@/lib/format-utils'
 import { useFiliereSelection, capacitesSelection, filiereMatch } from "@/lib/elevage/filiere-context"
+import { SelecteurPeriodeExercice, parametreAnnee, type PeriodeListe } from "./SelecteurPeriodeExercice"
 import { stockMedicamentEstDisponible } from "@/lib/elevage/stock-medicament"
+import { TYPES_SOIN } from "@/lib/elevage/types-soin"
 
 // ============================================================
 // Composant principal
 // ============================================================
 
-export function AlimentationTab() {
+export function AlimentationTab({ year }: { year?: number } = {}) {
   // Bug testeur 2026-05-31 — le bouton « + Soin » d'une fiche animale pointe
   // vers /elevage?tab=alimentation&sub=soins&animalId=29 mais on retombait
   // toujours sur l'onglet Stocks (defaultValue figé) et le formulaire ne
@@ -148,10 +151,10 @@ export function AlimentationTab() {
         <StocksSubTab />
       </TabsContent>
       <TabsContent value="consommations">
-        <ConsommationsSubTab />
+        <ConsommationsSubTab year={year} />
       </TabsContent>
       <TabsContent value="soins">
-        <SoinsSubTab initialAnimalId={soinAnimalId} initialOpen={ouvrirNouveauSoin} />
+        <SoinsSubTab initialAnimalId={soinAnimalId} initialOpen={ouvrirNouveauSoin} year={year} />
       </TabsContent>
       {caps.productionRente && (
         <TabsContent value="ration">
@@ -557,10 +560,15 @@ interface ConsoStats {
   parAliment: { alimentId: string; nom: string; totalKg: number; count: number }[]
 }
 
-function ConsommationsSubTab() {
+function ConsommationsSubTab({ year }: { year?: number } = {}) {
   const { toast } = useToast()
   const filiereSel = useFiliereSelection()
   const [isLoading, setIsLoading] = React.useState(true)
+  // Revue 2026-09-28 — même motif que les soins : la liste ne demandait que
+  // l'année civile courante ; avec une date de fin seule, la borne basse
+  // restait au 1er janvier courant et la liste se vidait.
+  const anneeExercice = year ?? new Date().getFullYear()
+  const [periode, setPeriode] = React.useState<PeriodeListe>("exercice")
   const [consommations, setConsommations] = React.useState<Consommation[]>([])
   const [aliments, setAliments] = React.useState<AlimentSimple[]>([])
   const [lots, setLots] = React.useState<LotSimple[]>([])
@@ -608,7 +616,7 @@ function ConsommationsSubTab() {
   const fetchData = React.useCallback(async () => {
     setIsLoading(true)
     try {
-      let url = "/api/elevage/consommations-aliments?limit=200"
+      let url = `/api/elevage/consommations-aliments?limit=500&${parametreAnnee(periode, anneeExercice)}`
       if (filterDateDebut) url += `&dateDebut=${filterDateDebut}`
       if (filterDateFin) url += `&dateFin=${filterDateFin}`
 
@@ -628,7 +636,7 @@ function ConsommationsSubTab() {
     } finally {
       setIsLoading(false)
     }
-  }, [toast, filterDateDebut, filterDateFin])
+  }, [toast, filterDateDebut, filterDateFin, periode, anneeExercice])
 
   React.useEffect(() => { fetchData() }, [fetchData])
 
@@ -781,6 +789,7 @@ function ConsommationsSubTab() {
 
       {/* Filtres et actions */}
       <div className="flex items-center gap-4 flex-wrap">
+        <SelecteurPeriodeExercice annee={anneeExercice} periode={periode} onChange={setPeriode} libelle="Période des consommations affichées" />
         <div className="flex flex-wrap items-center gap-2">
           <Calendar className="h-4 w-4 text-muted-foreground" />
           <Input type="date" value={filterDateDebut} onChange={(e) => setFilterDateDebut(e.target.value)} className="w-[150px]" />
@@ -973,8 +982,16 @@ interface Soin {
     dateRealisee: string | null
     statut: "a_faire" | "realisee" | "annulee"
   }[]
-  animal: { id: number; nom: string; identifiant: string; especeAnimale?: { id: string; filiere: string | null } | null } | null
-  lot: { id: number; nom: string; especeAnimale?: { id: string; filiere: string | null } | null } | null
+  animal: {
+    id: number
+    nom: string
+    identifiant: string
+    especeAnimale?: { id: string; filiere: string | null } | null
+    statut?: string | null
+    sexe?: string | null
+    dateSortie?: string | null
+  } | null
+  lot: { id: number; nom: string; especeAnimale?: { id: string; filiere: string | null } | null; statut?: string | null } | null
 }
 
 interface LotSoin { id: number; nom: string | null; quantiteActuelle: number; especeAnimale?: { id?: string; filiere?: string | null } | null }
@@ -1065,7 +1082,7 @@ function lotPharmacieFormVide() {
   }
 }
 
-function SoinsSubTab({ initialAnimalId = null, initialOpen = false }: { initialAnimalId?: string | null; initialOpen?: boolean }) {
+function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { initialAnimalId?: string | null; initialOpen?: boolean; year?: number }) {
   const caps = capacitesSelection(useFiliereSelection())
   const filiereSel = useFiliereSelection()
   const { toast } = useToast()
@@ -1076,6 +1093,13 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false }: { initialA
   const [lots, setLots] = React.useState<LotSoin[]>([])
   const [isDialogOpen, setIsDialogOpen] = React.useState(false)
   const [filterFait, setFilterFait] = React.useState<string>("all")
+  // Signalement 2026-09-27 (éleveur caprin) — les soins ressaisis pour les
+  // années passées figuraient au registre (qui suit l'exercice choisi) mais
+  // jamais dans cette liste, qui ne demandait à l'API que l'année civile
+  // courante : impossible de les modifier ou de les supprimer. La liste suit
+  // désormais l'exercice du module et peut afficher toutes les années.
+  const anneeExercice = year ?? new Date().getFullYear()
+  const [periode, setPeriode] = React.useState<PeriodeListe>("exercice")
   // QA 2026-05-15 — édition par ligne
   const [editingSoinId, setEditingSoinId] = React.useState<number | null>(null)
 
@@ -1101,6 +1125,33 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false }: { initialA
     setLotPharmacieForm(lotPharmacieFormVide())
     setLotPharmacieError(null)
   }, [])
+
+  // Signalement 2026-09-25 — un soin saisi par erreur ne se supprimait
+  // d'aucun écran, alors que l'API le permet (médicament remis en stock,
+  // dépense automatique retirée, attente lait recalculée).
+  const [isDeletingSoin, setIsDeletingSoin] = React.useState(false)
+  const supprimerSoin = async () => {
+    if (!editingSoinId || isDeletingSoin) return
+    if (!(await confirmDialog(
+      "Supprimer définitivement ce soin ? Il disparaît du registre sanitaire ; le médicament prélevé est remis en stock et la dépense automatique retirée.",
+      { title: "Supprimer le soin", confirmLabel: "Supprimer" },
+    ))) return
+    setIsDeletingSoin(true)
+    try {
+      const res = await fetch(`/api/elevage/soins?id=${editingSoinId}`, { method: "DELETE" })
+      const payload = await res.json().catch(() => null)
+      if (!res.ok) {
+        toast({ variant: "destructive", title: "Suppression impossible", description: payload?.error })
+        return
+      }
+      toast({ title: "Soin supprimé" })
+      setIsDialogOpen(false)
+      resetSoinForm()
+      fetchData()
+    } finally {
+      setIsDeletingSoin(false)
+    }
+  }
 
   const handleEditSoin = (s: Soin) => {
     setEditingSoinId(s.id)
@@ -1151,8 +1202,35 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false }: { initialA
   const [animaux, setAnimaux] = React.useState<{ id: number; nom: string | null; identifiant: string | null; especeAnimale?: { id?: string; nom?: string; filiere?: string | null } }[]>([])
   // Cibles proposées dans « Nouveau soin » scopées à l'atelier courant : on ne
   // veut pas soigner une chèvre depuis l'atelier « Chiens & chats ».
-  const animauxCibles = animaux.filter((a) => filiereMatch(filiereSel, a.especeAnimale?.filiere))
-  const lotsCibles = lots.filter((l) => filiereMatch(filiereSel, l.especeAnimale?.filiere))
+  // Les sélecteurs proposent les animaux et lots PRÉSENTS ; un soin d'un
+  // animal sorti ou d'un lot terminé (historique) garde pourtant sa cible à la
+  // modification, annoncée comme telle.
+  const soinEnEdition = editingSoinId != null ? soins.find((s) => s.id === editingSoinId) : undefined
+  const animauxCibles = React.useMemo(() => {
+    const base = animaux.filter((a) => filiereMatch(filiereSel, a.especeAnimale?.filiere))
+    const cible = soinEnEdition?.animal
+    if (!cible || base.some((a) => a.id === cible.id)) return base
+    return [
+      ...base,
+      {
+        id: cible.id,
+        nom: cible.nom,
+        identifiant: cible.identifiant,
+        especeAnimale: cible.especeAnimale
+          ? { id: cible.especeAnimale.id, nom: undefined, filiere: cible.especeAnimale.filiere }
+          : undefined,
+        statut: cible.statut ?? "sorti",
+        sexe: cible.sexe ?? null,
+        dateSortie: cible.dateSortie ?? null,
+      },
+    ]
+  }, [animaux, filiereSel, soinEnEdition])
+  const lotsCibles = React.useMemo(() => {
+    const base = lots.filter((l) => filiereMatch(filiereSel, l.especeAnimale?.filiere))
+    const cible = soinEnEdition?.lot
+    if (!cible || base.some((l) => l.id === cible.id)) return base
+    return [...base, { id: cible.id, nom: `${cible.nom || `Lot #${cible.id}`} (terminé)`, quantiteActuelle: 0, especeAnimale: cible.especeAnimale }]
+  }, [lots, filiereSel, soinEnEdition])
   const [produits, setProduits] = React.useState<{
     id: string
     nom: string
@@ -1200,7 +1278,9 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false }: { initialA
   const fetchData = React.useCallback(async () => {
     setIsLoading(true)
     try {
-      let url = '/api/elevage/soins?limit=100'
+      let url = periode === "toutes"
+        ? "/api/elevage/soins?annee=all&limit=1000"
+        : `/api/elevage/soins?annee=${anneeExercice}&limit=500`
       if (filterFait !== 'all') url += `&fait=${filterFait}`
       const [soinsRes, lotsRes, animauxRes, stocksRes] = await Promise.all([
         fetch(url),
@@ -1233,7 +1313,7 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false }: { initialA
     } finally {
       setIsLoading(false)
     }
-  }, [filterFait, toast])
+  }, [filterFait, periode, anneeExercice, toast])
 
   React.useEffect(() => { fetchData() }, [fetchData])
 
@@ -1523,6 +1603,7 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false }: { initialA
             <SelectItem value="true">Faits</SelectItem>
           </SelectContent>
         </Select>
+        <SelecteurPeriodeExercice annee={anneeExercice} periode={periode} onChange={setPeriode} libelle="Période des soins affichés" />
         <div className="flex items-center gap-2 ml-auto">
           <Button variant="outline" size="sm" onClick={fetchData}><RefreshCw className="h-4 w-4" /></Button>
           <Dialog open={isDialogOpen} onOpenChange={(open) => { setIsDialogOpen(open); if (!open) resetSoinForm() }}>
@@ -1564,18 +1645,9 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false }: { initialA
                         (tonte, parage, prophylaxie réglementaire, tarissement…)
                         masqués pour compagnie/équin/NAC. */}
                     <select className="w-full h-10 rounded-md border border-slate-300 px-2 bg-white text-sm" value={formData.type} onChange={(e) => setFormData(f => ({ ...f, type: e.target.value }))}>
-                      <option value="Vaccination">Vaccination</option>
-                      <option value="Vermifuge">Vermifuge</option>
-                      <option value="Traitement vétérinaire">Traitement vétérinaire</option>
-                      <option value="Castration">Castration</option>
-                      <option value="Identification">Identification</option>
-                      {caps.productionRente && <option value="Tonte">Tonte</option>}
-                      {caps.productionRente && <option value="Parage onglons">Parage onglons</option>}
-                      {caps.productionRente && <option value="Prophylaxie obligatoire">Prophylaxie obligatoire</option>}
-                      {caps.productionRente && <option value="Coproscopie">Coproscopie</option>}
-                      {caps.productionRente && <option value="Mise en lutte">Mise en lutte</option>}
-                      {caps.productionRente && <option value="Tarissement">Tarissement</option>}
-                      <option value="Autre">Autre</option>
+                      {TYPES_SOIN.filter((t) => !t.rente || caps.productionRente).map((t) => (
+                        <option key={t.valeur} value={t.valeur}>{t.valeur}</option>
+                      ))}
                     </select>
                   </div>
                   <div className="space-y-2">
@@ -1990,6 +2062,18 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false }: { initialA
                 <div className="flex flex-wrap items-center justify-end gap-2 pt-2">
                   {soinSubmitError && (
                     <p role="alert" className="mr-auto text-sm text-red-600">{soinSubmitError}</p>
+                  )}
+                  {editingSoinId !== null && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      className={`text-red-600 hover:bg-red-50 hover:text-red-700 ${soinSubmitError ? "" : "mr-auto"}`}
+                      onClick={() => void supprimerSoin()}
+                      disabled={isDeletingSoin || isSavingSoin}
+                    >
+                      <Trash2 className="mr-1 h-4 w-4" />
+                      {isDeletingSoin ? "Suppression…" : "Supprimer ce soin"}
+                    </Button>
                   )}
                   <Button type="button" variant="outline" onClick={() => setIsDialogOpen(false)}>Annuler</Button>
                   <Button
