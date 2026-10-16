@@ -9,10 +9,38 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { whereArrosageNote } from '@/lib/irrigation/arrosages-notes'
+import { apresDemain, MESSAGE_REALISEE_FUTURE } from '@/lib/interventions/date-realisee'
+import { irrigationCache } from '@/lib/irrigation-cache'
+import { supprimerArrosageNote } from '@/lib/irrigation-recording'
 import { lireAnnee } from '@/lib/api/annee'
 import { createDepenseFromIntervention, deleteAutoEntry } from '@/lib/auto-compta'
 import { createInterventionSchema, updateInterventionSchema } from '@/lib/validations/intervention'
 import { resoudreIdPlanche } from '@/lib/planches/resolution'
+import type { ZodError } from 'zod'
+
+/**
+ * Un refus de validation nomme le champ fautif : « Données invalides » seul
+ * laissait l'utilisateur deviner (QA cmv2962ey, AMM « ABC » refusée sans dire
+ * pourquoi). Le formulaire affiche `error` tel quel.
+ */
+function messageValidation(error: ZodError): string {
+  const premiere = error.issues[0]
+  if (!premiere) return 'Données invalides'
+  const champ = premiere.path.filter((p) => typeof p === 'string').join('.')
+  return champ ? `Données invalides — ${champ} : ${premiere.message}` : `Données invalides — ${premiere.message}`
+}
+
+/**
+ * QA cmv29i9ad — une intervention dont la planche n'existe plus affichait
+ * l'identifiant brut (« cmv2987co… ») dans la colonne Culture / Planche. Un
+ * cuid introuvable devient « Planche supprimée » ; un ancien nom stocké à la
+ * place de l'id (avant 2026-09-28) reste lisible tel quel.
+ */
+function libellePlancheIntrouvable(plancheId: string | null): string | null {
+  if (!plancheId) return null
+  return /^c[a-z0-9]{24}$/.test(plancheId) ? 'Planche supprimée' : plancheId
+}
 
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
@@ -89,7 +117,7 @@ export async function GET(request: NextRequest) {
         source: 'intervention' as const,
         sourceLabel: null as string | null,
         cultureNom: cult ? `${cult.espece?.nom ?? cult.espece?.id ?? '?'}${cult.variete ? ' - ' + (cult.variete.nom ?? cult.variete.id) : ''}` : (arbre ? arbre.nom : null),
-        plancheNom: planche?.nom || (cult?.planche as any)?.nom || null,
+        plancheNom: planche?.nom || (cult?.planche as any)?.nom || libellePlancheIntrouvable(i.plancheId),
       }
     })
 
@@ -208,11 +236,15 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // === 3. Irrigations planifiées ===
+    // === 3. Arrosages notés ===
+    // Refonte de l'arrosage (2026-10-10) : seuls les arrosages réellement notés
+    // vont au registre. Les reliquats de l'ancien plan (passages en attente ou
+    // périmés affichés « Planifié », auto-validations par la pluie) n'étaient
+    // pas des interventions.
     const irrigations = await prisma.irrigationPlanifiee.findMany({
       where: {
         userId,
-        datePrevue: { gte: yearStart, lte: yearEnd },
+        AND: [whereArrosageNote(), { datePrevue: { gte: yearStart, lte: yearEnd } }],
       },
       include: {
         culture: { include: { espece: true, planche: true } },
@@ -246,6 +278,9 @@ export async function GET(request: NextRequest) {
       updatedAt: ir.updatedAt,
       source: 'irrigation' as const,
       sourceLabel: `Irrigation #${ir.id}`,
+      // Trace « Noter » : modifiable (complétée en intervention) ou supprimable
+      // depuis le registre (ticket QA cmv2rfmzl).
+      irrigationId: ir.id,
       cultureNom: ir.culture?.espece?.id || null,
       plancheNom: ir.culture?.planche?.nom || null,
     }))
@@ -475,13 +510,17 @@ export async function POST(request: NextRequest) {
     const parsed = createInterventionSchema.safeParse(body)
     if (!parsed.success) {
       return NextResponse.json(
-        { error: 'Données invalides', details: parsed.error.flatten() },
+        { error: messageValidation(parsed.error), details: parsed.error.flatten() },
         { status: 400 }
       )
     }
 
     const userId = session.user.id
     const d = parsed.data
+    // Réalisée dans le futur : refusée (ticket QA cmv3jatw8, `date-realisee.ts`).
+    if (d.fait && apresDemain(d.date)) {
+      return NextResponse.json({ error: MESSAGE_REALISEE_FUTURE }, { status: 400 })
+    }
     // On stocke l'identifiant de la planche, jamais son libellé (règle du
     // projet) ; une référence par nom, héritée des anciens formulaires, est
     // traduite ; une référence inconnue est conservée telle quelle.
@@ -558,6 +597,23 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // « Modifier » un arrosage noté : l'intervention complète (volume, durée)
+    // remplace la trace « Noter », sans double compte (ticket QA cmv2rfmzl).
+    // Seulement pour un arrosage réalisé : une intervention « planifiée » ne
+    // remplace pas un arrosage qui a eu lieu. Un échec de suppression laisse la
+    // trace (le plein l'emporte dans le bilan) plutôt que de renvoyer une 500
+    // qui ferait recréer l'intervention.
+    const remplace = Number(body.remplaceArrosageNoteId)
+    if (intervention.type === 'arrosage' && intervention.fait && Number.isInteger(remplace) && remplace > 0) {
+      try {
+        await supprimerArrosageNote({ userId, traceId: remplace })
+      } catch (e) {
+        console.error('POST /api/interventions : trace d\'arrosage non remplacée', e)
+      }
+    }
+    // Un arrosage saisi ici nourrit le bilan hydrique (ticket QA cmv2rdmdn).
+    irrigationCache.invalidateUser(userId)
+
     return NextResponse.json(intervention, { status: 201 })
   } catch (err) {
     console.error('Erreur POST /api/interventions:', err)
@@ -585,7 +641,7 @@ export async function PATCH(request: NextRequest) {
     const parsedUpdates = updateInterventionSchema.safeParse({ id: parseInt(id), ...updates })
     if (!parsedUpdates.success) {
       return NextResponse.json(
-        { error: 'Données invalides', details: parsedUpdates.error.flatten() },
+        { error: messageValidation(parsedUpdates.error), details: parsedUpdates.error.flatten() },
         { status: 400 },
       )
     }
@@ -599,7 +655,7 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json({ error: 'Intervention non trouvée' }, { status: 404 })
     }
 
-    // DEV2 #7 — Audit Larcher : la transition "Planifié → Fait" exige
+    // DEV2 #7 — Audit comptable : la transition "Planifié → Fait" exige
     // une durée renseignée (sinon les statistiques de coût MO restent
     // à 0). On la bloque ici plutôt que de filtrer après coup.
     if (updates.fait === true && existing.fait === false) {
@@ -616,6 +672,12 @@ export async function PATCH(request: NextRequest) {
           { status: 400 }
         )
       }
+    }
+
+    const faitFinal = updates.fait !== undefined ? updates.fait === true : existing.fait
+    const dateFinale = updates.date !== undefined ? new Date(updates.date) : existing.date
+    if (faitFinal && !Number.isNaN(dateFinale.getTime()) && apresDemain(dateFinale)) {
+      return NextResponse.json({ error: MESSAGE_REALISEE_FUTURE }, { status: 400 })
     }
 
     // Build update data
@@ -687,6 +749,7 @@ export async function PATCH(request: NextRequest) {
       console.error('Auto-compta error (intervention PATCH):', autoComptaError)
     }
 
+    irrigationCache.invalidateUser(userId)
     return NextResponse.json(updated)
   } catch (err) {
     console.error('Erreur PATCH /api/interventions:', err)
@@ -726,6 +789,7 @@ export async function DELETE(request: NextRequest) {
     await prisma.intervention.delete({
       where: { id: parseInt(id) },
     })
+    irrigationCache.invalidateUser(userId)
 
     return NextResponse.json({ success: true })
   } catch (err) {

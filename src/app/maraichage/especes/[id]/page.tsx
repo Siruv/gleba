@@ -50,6 +50,8 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Label } from "@/components/ui/label"
+import { PeriodeSemainesField } from "@/components/referentiel/PeriodeSemainesField"
+import { libellePeriodeSemainesCourt } from "@/lib/semaines-lisibles"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useToast } from "@/hooks/use-toast"
 import { confirmDialog } from "@/lib/global-dialog"
@@ -68,6 +70,7 @@ import {
   formatRendement,
   libelleUniteRendement,
   uniteRendementParType,
+  estTypeVerger,
 } from "@/lib/validations/espece"
 import {
   libelleUniteObjectif,
@@ -94,10 +97,14 @@ interface Variete {
   fournisseur: { id: string } | null
   semaineRecolte: number | null
   dureeRecolte: number | null
+  semaineFloraison: number | null
+  dureeFloraison: number | null
   nbGrainesG: number | null
   prixGraine: number | null
-  stockGraines: number | null
-  stockPlants: number | null
+  // Stock de l'utilisateur connecté (`UserStockVariete`), le même que
+  // Planification > Stocks ; la variété n'a pas de stock propre (cmv29j6q7).
+  userStockGraines: number | null
+  userStockPlants: number | null
   bio: boolean
   description: string | null
   userId: string | null
@@ -112,6 +119,8 @@ const EMPTY_VARIETE_FORM = {
   bio: false,
   semaineRecolte: "",
   dureeRecolte: "",
+  semaineFloraison: "",
+  dureeFloraison: "",
   nbGrainesG: "",
   prixGraine: "",
   stockGraines: "",
@@ -154,6 +163,10 @@ export default function EditEspecePage() {
    * par type ne sert qu'aux lignes héritées sans unité.
    */
   const [uniteRendementEspece, setUniteRendementEspece] = React.useState<string | null>(null)
+  // Type de l'espèce (chargé avec elle) : la période de floraison d'une variété
+  // n'est proposée qu'au verger, où elle sert à la pollinisation.
+  const [especeType, setEspeceType] = React.useState<string | null>(null)
+  const especeDuVerger = estTypeVerger(especeType)
 
   // Charge les variétés via /api/varietes (superset enrichi des stats d'avis via avis=1).
   const reloadVarietes = React.useCallback(async () => {
@@ -297,6 +310,7 @@ export default function EditEspecePage() {
       .then(([famillesData, especeData, fournisseursData]) => {
         setFamilles(Array.isArray(famillesData) ? famillesData : [])
         setEspeceNom(especeData.nom ?? especeId)
+        setEspeceType(especeData.type ?? null)
         setUniteRendementEspece(
           especeData.uniteRendement ?? uniteRendementParType(especeData.type)
         )
@@ -428,21 +442,54 @@ export default function EditEspecePage() {
       bio: v.bio,
       semaineRecolte: v.semaineRecolte?.toString() || "",
       dureeRecolte: v.dureeRecolte?.toString() || "",
+      semaineFloraison: v.semaineFloraison?.toString() || "",
+      dureeFloraison: v.dureeFloraison?.toString() || "",
       nbGrainesG: v.nbGrainesG?.toString() || "",
       prixGraine: v.prixGraine?.toString() || "",
-      stockGraines: v.stockGraines?.toString() || "",
-      stockPlants: v.stockPlants?.toString() || "",
+      stockGraines: v.userStockGraines?.toString() || "",
+      stockPlants: v.userStockPlants?.toString() || "",
       description: v.description || "",
     })
     setShowVarieteDialog(true)
   }
+
+  // Les caractéristiques d'une variété du catalogue (ou d'un autre membre) ne
+  // sont modifiables que par son auteur ou un admin ; son STOCK, lui, est
+  // propre à chaque compte et toujours modifiable ici.
+  const estAdmin = (session?.user as { role?: string } | undefined)?.role === "ADMIN"
+  const peutModifierCatalogue = (v: Variete) => estAdmin || (!!v.userId && v.userId === currentUserId)
+
+  const enregistrerStockVariete = async (varieteId: string) => {
+    // Un seul appel pour les deux quantités (écriture atomique côté serveur).
+    const res = await fetch("/api/stocks", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "variete",
+        id: varieteId,
+        stockGraines: varieteForm.stockGraines ? parseFloat(varieteForm.stockGraines) : null,
+        stockPlants: varieteForm.stockPlants ? parseInt(varieteForm.stockPlants) : null,
+      }),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.error || "Enregistrement du stock impossible")
+    }
+  }
+  const catalogueVerrouille = !!editingVariete && !peutModifierCatalogue(editingVariete)
 
   const handleVarieteSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (isSavingVariete) return
     setIsSavingVariete(true)
     try {
-      if (editingVariete) {
+      if (editingVariete && !peutModifierCatalogue(editingVariete)) {
+        // Variété du catalogue : seul MON stock est enregistré (PATCH /api/stocks,
+        // la route des stocks par utilisateur), le catalogue reste intact.
+        await enregistrerStockVariete(editingVariete.id)
+        await reloadVarietes()
+        toast({ title: "Stock enregistré", description: "Le même que Planification > Stocks." })
+      } else if (editingVariete) {
         // PUT
         const res = await fetch(`/api/varietes/${encodeURIComponent(editingVariete.id)}`, {
           method: "PUT",
@@ -453,6 +500,8 @@ export default function EditEspecePage() {
             bio: varieteForm.bio,
             semaineRecolte: varieteForm.semaineRecolte ? parseInt(varieteForm.semaineRecolte) : null,
             dureeRecolte: varieteForm.dureeRecolte ? parseInt(varieteForm.dureeRecolte) : null,
+            semaineFloraison: varieteForm.semaineFloraison ? parseInt(varieteForm.semaineFloraison) : null,
+            dureeFloraison: varieteForm.dureeFloraison ? parseInt(varieteForm.dureeFloraison) : null,
             nbGrainesG: varieteForm.nbGrainesG ? parseFloat(varieteForm.nbGrainesG) : null,
             prixGraine: varieteForm.prixGraine ? parseFloat(varieteForm.prixGraine) : null,
             stockGraines: varieteForm.stockGraines ? parseFloat(varieteForm.stockGraines) : null,
@@ -479,6 +528,8 @@ export default function EditEspecePage() {
             bio: varieteForm.bio,
             semaineRecolte: varieteForm.semaineRecolte ? parseInt(varieteForm.semaineRecolte) : null,
             dureeRecolte: varieteForm.dureeRecolte ? parseInt(varieteForm.dureeRecolte) : null,
+            semaineFloraison: varieteForm.semaineFloraison ? parseInt(varieteForm.semaineFloraison) : null,
+            dureeFloraison: varieteForm.dureeFloraison ? parseInt(varieteForm.dureeFloraison) : null,
             nbGrainesG: varieteForm.nbGrainesG ? parseFloat(varieteForm.nbGrainesG) : null,
             prixGraine: varieteForm.prixGraine ? parseFloat(varieteForm.prixGraine) : null,
             stockGraines: varieteForm.stockGraines ? parseFloat(varieteForm.stockGraines) : null,
@@ -1477,17 +1528,18 @@ export default function EditEspecePage() {
                             <TableHead>Nom</TableHead>
                             <TableHead>Fournisseur</TableHead>
                             <TableHead>Bio</TableHead>
+                            <TableHead>Périodes</TableHead>
                             <TableHead>Avis</TableHead>
                             <TableHead>Origine</TableHead>
-                            <TableHead className="text-right">Stock graines (g)</TableHead>
-                            <TableHead className="text-right">Stock plants</TableHead>
+                            <TableHead className="text-right" title="Votre stock, le même que Planification > Stocks">Mon stock graines (g)</TableHead>
+                            <TableHead className="text-right" title="Votre stock, le même que Planification > Stocks">Mes plants</TableHead>
                             <TableHead className="text-right">Actions</TableHead>
                           </TableRow>
                         </TableHeader>
                         <TableBody>
                           {varietesAffichees.length === 0 && (
                             <TableRow>
-                              <TableCell colSpan={8} className="text-center text-muted-foreground py-6">
+                              <TableCell colSpan={9} className="text-center text-muted-foreground py-6">
                                 Aucune variété pour ce filtre.
                               </TableCell>
                             </TableRow>
@@ -1497,6 +1549,16 @@ export default function EditEspecePage() {
                               <TableCell className="font-medium">{v.nom ?? v.id}</TableCell>
                               <TableCell>{v.fournisseur?.id || "-"}</TableCell>
                               <TableCell>{v.bio ? "Oui" : "-"}</TableCell>
+                              <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
+                                {[
+                                  libellePeriodeSemainesCourt(v.semaineRecolte, v.dureeRecolte) &&
+                                    `Récolte ${libellePeriodeSemainesCourt(v.semaineRecolte, v.dureeRecolte)}`,
+                                  libellePeriodeSemainesCourt(v.semaineFloraison, v.dureeFloraison) &&
+                                    `Floraison ${libellePeriodeSemainesCourt(v.semaineFloraison, v.dureeFloraison)}`,
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ") || "-"}
+                              </TableCell>
                               <TableCell>
                                 <button
                                   type="button"
@@ -1531,8 +1593,8 @@ export default function EditEspecePage() {
                                   signalerRefType="VARIETE"
                                 />
                               </TableCell>
-                              <TableCell className="text-right">{v.stockGraines ?? "-"}</TableCell>
-                              <TableCell className="text-right">{v.stockPlants ?? "-"}</TableCell>
+                              <TableCell className="text-right">{v.userStockGraines ?? "-"}</TableCell>
+                              <TableCell className="text-right">{v.userStockPlants ?? "-"}</TableCell>
                               <TableCell className="text-right">
                                 <div className="flex justify-end gap-1">
                                   <Button
@@ -1600,6 +1662,10 @@ export default function EditEspecePage() {
               <DialogTitle>{editingVariete ? `Modifier : ${editingVariete.nom ?? editingVariete.id}` : "Nouvelle variété"}</DialogTitle>
             </DialogHeader>
             <form onSubmit={handleVarieteSubmit} className="space-y-4">
+              {/* Caractéristiques du catalogue : verrouillées (fieldset désactivé)
+                  quand la variété n'est pas la mienne ; seuls mes stocks restent
+                  saisissables plus bas. */}
+              <fieldset disabled={catalogueVerrouille} className="contents">
               {!editingVariete && (
                 <div>
                   <Label>Nom de la variété *</Label>
@@ -1643,28 +1709,39 @@ export default function EditEspecePage() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <Label>Semaine récolte (1-52)</Label>
-                  <Input
-                    type="number"
-                    min="1"
-                    max="52"
-                    value={varieteForm.semaineRecolte}
-                    onChange={(e) => setVarieteForm({ ...varieteForm, semaineRecolte: e.target.value })}
-                  />
-                </div>
-                <div>
-                  <Label>Durée récolte (sem.)</Label>
-                  <Input
-                    type="number"
-                    min="1"
-                    max="52"
-                    value={varieteForm.dureeRecolte}
-                    onChange={(e) => setVarieteForm({ ...varieteForm, dureeRecolte: e.target.value })}
-                  />
-                </div>
-              </div>
+              {/* Demande du 2026-10-07 : « semaine 27 + durée » n'était pas
+                  reconnu comme une période de récolte. Début et fin en dates
+                  lisibles ; stockage inchangé (semaine ISO + durée). */}
+              <PeriodeSemainesField
+                idPrefix="variete-recolte"
+                label="Période de récolte"
+                debut={varieteForm.semaineRecolte ? parseInt(varieteForm.semaineRecolte) : null}
+                duree={varieteForm.dureeRecolte ? parseInt(varieteForm.dureeRecolte) : null}
+                onChange={({ debut, duree }) =>
+                  setVarieteForm({
+                    ...varieteForm,
+                    semaineRecolte: debut ? String(debut) : "",
+                    dureeRecolte: duree ? String(duree) : "",
+                  })
+                }
+                aide="Semaine de début puis semaine de fin ; la période peut passer par janvier."
+              />
+              {especeDuVerger && (
+                <PeriodeSemainesField
+                  idPrefix="variete-floraison"
+                  label="Période de floraison"
+                  debut={varieteForm.semaineFloraison ? parseInt(varieteForm.semaineFloraison) : null}
+                  duree={varieteForm.dureeFloraison ? parseInt(varieteForm.dureeFloraison) : null}
+                  onChange={({ debut, duree }) =>
+                    setVarieteForm({
+                      ...varieteForm,
+                      semaineFloraison: debut ? String(debut) : "",
+                      dureeFloraison: duree ? String(duree) : "",
+                    })
+                  }
+                  aide="Sert à la pollinisation : deux variétés aux floraisons simultanées peuvent se polliniser."
+                />
+              )}
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
@@ -1688,10 +1765,16 @@ export default function EditEspecePage() {
                   />
                 </div>
               </div>
+              </fieldset>
 
+              {catalogueVerrouille && (
+                <p className="text-xs text-muted-foreground">
+                  Variété du catalogue : ses caractéristiques ne sont modifiables que par son auteur. Seuls vos stocks sont enregistrés ici.
+                </p>
+              )}
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <Label>Stock graines (g)</Label>
+                  <Label>Mon stock de graines (g)</Label>
                   <Input
                     type="number"
                     step="0.1"
@@ -1701,7 +1784,7 @@ export default function EditEspecePage() {
                   />
                 </div>
                 <div>
-                  <Label>Stock plants</Label>
+                  <Label>Mes plants</Label>
                   <Input
                     type="number"
                     min="0"
@@ -1718,6 +1801,7 @@ export default function EditEspecePage() {
                   onChange={(e) => setVarieteForm({ ...varieteForm, description: e.target.value })}
                   rows={2}
                   placeholder="Notes sur cette variété..."
+                  disabled={catalogueVerrouille}
                 />
               </div>
 

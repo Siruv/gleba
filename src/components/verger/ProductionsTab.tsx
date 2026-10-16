@@ -16,6 +16,7 @@ import { Label } from "@/components/ui/label"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { SelectNatif } from "@/components/ui/select-natif"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -37,6 +38,7 @@ import { Combobox } from "@/components/ui/combobox"
 import { useToast } from "@/hooks/use-toast"
 import { AssistantPlantationDialog } from "./AssistantPlantationDialog"
 import { todayLocalISO } from '@/lib/format-utils'
+import { labelStatutRecolteArbre } from '@/lib/verger/statut-recolte-arbre'
 
 // ============================================================
 // Types
@@ -275,9 +277,31 @@ function RecoltesFruitsSubTab() {
     return null
   }
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (isSubmitting) return
+    // QA cmv2ejjvp — filet FormData (même règle que le soin, cmsp5ckbx) : la
+    // date visible dans le champ gagne sur l'état React, qu'un remplissage
+    // sans onChange laissait à aujourd'hui. Lu avant tout await.
+    const formulaireSoumis = e.currentTarget
+    const champsSoumis = new FormData(formulaireSoumis)
+    for (const [champName, label] of [
+      ["date", "de récolte"],
+      ["datePeremption", "de péremption"],
+    ] as const) {
+      const champ = formulaireSoumis.elements.namedItem(champName) as HTMLInputElement | null
+      if (champ?.validity?.badInput) {
+        toast({
+          title: `Date ${label} incomplète`,
+          description: "Saisissez jj/mm/aaaa ou utilisez le calendrier.",
+          variant: "destructive",
+        })
+        return
+      }
+    }
+    const dateSoumise = String(champsSoumis.get("date") || "").trim() || newRecolte.date
+    const peremptionSoumise =
+      String(champsSoumis.get("datePeremption") || "").trim() || newRecolte.datePeremption
     // Famille C — au lieu d'un bouton grisé muet, on valide explicitement
     // l'arbre requis avec un message clair.
     if (!newRecolte.arbreId) {
@@ -300,11 +324,11 @@ function RecoltesFruitsSubTab() {
     try {
       const corps = {
         arbreId: parseInt(newRecolte.arbreId),
-        date: newRecolte.date,
+        date: dateSoumise,
         quantite,
         qualite: newRecolte.qualite || null,
         prixKg: newRecolte.prixKg ? parseFloat(newRecolte.prixKg) : null,
-        datePeremption: newRecolte.datePeremption || null,
+        datePeremption: peremptionSoumise || null,
         notes: newRecolte.notes || null,
         // DEV3 #4 — traçabilité AB
         statutBioSnapshot: newRecolte.statutBioSnapshot || null,
@@ -742,7 +766,7 @@ function RecoltesFruitsSubTab() {
                       <TableCell className="capitalize">{r.qualite || "-"}</TableCell>
                       <TableCell>
                         <Badge variant={r.statut === "perte" ? "destructive" : "outline"}>
-                          {r.statut === "perte" ? "Perte" : "Usage interne"}
+                          {labelStatutRecolteArbre(r.statut)}
                         </Badge>
                       </TableCell>
                       <TableCell className="text-muted-foreground text-sm">{r.notes || "-"}</TableCell>
@@ -765,22 +789,33 @@ function RecoltesFruitsSubTab() {
               revalidation explicite dans handleSubmit. */}
           <form onSubmit={handleSubmit} noValidate className="space-y-4">
             <div>
-              <Label>Arbre *</Label>
-              <Select
+              <Label htmlFor="recolte-arbre-arbre">Arbre *</Label>
+              {/* QA cmv2ebsdk — champ obligatoire en <select> natif : tout mode
+                  de saisie passe par onChange (Select Radix : voir SelectNatif). */}
+              <SelectNatif
+                id="recolte-arbre-arbre"
+                name="arbreId"
                 value={newRecolte.arbreId}
-                onValueChange={choisirArbre}
+                onChange={(e) => choisirArbre(e.target.value)}
               >
-                <SelectTrigger>
-                  <SelectValue placeholder="Sélectionner un arbre" />
-                </SelectTrigger>
-                <SelectContent>
-                  {arbresFruitiers.map((a) => (
-                    <SelectItem key={a.id} value={a.id.toString()}>
-                      {a.nom}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                <option value="" disabled>
+                  Sélectionner un arbre
+                </option>
+                {arbresFruitiers.map((a) => (
+                  <option key={a.id} value={a.id.toString()}>
+                    {a.nom}
+                  </option>
+                ))}
+                {/* En modification, l'arbre d'origine reste affiché même s'il
+                    n'est plus proposé (type changé) : un select natif sans
+                    option correspondante paraîtrait vide. */}
+                {editingRecolte &&
+                  !arbresFruitiers.some((a) => a.id === editingRecolte.arbreId) && (
+                    <option value={editingRecolte.arbreId.toString()}>
+                      {editingRecolte.arbre?.nom ?? `Arbre n° ${editingRecolte.arbreId}`}
+                    </option>
+                  )}
+              </SelectNatif>
             </div>
             {/* QA cmsqn6n46 — même contrôle de fenêtre que la taille : une
                 récolte de Golden fin mai était acceptée sans un mot et rendait
@@ -801,11 +836,22 @@ function RecoltesFruitsSubTab() {
             })()}
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <Label>Date</Label>
+                <Label htmlFor="recolte-arbre-date">Date</Label>
+                {/* QA cmv2ejjvp — name + resynchronisation au blur : la date
+                    affichée est celle enregistrée (filet relu à l'envoi). */}
                 <Input
+                  id="recolte-arbre-date"
                   type="date"
+                  name="date"
                   value={newRecolte.date}
-                  onChange={(e) => setNewRecolte({ ...newRecolte, date: e.target.value })}
+                  onChange={(e) => {
+                    const date = e.target.value
+                    setNewRecolte((courant) => ({ ...courant, date }))
+                  }}
+                  onBlur={(e) => {
+                    const date = e.currentTarget.value
+                    if (date) setNewRecolte((courant) => (courant.date === date ? courant : { ...courant, date }))
+                  }}
                 />
               </div>
               <div>
@@ -850,11 +896,24 @@ function RecoltesFruitsSubTab() {
               </div>
             </div>
             <div>
-              <Label>Date de péremption</Label>
+              <Label htmlFor="recolte-arbre-peremption">Date de péremption</Label>
               <Input
+                id="recolte-arbre-peremption"
                 type="date"
+                name="datePeremption"
                 value={newRecolte.datePeremption}
-                onChange={(e) => setNewRecolte({ ...newRecolte, datePeremption: e.target.value })}
+                onChange={(e) => {
+                  const datePeremption = e.target.value
+                  setNewRecolte((courant) => ({ ...courant, datePeremption }))
+                }}
+                onBlur={(e) => {
+                  const datePeremption = e.currentTarget.value
+                  if (datePeremption) {
+                    setNewRecolte((courant) =>
+                      courant.datePeremption === datePeremption ? courant : { ...courant, datePeremption }
+                    )
+                  }
+                }}
               />
             </div>
 
@@ -1552,26 +1611,32 @@ function ProductionBoisSubTab() {
               {/* QA 2026-07-30 — L'arbre est la clé de traçabilité d'un élagage
                   ou d'un abattage : le libellé « optionnel » et une liste vide
                   silencieuse laissaient créer des lignes orphelines. */}
-              <Label>
+              <Label htmlFor="production-bois-arbre">
                 Arbre{newProduction.type === "elagage" || newProduction.type === "abattage"
                   ? <span className="text-red-600"> *</span>
                   : " (optionnel)"}
               </Label>
-              <Select
+              {/* QA cmv2r1kjv (même motif) — <select> natif : l'arbre, exigé pour
+                  un élagage ou un abattage, ne retombe plus sur le placeholder ;
+                  l'option vide permet aussi de revenir à « aucun arbre ». */}
+              <SelectNatif
+                id="production-bois-arbre"
+                name="arbreId"
                 value={newProduction.arbreId}
-                onValueChange={(v) => setNewProduction({ ...newProduction, arbreId: v })}
+                onChange={(e) => {
+                  const arbreId = e.target.value
+                  setNewProduction((courant) => ({ ...courant, arbreId }))
+                }}
               >
-                <SelectTrigger>
-                  <SelectValue placeholder={arbres.length === 0 ? "Aucun arbre forestier ou de haie" : "Aucun arbre spécifique"} />
-                </SelectTrigger>
-                <SelectContent>
-                  {arbres.map((a) => (
-                    <SelectItem key={a.id} value={a.id.toString()}>
-                      {a.nom}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                <option value="">
+                  {arbres.length === 0 ? "Aucun arbre forestier ou de haie" : "Aucun arbre spécifique"}
+                </option>
+                {arbres.map((a) => (
+                  <option key={a.id} value={a.id.toString()}>
+                    {a.nom}
+                  </option>
+                ))}
+              </SelectNatif>
               {arbres.length === 0 && (
                 <p className="mt-1 text-xs text-muted-foreground">
                   Aucun arbre de type forestier ou haie n&apos;est disponible : créez-en un pour tracer la production.

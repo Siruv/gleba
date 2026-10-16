@@ -6,13 +6,15 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
 import { updateRecolteSchema, recoltePatchSchema } from '@/lib/validations'
 import { requireAuthApi } from '@/lib/auth-utils'
 import { createVenteFromRecolte, deleteAutoEntry } from '@/lib/auto-compta'
 import { invalidateKpi } from '@/lib/kpi'
 import { creerFacture, annulerFactureLiee } from '@/lib/facture-utils'
+import { jourCivilLocal } from '@/lib/cultures/execution'
+import { refusRecolteAvantDebut } from '@/lib/recolte/date-coherente'
+import { libelleUniteQuantite, type UniteQuantite } from '@/lib/recolte/projection'
 
 type RouteParams = { params: Promise<{ id: string }> }
 
@@ -121,12 +123,47 @@ export async function PUT(
       )
     }
 
+    // QA cmv2r19al — même règle qu'à la création : la date de récolte ne
+    // précède pas le début de la culture. Contrôlée seulement quand la date, la
+    // culture ou l'espèce change, pour ne pas bloquer la retouche d'une ligne
+    // ancienne.
+    // La culture visée est relue dans le compte : un rattachement à la culture
+    // d'un autre compte n'était pas vérifié.
+    const data = validationResult.data
+    const cultureCible = data.cultureId ?? existing.cultureId
+    const especeCible = data.especeId ?? existing.especeId
+    const dateCible = data.date ?? existing.date
+    const dateChange = data.date !== undefined && jourCivilLocal(data.date) !== jourCivilLocal(existing.date)
+    if (cultureCible !== existing.cultureId || especeCible !== existing.especeId || dateChange) {
+      const culture = await prisma.culture.findUnique({
+        where: { id: cultureCible, userId: session!.user.id },
+        select: { id: true, especeId: true, dateSemis: true, datePlantation: true, semisFait: true, plantationFaite: true },
+      })
+      if (!culture) {
+        return NextResponse.json(
+          { error: `La culture #${cultureCible} n'existe pas` },
+          { status: 400 }
+        )
+      }
+      // Même cohérence qu'à la création : l'espèce est celle de la culture.
+      if (culture.especeId !== especeCible) {
+        return NextResponse.json(
+          { error: `L'espèce de la récolte doit correspondre à l'espèce de la culture #${culture.id}`, champ: 'especeId' },
+          { status: 400 }
+        )
+      }
+      const refusDate = refusRecolteAvantDebut(culture, dateCible)
+      if (refusDate) {
+        return NextResponse.json({ error: refusDate, champ: 'date' }, { status: 400 })
+      }
+    }
+
     // Mise à jour + ajustement de l'inventaire si la récolte est en stock
     // (changement de quantité ou d'espèce → le compteur doit suivre).
     const recolte = await prisma.$transaction(async (tx) => {
       const updated = await tx.recolte.update({
         where: { id: recolteId },
-        data: validationResult.data,
+        data,
         include: {
           espece: true,
           culture: true,
@@ -214,7 +251,7 @@ export async function PATCH(
     }
 
     // Préparer les données de mise à jour
-    const updateData: any = {}
+    const updateData: Record<string, unknown> = {}
     if (body.statut !== undefined) updateData.statut = body.statut
     if (body.dateVente !== undefined) updateData.dateVente = body.dateVente ? new Date(body.dateVente) : null
     if (body.prixKg !== undefined) updateData.prixKg = body.prixKg
@@ -228,6 +265,22 @@ export async function PATCH(
     // l'ignorait (récolte entière marquée vendue, facture incohérente). On
     // scinde désormais : la récolte vendue porte la quantité vendue, le
     // reliquat redevient une récolte en_stock distincte.
+    // QA cmv2r1oao — des tiges, pièces ou bottes se vendent à l'unité : l'écran
+    // le contrôle, la route aussi (un reliquat de 2,5 tiges n'aurait aucun sens).
+    if (
+      body.statut === 'vendu' &&
+      typeof body.quantiteVendue === 'number' &&
+      (existing.unite ?? 'kg') !== 'kg' &&
+      !Number.isInteger(body.quantiteVendue)
+    ) {
+      return NextResponse.json(
+        {
+          error: `Quantité vendue invalide : un nombre entier de ${libelleUniteQuantite(existing.unite as UniteQuantite, 2)} est attendu.`,
+        },
+        { status: 400 }
+      )
+    }
+
     const quantiteVendue =
       body.statut === 'vendu' &&
       typeof body.quantiteVendue === 'number' &&
@@ -320,7 +373,10 @@ export async function PATCH(
             // Quantité réellement vendue (pas la quantité totale de la
             // récolte) : sinon quantité × prix unitaire ≠ montant.
             quantite: quantiteVendue,
-            unite: 'kg',
+            // QA cmv2r1oao — même règle que l'écriture auto (auto-compta.ts) :
+            // une récolte en tiges se facture en tiges, `prixKg` étant un prix
+            // par unité de la récolte.
+            unite: libelleUniteQuantite((existing.unite ?? 'kg') as UniteQuantite, 1),
             prixUnitaire: (body.prixKg || 0) / 1.055,
             tauxTVA: 5.5,
             montantHT: totalHT,
@@ -342,6 +398,10 @@ export async function PATCH(
             cultureId: existing.cultureId,
             date: existing.date,
             quantite: reliquat,
+            // Le reliquat est la même matière que la récolte scindée : il garde
+            // son unité figée (des tiges restent des tiges), comme son snapshot
+            // Bio. Sans cette ligne il naissait sans unité, donc relu en kilos.
+            unite: existing.unite,
             statut: 'en_stock',
             datePeremption: existing.datePeremption,
             statutBioSnapshot: existing.statutBioSnapshot,

@@ -11,8 +11,6 @@ import { useSearchParams } from "next/navigation"
 import { Suspense } from "react"
 import {
   ArrowLeft,
-  CheckCircle2,
-  Circle,
   Sprout,
   Leaf,
   Package,
@@ -22,6 +20,7 @@ import {
   RefreshCw,
   AlertTriangle,
   CalendarClock,
+  ClipboardList,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -31,11 +30,16 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Textarea } from "@/components/ui/textarea"
 import { useToast } from "@/hooks/use-toast"
 import { format, startOfWeek, endOfWeek, addWeeks } from "date-fns"
 import { fr } from "date-fns/locale"
 import { libelleUniteQuantite, type UniteQuantite } from "@/lib/recolte/projection"
+import type { ArrosageDuJour } from "@/lib/irrigation/a-arroser"
+import { annulerArrosage, noterArrosage } from "@/lib/irrigation/noter-arrosage"
+import { detailArrosageNote } from "@/lib/irrigation/quantite-versee"
+import { notifierEnregistrement } from "@/lib/notifications-ecran"
+import { LigneArrosage, LigneTache } from "@/components/potager/LigneTache"
+import { SaisieArrosage } from "@/components/potager/SaisieArrosage"
 
 interface TacheItem {
   id: number
@@ -53,23 +57,11 @@ interface TacheItem {
   retardJours?: number
 }
 
-interface IrrigationItem {
-  id: number
-  cultureId: number
-  especeId: string
-  especeNom?: string
-  plancheId: string | null
-  ilot: string | null
-  datePrevue: string
-  fait: boolean
-  couleur: string | null
-}
-
 interface TachesData {
   semis: TacheItem[]
   plantations: TacheItem[]
   recoltes: TacheItem[]
-  irrigation: IrrigationItem[]
+  irrigation: ArrosageDuJour[]
   stats: {
     semisPrevus: number
     semisFaits: number
@@ -89,7 +81,7 @@ function TachesContent() {
   const [pendingAction, setPendingAction] = React.useState<
     | { kind: "recolte"; cultureId: number; especeId: string; label: string; unite?: UniteQuantite }
     | { kind: "annulation-recolte"; cultureId: number; especeId: string; label: string; unite?: UniteQuantite }
-    | { kind: "irrigation"; irrigationId: number; label: string; unite?: undefined }
+    | { kind: "irrigation"; arrosage: ArrosageDuJour; label: string; unite?: undefined }
     | { kind: "report"; cultureId: number; type: "semis" | "plantation" | "recolte"; label: string; unite?: undefined }
     | null
   >(null)
@@ -122,27 +114,10 @@ function TachesContent() {
   const startIso = React.useMemo(() => weekStart.toISOString(), [weekStart])
   const endIso = React.useMemo(() => weekEnd.toISOString(), [weekEnd])
 
-  // Bug #6 (testeur) — Regroupe les irrigations par espèce pour éviter une
-  // longue liste de lignes quasi identiques (« 20× Tomate »). On conserve
-  // chaque planche en sous-ligne actionnable, mais sous un en-tête « ×N ».
-  const groupedIrrigation = React.useMemo(() => {
-    const groups = new Map<string, { especeId: string; especeNom?: string; couleur: string | null; items: IrrigationItem[] }>()
-    for (const item of data?.irrigation ?? []) {
-      const existing = groups.get(item.especeId)
-      if (existing) {
-        existing.items.push(item)
-      } else {
-        groups.set(item.especeId, { especeId: item.especeId, especeNom: item.especeNom, couleur: item.couleur, items: [item] })
-      }
-    }
-    // Trie les sous-lignes par date prévue, puis les groupes par taille décroissante.
-    const arr = Array.from(groups.values())
-    arr.forEach(g => g.items.sort((a, b) => new Date(a.datePrevue).getTime() - new Date(b.datePrevue).getTime()))
-    return arr.sort((a, b) => b.items.length - a.items.length || a.especeId.localeCompare(b.especeId))
-  }, [data?.irrigation])
-
-  const fetchData = React.useCallback(async () => {
-    setIsLoading(true)
+  // `silencieux` : recharger sans remplacer la page par le squelette (arrosage
+  // noté avec sa quantité : on reste à sa place dans la liste).
+  const fetchData = React.useCallback(async ({ silencieux = false }: { silencieux?: boolean } = {}) => {
+    if (!silencieux) setIsLoading(true)
     try {
       const response = await fetch(
         `/api/taches?start=${startIso}&end=${endIso}${anneeChoisie !== null ? `&year=${anneeChoisie}` : ""}`
@@ -387,45 +362,44 @@ function TachesContent() {
     }
   }
 
-  // Marquer irrigation planifiée comme faite
-  const marquerIrrigation = async (irrigationId: number) => {
-    const noteStr = actionValue.trim()
+  // Noter l'arrosage d'une planche à arroser aujourd'hui (bilan hydrique).
+  // Avec la quantité versée, le bilan retranche ces litres et la planche peut
+  // rester à arroser ; sans, l'arrosage compte comme complet (ticket QA cmv3japsf).
+  const marquerIrrigation = async (arrosage: ArrosageDuJour, litres: number | null, notes: string | null) => {
     setActionLoading(true)
     try {
-      const response = await fetch(`/api/irrigations/${irrigationId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fait: true,
-          dateEffective: new Date().toISOString(),
-          notes: noteStr || null,
-        }),
-      })
-      if (!response.ok) throw new Error("Erreur")
+      const resultat = await noterArrosage(arrosage.cultureIds, notes, litres, "taches")
+      if (!resultat.ok) throw new Error(resultat.erreur)
 
-      // Retirer de la liste
-      setData(prev => {
-        if (!prev) return prev
-        return {
-          ...prev,
-          irrigation: prev.irrigation.filter(i => i.id !== irrigationId),
-          stats: { ...prev.stats, aIrriguer: prev.stats.aIrriguer - 1 },
-        }
-      })
+      if (litres) {
+        fetchData({ silencieux: true })
+      } else {
+        setData(prev => {
+          if (!prev) return prev
+          return {
+            ...prev,
+            irrigation: prev.irrigation.filter(a => a.cle !== arrosage.cle),
+            stats: { ...prev.stats, aIrriguer: Math.max(0, prev.stats.aIrriguer - 1) },
+          }
+        })
+      }
 
-      toast({
-        title: "Arrosage noté !",
-        description: noteStr || "Irrigation standard",
+      // Un geste de trop s'annule : inverse exact (revue du 2026-10-10).
+      notifierEnregistrement({
+        titre: "Arrosage noté",
+        detail: detailArrosageNote(arrosage.plancheNom ?? arrosage.especes, litres),
+        annuler: async () => {
+          const annule = await annulerArrosage(resultat.annulation)
+          if (!annule.ok) throw new Error(annule.erreur)
+          fetchData({ silencieux: true })
+        },
       })
-      window.dispatchEvent(new CustomEvent("gleba:irrigation-updated", {
-        detail: { source: "tasks-page" },
-      }))
       setPendingAction(null)
-    } catch {
+    } catch (e) {
       toast({
         variant: "destructive",
         title: "Erreur",
-        description: "Impossible de noter l'arrosage",
+        description: e instanceof Error && e.message ? e.message : "Impossible de noter l'arrosage",
       })
     } finally {
       setActionLoading(false)
@@ -474,73 +448,24 @@ function TachesContent() {
         {items.length === 0 ? (
           <p className="text-sm text-muted-foreground py-2">{emptyText}</p>
         ) : (
-          <div className="space-y-2">
+          // P4 « une liste est un registre » (2026-10-09) : liseré d'état,
+          // verbe en pastille, une action et le report en geste secondaire ;
+          // plus de fond rouge ni de badge destructif.
+          <div className="-mx-2">
             {items.map(item => (
-              <div key={item.id} className="flex items-center gap-1">
-              <button
-                onClick={() => toggleTache(item.id, type, item.fait, item.especeId, item.especeNom ?? item.especeId, item.unite)}
-                className={`flex-1 min-w-0 flex items-center gap-3 p-3 rounded-lg border transition-all ${
-                  item.fait
-                    ? "bg-green-50 border-green-200 opacity-60"
-                    : "bg-white border-slate-200 hover:border-slate-300 hover:shadow-sm"
-                }`}
-              >
-                {item.fait ? (
-                  <CheckCircle2 className="h-5 w-5 text-green-600 flex-shrink-0" />
-                ) : (
-                  <Circle className="h-5 w-5 text-slate-300 flex-shrink-0" />
-                )}
-                <div className="flex items-center gap-2 flex-1 min-w-0">
-                  {item.couleur && (
-                    <div
-                      className="w-3 h-3 rounded-full flex-shrink-0"
-                      style={{ backgroundColor: item.couleur }}
-                    />
-                  )}
-                  <span className={`font-medium truncate ${item.fait ? "line-through" : ""}`}>
-                    {item.especeNom ?? item.especeId}
-                  </span>
-                  {item.varieteId && (
-                    <span className="text-sm text-muted-foreground truncate">
-                      {item.varieteNom ?? item.varieteId}
-                    </span>
-                  )}
-                </div>
-                {/* QA cmsjiedps — la page ne montrait ni le retard ni la date
-                    prévue, donc impossible d'identifier les tâches en retard
-                    remontées par le KPI du dashboard. On affiche la date prévue
-                    et un badge de retard rouge le cas échéant. */}
-                {!item.fait && (item.retardJours ?? 0) > 0 && (
-                  <Badge variant="destructive" className="flex-shrink-0">
-                    {(item.retardJours ?? 0) >= 7
-                      ? `${Math.floor((item.retardJours ?? 0) / 7)} sem. de retard`
-                      : `${item.retardJours} j de retard`}
-                  </Badge>
-                )}
-                {item.date && (
-                  <span className="text-xs text-muted-foreground flex-shrink-0 tabular-nums">
-                    {new Date(item.date).toLocaleDateString("fr-FR", { day: "2-digit", month: "2-digit" })}
-                  </span>
-                )}
-                {item.plancheId && (
-                  <Badge variant="outline" className="flex-shrink-0">
-                    {item.plancheId}
-                  </Badge>
-                )}
-              </button>
-              {!item.fait && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-9 px-2 flex-shrink-0 text-muted-foreground"
-                  aria-label="Reporter cette échéance"
-                  title="Reporter cette échéance"
-                  onClick={() => ouvrirReport(item, type)}
-                >
-                  <CalendarClock className="h-4 w-4" />
-                </Button>
-              )}
-              </div>
+              <LigneTache
+                key={item.id}
+                type={type}
+                especeNom={item.especeNom ?? item.especeId}
+                varieteNom={item.varieteId ? item.varieteNom ?? item.varieteId : null}
+                plancheNom={item.plancheId}
+                couleur={item.couleur}
+                date={item.date}
+                fait={item.fait}
+                retardJours={item.retardJours}
+                onAction={() => toggleTache(item.id, type, item.fait, item.especeId, item.especeNom ?? item.especeId, item.unite)}
+                onReporter={() => ouvrirReport(item, type)}
+              />
             ))}
           </div>
         )}
@@ -571,7 +496,7 @@ function TachesContent() {
               </Button>
             </Link>
             <h1 className="text-lg font-bold">Tâches</h1>
-            <Button variant="ghost" size="sm" className="h-8 px-2" onClick={fetchData}>
+            <Button variant="ghost" size="sm" className="h-8 px-2" onClick={() => fetchData()}>
               <RefreshCw className="h-4 w-4" />
             </Button>
           </div>
@@ -648,6 +573,20 @@ function TachesContent() {
           </div>
         )}
 
+        {/* QA cmv2r57qk — « Noter » mène ici : un geste hors de la liste
+            (désherbage, traitement, taille…) se note au registre des
+            interventions, qui n'avait aucun accès depuis le nouvel accueil. */}
+        <Link
+          href="/interventions?nouvelle=1"
+          className="flex min-h-11 items-center justify-between gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50"
+        >
+          <span className="flex items-center gap-2">
+            <ClipboardList className="h-4 w-4 text-orange-600" aria-hidden />
+            Noter une intervention hors liste
+          </span>
+          <span className="text-xs text-slate-500">désherbage, traitement, taille…</span>
+        </Link>
+
         {/* Sections de taches */}
         {data && (
           <>
@@ -683,7 +622,7 @@ function TachesContent() {
               <CardHeader className="pb-2">
                 <CardTitle className="flex items-center gap-2 text-base">
                   <Droplets className="h-5 w-5 text-cyan-600" />
-                  À irriguer
+                  À arroser aujourd&apos;hui
                   {data.irrigation.length > 0 && (
                     <Badge variant="secondary" className="ml-auto">
                       {data.irrigation.length}
@@ -692,69 +631,34 @@ function TachesContent() {
                 </CardTitle>
               </CardHeader>
               <CardContent>
+                {/* Refonte du 2026-10-10 : une planche est à arroser quand le
+                    bilan hydrique d'une de ses cultures l'exige aujourd'hui
+                    (src/lib/irrigation/a-arroser.ts). Plus de plan d'avance. */}
                 {data.irrigation.length === 0 ? (
                   <p className="text-sm text-muted-foreground py-2">
-                    Tout est arrosé !
+                    Aucune planche à arroser aujourd&apos;hui. Le conseil d&apos;irrigation détaille chaque culture.
                   </p>
                 ) : (
-                  // Bug #6 (testeur) — Regroupement par espèce : avant, 20 cultures
-                  // de Tomate produisaient 20 lignes quasi identiques. On affiche
-                  // désormais un en-tête « Tomate ×4 » (nombre de planches) suivi
-                  // des lignes par planche, individuellement actionnables.
-                  <div className="space-y-3">
-                    {groupedIrrigation.map(groupe => (
-                      <div key={groupe.especeId} className="space-y-1.5">
-                        <div className="flex items-center gap-2 px-1">
-                          {groupe.couleur && (
-                            <div
-                              className="w-3 h-3 rounded-full flex-shrink-0"
-                              style={{ backgroundColor: groupe.couleur }}
-                            />
-                          )}
-                          <span className="font-semibold text-sm">{groupe.especeNom ?? groupe.especeId}</span>
-                          {groupe.items.length > 1 && (
-                            <Badge variant="secondary" className="text-xs">
-                              ×{groupe.items.length}
-                            </Badge>
-                          )}
-                        </div>
-                        {groupe.items.map(item => {
-                          const datePrevue = new Date(item.datePrevue)
-                          const isToday = datePrevue.toDateString() === new Date().toDateString()
-                          const isPast = datePrevue < new Date() && !isToday
-
-                          return (
-                            <button
-                              key={item.id}
-                              onClick={() => {
-                                setActionValue("")
-                                setPendingAction({
-                                  kind: "irrigation",
-                                  irrigationId: item.id,
-                                  label: `${groupe.especeNom ?? groupe.especeId} · ${item.plancheId || "Sans planche"}`,
-                                })
-                              }}
-                              className={`w-full flex items-center gap-3 p-2.5 pl-5 rounded-lg border bg-white transition-all ${
-                                isPast ? 'border-red-300 bg-red-50' : 'border-slate-200 hover:border-cyan-300 hover:shadow-sm'
-                              }`}
-                            >
-                              <Droplets className={`h-4 w-4 flex-shrink-0 ${
-                                isPast ? 'text-red-600' : isToday ? 'text-cyan-600' : 'text-blue-500'
-                              }`} />
-                              <div className="flex items-center gap-2 flex-1 min-w-0">
-                                <span className="text-sm text-muted-foreground truncate">
-                                  {item.plancheId || 'Sans planche'}
-                                </span>
-                              </div>
-                              <span className={`text-sm ${
-                                isPast ? 'text-red-600 font-medium' : isToday ? 'text-cyan-600' : 'text-blue-500'
-                              }`}>
-                                {isToday ? "Aujourd'hui" : format(datePrevue, "EEE d", { locale: fr })}
-                              </span>
-                            </button>
-                          )
-                        })}
-                      </div>
+                  <div className="rounded-lg border border-lin-doux bg-craie">
+                    {data.irrigation.map(arrosage => (
+                      <LigneArrosage
+                        key={arrosage.cle}
+                        titre={arrosage.plancheNom ?? arrosage.especes}
+                        urgence={arrosage.urgence}
+                        details={[
+                          arrosage.plancheNom ? arrosage.especes : null,
+                          arrosage.cultureIds.length > 1 ? `${arrosage.cultureIds.length} cultures` : null,
+                          arrosage.raison,
+                          arrosage.sousAbri ? "sous abri" : null,
+                        ]}
+                        onAction={() => {
+                          setPendingAction({
+                            kind: "irrigation",
+                            arrosage,
+                            label: [arrosage.plancheNom, arrosage.especes].filter(Boolean).join(" · "),
+                          })
+                        }}
+                      />
                     ))}
                   </div>
                 )}
@@ -811,33 +715,14 @@ function TachesContent() {
           )}
 
           {pendingAction?.kind === "irrigation" && (
-            <>
-              <DialogHeader>
-                <div className="mb-2 flex h-11 w-11 items-center justify-center rounded-xl bg-cyan-100">
-                  <Droplets className="h-5 w-5 text-cyan-600" />
-                </div>
-                <DialogTitle>Confirmer l’arrosage</DialogTitle>
-                <DialogDescription>{pendingAction.label}</DialogDescription>
-              </DialogHeader>
-              <div className="space-y-2 rounded-xl border border-cyan-200 bg-cyan-50/60 p-4">
-                <Label htmlFor="task-irrigation-notes">Observation facultative</Label>
-                <Textarea
-                  id="task-irrigation-notes"
-                  autoFocus
-                  value={actionValue}
-                  onChange={(e) => setActionValue(e.target.value)}
-                  placeholder="Sol sec, pluie récente, quantité ajustée…"
-                  className="min-h-24 resize-none bg-white"
-                />
-              </div>
-              <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-                <Button variant="outline" onClick={() => setPendingAction(null)} disabled={actionLoading}>Retour</Button>
-                <Button onClick={() => marquerIrrigation(pendingAction.irrigationId)} disabled={actionLoading}>
-                  {actionLoading && <RefreshCw className="mr-2 h-4 w-4 animate-spin" />}
-                  Confirmer l’arrosage
-                </Button>
-              </div>
-            </>
+            <SaisieArrosage
+              key={pendingAction.arrosage.cle}
+              arrosage={pendingAction.arrosage}
+              libelle={pendingAction.label}
+              enCours={actionLoading}
+              onNoter={(litres, notes) => marquerIrrigation(pendingAction.arrosage, litres, notes)}
+              onRetour={() => setPendingAction(null)}
+            />
           )}
 
           {pendingAction?.kind === "report" && (

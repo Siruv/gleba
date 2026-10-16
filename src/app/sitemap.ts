@@ -11,6 +11,9 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   // Dates éditoriales réelles : ne pas annoncer artificiellement une mise à
   // jour à chaque génération du sitemap.
   const marketingUpdatedAt = new Date("2026-08-01");
+  // Refonte de la vitrine dans la charte « carnet de ferme » et écran
+  // Aujourd'hui : accueil et pages métier réécrits le 2026-10-10.
+  const vitrineUpdatedAt = new Date("2026-10-10");
   const seoPriorityByPath: Record<string, number> = {
     "/logiciel-micro-ferme": 1.0,
     "/logiciel-maraichage": 0.95,
@@ -24,13 +27,17 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     "/assistant-ia-agricole": 0.75,
     "/logiciel-permaculture": 0.7,
     "/logiciel-potager": 0.65,
+    "/plan-de-ferme": 0.8,
+    "/carnet-de-culture": 0.75,
+    "/registre-phytosanitaire-numerique": 0.8,
+    "/comparatif-logiciels-maraichage": 0.8,
   };
 
   // Pages principales
   const corePages: MetadataRoute.Sitemap = [
     {
       url: baseUrl,
-      lastModified: marketingUpdatedAt,
+      lastModified: vitrineUpdatedAt,
       changeFrequency: "weekly",
       priority: 1.0,
     },
@@ -70,9 +77,13 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     "/registre-phytosanitaire",
     "/calendrier-semis",
     "/assistant-ia-agricole",
+    "/plan-de-ferme",
+    "/carnet-de-culture",
+    "/registre-phytosanitaire-numerique",
+    "/comparatif-logiciels-maraichage",
   ].map((path) => ({
     url: `${baseUrl}${path}`,
-    lastModified: marketingUpdatedAt,
+    lastModified: vitrineUpdatedAt,
     changeFrequency: "monthly" as const,
     priority: seoPriorityByPath[path] ?? 0.7,
   }));

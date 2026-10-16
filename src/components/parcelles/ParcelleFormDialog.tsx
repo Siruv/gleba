@@ -39,6 +39,10 @@ export function ParcelleFormDialog({ open, parcelle, onClose }: ParcelleFormDial
   const [couches, setCouches] = useState<string[]>([])
   // QA cmswu0bql — le texte du dialogue annonçait le type de sol sans champ.
   const [typeSol, setTypeSol] = useState("")
+  // Sol enregistré hors liste canonique, gardé en option jusqu'à la fermeture.
+  const solEnregistre = parcelle?.typeSol || ""
+  const solHerite =
+    [typeSol, solEnregistre].find((v) => v && !TYPE_SOL_OPTIONS.some((opt) => opt.value === v)) ?? null
   const [geometry, setGeometry] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
@@ -73,7 +77,7 @@ export function ParcelleFormDialog({ open, parcelle, onClose }: ParcelleFormDial
     const formData = { nom: nom.trim(), geometry: geometry || "", couches, typeSol: typeSol || null }
     const validation = createParcelleSchema.safeParse(formData)
     if (!validation.success) {
-      const msg = validation.error.issues[0]?.message || "Donnees invalides"
+      const msg = validation.error.issues[0]?.message || "Données invalides"
       toast({ variant: "destructive", title: "Erreur de validation", description: msg })
       return
     }
@@ -105,7 +109,7 @@ export function ParcelleFormDialog({ open, parcelle, onClose }: ParcelleFormDial
 
       toast({
         title: isEdit ? "Parcelle modifiée" : "Parcelle créée",
-        description: `"${nom.trim()}" a ete ${isEdit ? "modifiee" : "creee"}`,
+        description: `« ${nom.trim()} » a été ${isEdit ? "modifiée" : "créée"}`,
       })
       onClose(true)
     } catch (err) {
@@ -145,7 +149,7 @@ export function ParcelleFormDialog({ open, parcelle, onClose }: ParcelleFormDial
           </div>
 
           <div className="space-y-2">
-            <Label>Couches d'activite</Label>
+            <Label>Couches d’activité</Label>
             <div className="flex flex-wrap gap-3">
               {COUCHES_ACTIVITE.map((couche) => (
                 <label key={couche} className="flex items-center gap-2 cursor-pointer">
@@ -174,10 +178,10 @@ export function ParcelleFormDialog({ open, parcelle, onClose }: ParcelleFormDial
                   <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
                 ))}
                 {/* Valeur héritée hors liste (ex. limono-argileux) : proposée
-                    telle quelle pour ne pas l'écraser en mode édition. */}
-                {typeSol && !TYPE_SOL_OPTIONS.some((opt) => opt.value === typeSol) && (
-                  <SelectItem value={typeSol}>{typeSol}</SelectItem>
-                )}
+                    telle quelle pour ne pas l'écraser en mode édition, et
+                    tant que la fenêtre est ouverte, même après un autre choix
+                    (ticket QA cmv2rfzqs : on ne pouvait plus y revenir). */}
+                {solHerite && <SelectItem value={solHerite}>{solHerite}</SelectItem>}
               </SelectContent>
             </Select>
           </div>

@@ -33,6 +33,8 @@ import { confirmDialog } from "@/lib/global-dialog"
 import { libelleCulture } from "@/lib/cultures/label"
 import { ZntFieldset } from "@/components/phyto/ZntFieldset"
 import { todayLocalISO } from '@/lib/format-utils'
+import { TYPES_INTERVENTION, libelleTypeIntervention } from "@/lib/interventions/types"
+import { EVENEMENT_NOUVELLE_INTERVENTION } from "@/lib/accueil/evenements"
 import {
   Sprout,
   TreeDeciduous,
@@ -95,6 +97,8 @@ interface Intervention {
   // Source tracking (virtual entries from other modules)
   source: 'intervention' | 'culture' | 'irrigation' | 'fertilisation' | 'operation_arbre' | 'soin_animal'
   sourceLabel: string | null
+  /** Arrosage noté (« Noter ») : id de sa trace, modifiable ou supprimable ici. */
+  irrigationId?: number
   cultureNom: string | null
   plancheNom: string | null
 }
@@ -159,54 +163,46 @@ function valeurOptionPlancheRef(ref: string | null | undefined, planches: Planch
 // Constants
 // ============================================================
 
-const TYPE_OPTIONS = [
-  { value: "semis", label: "Semis" },
-  { value: "plantation", label: "Plantation" },
-  { value: "desherbage", label: "Désherbage" },
-  { value: "binage", label: "Binage" },
-  { value: "paillage", label: "Paillage" },
-  { value: "traitement_phyto", label: "Traitement phyto" },
-  { value: "fertilisation", label: "Fertilisation" },
-  { value: "recolte", label: "Récolte" },
-  { value: "taille", label: "Taille" },
-  { value: "arrosage", label: "Arrosage" },
-  { value: "tuteurage", label: "Tuteurage" },
-  { value: "autre", label: "Autre" },
-] as const
+// Liste partagée avec la traçabilité et l'accueil (QA cmv2r21ns).
+const TYPE_OPTIONS = TYPES_INTERVENTION
 
 const TYPE_COLORS: Record<string, { bg: string; text: string }> = {
   semis: { bg: "bg-green-100", text: "text-green-800" },
+  repiquage: { bg: "bg-green-100", text: "text-green-800" },
   plantation: { bg: "bg-emerald-100", text: "text-emerald-800" },
   desherbage: { bg: "bg-yellow-100", text: "text-yellow-800" },
   binage: { bg: "bg-amber-100", text: "text-amber-800" },
+  eclaircissage: { bg: "bg-amber-100", text: "text-amber-800" },
   paillage: { bg: "bg-orange-100", text: "text-orange-800" },
   traitement_phyto: { bg: "bg-red-100", text: "text-red-800" },
   fertilisation: { bg: "bg-purple-100", text: "text-purple-800" },
   recolte: { bg: "bg-blue-100", text: "text-blue-800" },
   taille: { bg: "bg-cyan-100", text: "text-cyan-800" },
+  pincement: { bg: "bg-cyan-100", text: "text-cyan-800" },
+  ebourgeonnage: { bg: "bg-cyan-100", text: "text-cyan-800" },
   arrosage: { bg: "bg-sky-100", text: "text-sky-800" },
+  palissage: { bg: "bg-slate-100", text: "text-slate-800" },
   tuteurage: { bg: "bg-slate-100", text: "text-slate-800" },
   autre: { bg: "bg-slate-100", text: "text-slate-800" },
-}
-
-const TYPE_LABELS: Record<string, string> = {
-  semis: "Semis",
-  plantation: "Plantation",
-  desherbage: "Désherbage",
-  binage: "Binage",
-  paillage: "Paillage",
-  traitement_phyto: "Traitement phyto",
-  fertilisation: "Fertilisation",
-  recolte: "Récolte",
-  taille: "Taille",
-  arrosage: "Arrosage",
-  tuteurage: "Tuteurage",
-  autre: "Autre",
 }
 
 // QA Camille 2026-05-15 — bonus : plage factorisée [N+1 … N-4]
 const currentYearNow = new Date().getFullYear()
 const availableYears = getAvailableYears()
+
+/**
+ * Ticket QA cmv4z983m — l'URL est la source de vérité du filtre d'année
+ * (`?annee=`), pour qu'un rechargement ou un lien partagé gardent 2025.
+ * Les paramètres d'ouverture (`nouvelle`, `prefill`) sont retirés sans toucher
+ * au reste de la requête.
+ */
+function urlSansOuverture(): string {
+  const sp = new URLSearchParams(window.location.search)
+  sp.delete("nouvelle")
+  sp.delete("prefill")
+  const q = sp.toString()
+  return q ? `${window.location.pathname}?${q}` : window.location.pathname
+}
 
 // ============================================================
 // Helper functions
@@ -214,6 +210,17 @@ const availableYears = getAvailableYears()
 
 function formatEuro(value: number) {
   return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(value)
+}
+
+/**
+ * Jour AAAA-MM-JJ d'une date d'intervention : une date de calendrier (minuit
+ * UTC, formulaire) garde son jour ; un horodatage (assistant, ancien « Noter »)
+ * prend le jour local. `split("T")` avançait d'un jour un arrosage du soir aux
+ * Antilles, que la garde « date dans le futur » refusait ensuite (revue QA
+ * cmv3jatw8).
+ */
+function jourSaisi(iso: string): string {
+  return /T00:00:00(\.000)?Z$/.test(iso) ? iso.slice(0, 10) : new Date(iso).toLocaleDateString("sv-SE")
 }
 
 function formatDate(dateStr: string) {
@@ -249,12 +256,28 @@ export default function InterventionsPage() {
   const [filterDateTo, setFilterDateTo] = React.useState("")
   const [filterFait, setFilterFait] = React.useState<string>("all") // "all" | "true" | "false"
   const [selectedYear, setSelectedYear] = React.useState(currentYearNow)
+  // Vrai une fois `?annee=` lu : la première lecture attend l'année de l'URL
+  // au lieu de charger l'année courante puis la bonne (ticket cmv4z983m).
+  const [anneeRestauree, setAnneeRestauree] = React.useState(false)
+  const changerAnnee = React.useCallback((annee: number) => {
+    setSelectedYear(annee)
+    const sp = new URLSearchParams(window.location.search)
+    sp.set("annee", String(annee))
+    // Un filtre n'encombre pas l'historique (replace) ; l'API History suffit,
+    // `router.replace` sur le même chemin est ignoré après préchargement.
+    // État `null` et non celui de Next : avec lui, le routeur ne voit pas la
+    // nouvelle URL et la réécrirait sans `annee` à sa prochaine mise à jour
+    // (cf. use-annee-planification.ts, relecture du 2026-10-12).
+    window.history.replaceState(null, "", `${window.location.pathname}?${sp.toString()}`)
+  }, [])
   const [searchText, setSearchText] = React.useState("")
 
   // UI state
   const [expandedRow, setExpandedRow] = React.useState<number | null>(null)
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [editingIntervention, setEditingIntervention] = React.useState<Intervention | null>(null)
+  // Arrosage noté en cours de complément : l'intervention créée le remplace.
+  const [arrosageAComplete, setArrosageAComplete] = React.useState<number | null>(null)
   const [isSubmitting, setIsSubmitting] = React.useState(false)
 
   // Form state
@@ -302,6 +325,17 @@ export default function InterventionsPage() {
   React.useEffect(() => {
     if (typeof window === "undefined") return
     const sp = new URLSearchParams(window.location.search)
+    // Ticket cmv4z983m — année du deep-link, si elle est dans la plage du sélecteur.
+    const anneeUrl = Number.parseInt(sp.get("annee") ?? "", 10)
+    if (availableYears.includes(anneeUrl)) setSelectedYear(anneeUrl)
+    setAnneeRestauree(true)
+    // QA cmv2r57qk — « Noter une intervention » depuis la navigation de
+    // l'accueil (palette, Tâches) ouvre directement une fiche vierge.
+    if (sp.get("nouvelle") === "1") {
+      setDialogOpen(true)
+      window.history.replaceState(null, "", urlSansOuverture())
+      return
+    }
     const prefill = sp.get("prefill")
     if (!prefill) return
     const params = new URLSearchParams(prefill)
@@ -320,7 +354,7 @@ export default function InterventionsPage() {
     // QA cmsno1hct — sans nettoyage, `?prefill=` survivait au reload : la
     // modale se rouvrait pré-remplie après F5, donnant l'impression que la
     // saisie précédente n'avait jamais été enregistrée.
-    window.history.replaceState(window.history.state, "", window.location.pathname)
+    window.history.replaceState(null, "", urlSansOuverture())
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -405,10 +439,10 @@ export default function InterventionsPage() {
   }, [])
 
   React.useEffect(() => {
-    if (session?.user) {
+    if (session?.user && anneeRestauree) {
       fetchInterventions()
     }
-  }, [session?.user, fetchInterventions])
+  }, [session?.user, fetchInterventions, anneeRestauree])
 
   React.useEffect(() => {
     if (session?.user) {
@@ -423,6 +457,21 @@ export default function InterventionsPage() {
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
     if (isSubmitting) return
+    // Ticket QA cmv3jatw8 : une intervention réalisée datée d'après aujourd'hui
+    // (arrosage du 12/10 coché « réalisé » le 11/10) brouillait le dernier
+    // arrosage du conseil d'irrigation.
+    // Seulement sur un geste de l'utilisateur : une intervention déjà réalisée
+    // dont ni la date ni l'état ne changent s'enregistre telle quelle (revue).
+    const dateOuEtatChange =
+      !editingIntervention || !editingIntervention.fait || form.date !== jourSaisi(editingIntervention.date)
+    if (form.fait && dateOuEtatChange && form.date > todayLocalISO()) {
+      toast({
+        variant: "destructive",
+        title: "Date dans le futur",
+        description: "Une intervention réalisée se date au plus tard aujourd'hui. Datez-la du jour où elle a été faite, ou laissez-la planifiée.",
+      })
+      return
+    }
 
     const dureeMinutes =
       (form.dureeHeures ? parseInt(form.dureeHeures) * 60 : 0) +
@@ -473,7 +522,11 @@ export default function InterventionsPage() {
         ? "/api/interventions"
         : "/api/interventions"
       const method = editingIntervention ? "PATCH" : "POST"
-      const payload = editingIntervention ? { id: editingIntervention.id, ...body } : body
+      const payload = editingIntervention
+        ? { id: editingIntervention.id, ...body }
+        : arrosageAComplete
+          ? { ...body, remplaceArrosageNoteId: arrosageAComplete }
+          : body
 
       const res = await fetch(url, {
         method,
@@ -488,6 +541,7 @@ export default function InterventionsPage() {
         })
         setDialogOpen(false)
         setEditingIntervention(null)
+        setArrosageAComplete(null)
         setForm(emptyForm)
         fetchInterventions()
       } else {
@@ -508,6 +562,16 @@ export default function InterventionsPage() {
   }
 
   const handleMarkDone = async (intervention: Intervention) => {
+    // Ticket QA cmv2resok : une intervention réalisée exige sa durée (coût de
+    // main-d'œuvre). Sans durée, ce bouton échouait sur un « Impossible de
+    // modifier » muet : on ouvre la fiche, cochée « Réalisée », pour la saisir.
+    if (!intervention.dureeMinutes) {
+      handleEdit(intervention)
+      // Réalisée maintenant : une date prévue plus tard devient celle du jour (QA cmv3jatw8).
+      setForm((f) => ({ ...f, fait: true, date: f.date > todayLocalISO() ? todayLocalISO() : f.date }))
+      toast({ title: "Durée à renseigner", description: "Indiquez le temps passé pour marquer l'intervention comme réalisée." })
+      return
+    }
     try {
       const res = await fetch("/api/interventions", {
         method: "PATCH",
@@ -522,10 +586,57 @@ export default function InterventionsPage() {
         toast({ title: "Fait", description: "Intervention marquée comme réalisée" })
         fetchInterventions()
       } else {
-        throw new Error()
+        const d = await res.json().catch(() => ({}))
+        throw new Error(d.error ?? `Erreur ${res.status}`)
       }
-    } catch {
-      toast({ variant: "destructive", title: "Erreur", description: "Impossible de modifier" })
+    } catch (e) {
+      toast({
+        variant: "destructive",
+        title: "Erreur",
+        description: e instanceof Error && e.message ? e.message : "Impossible de modifier",
+      })
+    }
+  }
+
+  // Ticket QA cmv2rfmzl : un arrosage noté se complète (volume, durée,
+  // méthode) en intervention « arrosage », qui le remplace au registre et
+  // dans le bilan hydrique, ou se supprime.
+  const handleCompleterArrosage = (intervention: Intervention) => {
+    if (!intervention.irrigationId) return
+    setEditingIntervention(null)
+    setArrosageAComplete(intervention.irrigationId)
+    setForm({
+      ...emptyForm,
+      date: intervention.date ? new Date(intervention.date).toLocaleDateString("sv-SE") : todayLocalISO(),
+      type: "arrosage",
+      cultureId: intervention.cultureId?.toString() || "",
+      plancheId: valeurOptionPlancheRef(intervention.plancheId, planches),
+      fait: true,
+      intrantNom: "Eau",
+      intrantUnite: "L",
+      notes: intervention.notes && intervention.notes !== "Arrosage noté" ? intervention.notes : "",
+    })
+    setDialogOpen(true)
+  }
+
+  const handleSupprimerArrosage = async (intervention: Intervention) => {
+    if (!intervention.irrigationId) return
+    if (!(await confirmDialog("Supprimer cet arrosage noté ? « Noter » arrose toute la planche : il est retiré pour toutes ses cultures, et le conseil d'irrigation est recalculé sans lui."))) return
+    try {
+      const res = await fetch(`/api/cultures/irriguer?traceId=${intervention.irrigationId}`, { method: "DELETE" })
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}))
+        throw new Error(d.error ?? `Erreur ${res.status}`)
+      }
+      toast({ title: "Supprimé", description: "Arrosage noté supprimé" })
+      window.dispatchEvent(new CustomEvent("gleba:irrigation-updated", { detail: { source: "interventions" } }))
+      fetchInterventions()
+    } catch (e) {
+      toast({
+        variant: "destructive",
+        title: "Erreur",
+        description: e instanceof Error && e.message ? e.message : "Impossible de supprimer l'arrosage",
+      })
     }
   }
 
@@ -547,9 +658,10 @@ export default function InterventionsPage() {
 
   const handleEdit = (intervention: Intervention) => {
     const totalMin = intervention.dureeMinutes || 0
+    setArrosageAComplete(null)
     setEditingIntervention(intervention)
     setForm({
-      date: intervention.date ? intervention.date.split("T")[0] : todayLocalISO(),
+      date: intervention.date ? jourSaisi(intervention.date) : todayLocalISO(),
       type: intervention.type,
       cultureId: intervention.cultureId?.toString() || "",
       plancheId: valeurOptionPlancheRef(intervention.plancheId, planches),
@@ -586,9 +698,20 @@ export default function InterventionsPage() {
 
   const handleOpenNew = () => {
     setEditingIntervention(null)
+    setArrosageAComplete(null)
     setForm(emptyForm)
     setDialogOpen(true)
   }
+
+  // QA cmv2r57qk — « Noter une intervention » depuis la palette alors que le
+  // registre est déjà affiché : pas de remontage, donc pas de `?nouvelle=1`.
+  const ouvrirNouvelleRef = React.useRef(handleOpenNew)
+  ouvrirNouvelleRef.current = handleOpenNew
+  React.useEffect(() => {
+    const ouvrir = () => ouvrirNouvelleRef.current()
+    window.addEventListener(EVENEMENT_NOUVELLE_INTERVENTION, ouvrir)
+    return () => window.removeEventListener(EVENEMENT_NOUVELLE_INTERVENTION, ouvrir)
+  }, [])
 
   const clearFilters = () => {
     setFilterType("")
@@ -606,7 +729,7 @@ export default function InterventionsPage() {
     if (!searchText) return interventions
     const lower = searchText.toLowerCase()
     return interventions.filter((i) => {
-      const typeLabel = TYPE_LABELS[i.type] || i.type
+      const typeLabel = libelleTypeIntervention(i.type)
       return (
         typeLabel.toLowerCase().includes(lower) ||
         (i.description && i.description.toLowerCase().includes(lower)) ||
@@ -724,7 +847,7 @@ export default function InterventionsPage() {
           <div className="flex flex-wrap items-center gap-2">
             <select
               value={selectedYear}
-              onChange={(e) => setSelectedYear(parseInt(e.target.value))}
+              onChange={(e) => changerAnnee(parseInt(e.target.value))}
               className="h-9 rounded-md border border-input bg-background px-3 text-sm"
             >
               {availableYears.map((y) => (
@@ -737,6 +860,7 @@ export default function InterventionsPage() {
               setDialogOpen(open)
               if (!open) {
                 setEditingIntervention(null)
+                setArrosageAComplete(null)
                 setForm(emptyForm)
               }
             }}>
@@ -752,7 +876,11 @@ export default function InterventionsPage() {
               <DialogContent className="max-w-2xl max-h-[90dvh] overflow-y-auto">
                 <DialogHeader>
                   <DialogTitle>
-                    {editingIntervention ? "Modifier l'intervention" : "Nouvelle intervention"}
+                    {editingIntervention
+                      ? "Modifier l'intervention"
+                      : arrosageAComplete
+                        ? "Compléter l'arrosage noté"
+                        : "Nouvelle intervention"}
                   </DialogTitle>
                   <DialogDescription>
                     {editingIntervention ? "Modifiez les champs puis enregistrez." : "Remplissez les informations de l'intervention."}
@@ -776,7 +904,10 @@ export default function InterventionsPage() {
                       <Input
                         type="date"
                         value={form.date}
-                        onChange={(e) => setForm({ ...form, date: e.target.value })}
+                        // Une date future se planifie : « Réalisée » se décoche (QA cmv3jatw8).
+                        onChange={(e) =>
+                          setForm({ ...form, date: e.target.value, ...(e.target.value > todayLocalISO() ? { fait: false } : {}) })
+                        }
                         required
                       />
                     </div>
@@ -784,7 +915,16 @@ export default function InterventionsPage() {
                       <Label>Type</Label>
                       <select
                         value={form.type}
-                        onChange={(e) => setForm({ ...form, type: e.target.value })}
+                        onChange={(e) =>
+                          setForm({
+                            ...form,
+                            type: e.target.value,
+                            // Un arrosage se compte en litres, pas en « kg » (unité par défaut).
+                            ...(e.target.value === "arrosage" && form.intrantUnite === "kg" && !form.intrantQuantite
+                              ? { intrantUnite: "L", intrantNom: form.intrantNom || "Eau" }
+                              : {}),
+                          })
+                        }
                         className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
                         required
                       >
@@ -800,11 +940,22 @@ export default function InterventionsPage() {
                         <input
                           type="checkbox"
                           checked={form.fait}
-                          onChange={(e) => setForm({ ...form, fait: e.target.checked })}
+                          // Réalisée : au plus tard aujourd'hui (QA cmv3jatw8).
+                          onChange={(e) =>
+                            setForm({
+                              ...form,
+                              fait: e.target.checked,
+                              ...(e.target.checked && form.date > todayLocalISO() ? { date: todayLocalISO() } : {}),
+                            })
+                          }
                           className="rounded"
                         />
                         <span className="text-sm">{form.fait ? "Réalisée" : "Planifiée"}</span>
                       </label>
+                      {/* Ticket QA cmv2resok : passer en « Réalisée » exige la durée (refus serveur sinon). */}
+                      {form.fait && editingIntervention && !editingIntervention.fait && !form.dureeHeures && !Number(form.dureeMinutesForm) && (
+                        <span className="text-xs text-amber-700 pb-2">Durée requise</span>
+                      )}
                     </div>
                   </div>
 
@@ -1297,7 +1448,7 @@ export default function InterventionsPage() {
                     {filteredInterventions.map((intervention) => {
                       const isExpanded = expandedRow === intervention.id
                       const typeColor = TYPE_COLORS[intervention.type] || TYPE_COLORS.autre
-                      const typeLabel = TYPE_LABELS[intervention.type] || intervention.type
+                      const typeLabel = libelleTypeIntervention(intervention.type)
 
                       // Try to find culture name
                       const isVirtual = intervention.source !== 'intervention'
@@ -1370,7 +1521,28 @@ export default function InterventionsPage() {
                                 className="flex items-center justify-end gap-1"
                                 onClick={(e) => e.stopPropagation()}
                               >
-                                {isVirtual ? (
+                                {intervention.source === 'irrigation' && intervention.irrigationId ? (
+                                  <>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className="h-7 px-2 text-blue-700 hover:text-blue-800 hover:bg-blue-50"
+                                      onClick={() => handleCompleterArrosage(intervention)}
+                                      title="Compléter (volume, durée, méthode)"
+                                    >
+                                      <Pencil className="h-4 w-4" />
+                                    </Button>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className="h-7 px-2 text-red-700 hover:text-red-800 hover:bg-red-50"
+                                      onClick={() => handleSupprimerArrosage(intervention)}
+                                      title="Supprimer l'arrosage noté"
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                    </Button>
+                                  </>
+                                ) : isVirtual ? (
                                   <span className="text-xs text-muted-foreground italic">
                                     {intervention.source === 'culture' ? 'via Cultures' : intervention.source === 'irrigation' ? 'via Irrigations' : intervention.source === 'fertilisation' ? 'via Fertilisations' : intervention.source === 'operation_arbre' ? 'via Verger' : intervention.source === 'soin_animal' ? 'via Elevage' : ''}
                                   </span>

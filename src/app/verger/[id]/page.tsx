@@ -21,6 +21,7 @@ import { GpsMapPickerDialog } from "@/components/gps/GpsMapPickerDialog"
 import { roundCoord } from "@/lib/geolocation"
 import { parcelleCompatibleVerger } from "@/lib/verger/lot-arbres"
 import { CONDUITES_ARBRE, ETATS_ARBRE as ETATS } from "@/lib/verger/arbre-constants"
+import { labelStatutRecolteArbre } from "@/lib/verger/statut-recolte-arbre"
 
 interface Arbre {
   id: number
@@ -83,9 +84,11 @@ interface FournisseurRef {
   id?: string | null
 }
 
-const TYPE_TO_REF: Record<string, string> = {
-  fruitier: "arbre_fruitier",
-  petit_fruit: "petit_fruit",
+// Types d'espèce du référentiel proposés selon la conduite de l'arbre ; une
+// liane (kiwi, vigne) se conduit en fruitier ou en petit fruit (2026-10-08).
+const TYPE_TO_REF: Record<string, readonly string[]> = {
+  fruitier: ["arbre_fruitier", "liane"],
+  petit_fruit: ["petit_fruit", "liane"],
 }
 
 const TYPES_ARBRES = [
@@ -180,9 +183,9 @@ export default function DetailArbrePage() {
   }, [id])
 
   const especeOptions = React.useMemo(() => {
-    const refType = arbre ? TYPE_TO_REF[arbre.type] : null
-    const refEspeces = refType
-      ? especesRef.filter(e => e.type === refType).map(e => e.id)
+    const refTypes = arbre ? TYPE_TO_REF[arbre.type] : null
+    const refEspeces = refTypes
+      ? especesRef.filter(e => refTypes.includes(e.type)).map(e => e.id)
       : especesRef.map(e => e.id)
     return [...new Set([...refEspeces, ...suggestions.especes])]
       .sort()
@@ -851,8 +854,8 @@ export default function DetailArbrePage() {
                               {new Date(r.date).toLocaleDateString("fr-FR")}
                             </td>
                             <td className="p-2 text-right font-medium">{r.quantite} kg</td>
-                            <td className="p-2">{r.qualite || "—"}</td>
-                            <td className="p-2">{r.statut}</td>
+                            <td className="p-2 capitalize">{r.qualite || "—"}</td>
+                            <td className="p-2">{labelStatutRecolteArbre(r.statut)}</td>
                           </tr>
                         ))}
                       </tbody>

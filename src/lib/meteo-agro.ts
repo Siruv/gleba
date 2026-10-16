@@ -5,6 +5,11 @@
  */
 
 import type { MeteoJournaliere, MeteoPrevision } from './meteo'
+import { SEUIL_PLUIE_SIGNIFICATIVE } from './irrigation/seuils'
+import { kcAuStade, phraseVolume, profilEspece, volumeArrosage } from './irrigation/bilan-sol'
+import { bilanCulture, joursDepuisArrosage, type CultureBilan } from './irrigation/bilan-culture'
+import type { ArrosageSaisi } from './irrigation/arrosages-saisis'
+import { pluieSeptDerniersJours, type MeteoBilan } from './irrigation/meteo-bilan'
 
 // ============================================================
 // TYPES
@@ -62,49 +67,13 @@ export interface EnsoleillementResume {
 // COEFFICIENTS CULTURAUX (Kc) - FAO 56
 // ============================================================
 
-// Kc par categorie d'espece et stade phénologique
-const KC_VALUES: Record<string, { initial: number; midSeason: number; late: number }> = {
-  // Légumes-fruits
-  'Tomate': { initial: 0.6, midSeason: 1.15, late: 0.8 },
-  'Courgette': { initial: 0.5, midSeason: 1.0, late: 0.8 },
-  'Concombre': { initial: 0.6, midSeason: 1.0, late: 0.75 },
-  'Poivron': { initial: 0.6, midSeason: 1.05, late: 0.9 },
-  'Aubergine': { initial: 0.6, midSeason: 1.05, late: 0.9 },
-  'Melon': { initial: 0.5, midSeason: 1.05, late: 0.75 },
-  // Légumes-feuilles
-  'Salade': { initial: 0.7, midSeason: 1.0, late: 0.95 },
-  'Épinard': { initial: 0.7, midSeason: 1.0, late: 0.95 },
-  'Chou': { initial: 0.7, midSeason: 1.05, late: 0.95 },
-  // Légumes-racines
-  'Carotte': { initial: 0.7, midSeason: 1.05, late: 0.95 },
-  'Oignon': { initial: 0.7, midSeason: 1.05, late: 0.75 },
-  'Pomme de terre': { initial: 0.5, midSeason: 1.15, late: 0.75 },
-  'Betterave': { initial: 0.5, midSeason: 1.05, late: 0.95 },
-  // Légumineuses
-  'Haricot': { initial: 0.4, midSeason: 1.15, late: 0.35 },
-  'Pois': { initial: 0.5, midSeason: 1.15, late: 0.3 },
-  // Défaut
-  'default': { initial: 0.6, midSeason: 1.0, late: 0.8 },
-}
-
 /**
- * Estime le coefficient cultural Kc en fonction de l'espece et du stade
- * stadeRatio: 0 = semis, 0.5 = pleine croissance, 1.0 = fin de cycle
+ * Coefficient cultural au stade (0 = semis, 0,5 = pleine croissance, 1 = fin
+ * de cycle). Une seule table d'espèces depuis le 2026-10-10 : celle du moteur
+ * de bilan hydrique (`src/lib/irrigation/bilan-sol.ts`, FAO-56 tableau 12).
  */
 export function getKc(espece: string, stadeRatio: number): number {
-  // Normaliser la casse : "tomate" → "Tomate" pour correspondre aux clés KC_VALUES
-  const especeNormalized = espece.charAt(0).toUpperCase() + espece.slice(1).toLowerCase()
-  const kc = KC_VALUES[especeNormalized] || KC_VALUES[espece] || KC_VALUES['default']
-
-  if (stadeRatio < 0.25) return kc.initial
-  if (stadeRatio < 0.75) {
-    // Interpolation linéaire initial → midSeason
-    const t = (stadeRatio - 0.25) / 0.5
-    return kc.initial + t * (kc.midSeason - kc.initial)
-  }
-  // Interpolation midSeason → late
-  const t = (stadeRatio - 0.75) / 0.25
-  return kc.midSeason + t * (kc.late - kc.midSeason)
+  return kcAuStade(profilEspece(espece, 3), stadeRatio)
 }
 
 // ============================================================
@@ -183,239 +152,75 @@ export function calculerDegreJours(
 // ============================================================
 
 /**
- * Génère des recommandations d'irrigation intelligentes
- * Combine : données météo réelles + prévisions + sol + besoins culture
+ * Recommandation d'irrigation d'une culture pour le conseiller du Calendrier
+ * potager et de /meteo.
+ *
+ * Itération du 2026-10-10 : plus de calcul propre. Le bilan hydrique de la
+ * réserve du sol (`src/lib/irrigation/bilan-sol.ts`) est le moteur unique,
+ * partagé avec les lignes « à arroser » des tâches : même culture, même jour,
+ * même urgence. Cette fonction ne fait que le traduire pour l'écran.
  */
 export function genererRecommandationIrrigation(
-  historique7j: MeteoJournaliere[],
-  previsions: MeteoPrevision[],
-  culture: {
+  meteo: MeteoBilan,
+  culture: CultureBilan & {
     id: number
-    espece: string
-    besoinEau: number // 1-5
-    dateSemis: Date | null
-    derniereIrrigation: Date | null
+    /** Arrosages saisis sur la fenêtre du bilan (« Noter » et interventions). */
+    arrosages: ArrosageSaisi[]
   },
   planche: {
     nom: string
     surface: number // m²
     retentionEau: string | null
     typeSol: string | null
-  }
+    /** Sol de la parcelle, quand la planche n'en a pas. */
+    typeSolParcelle?: string | null
+    /** Système d'arrosage de la planche (efficacité de l'apport). */
+    irrigation?: string | null
+  },
+  /** null : type de planche non renseigné (`typeSousAbri`), le conseil le dit. */
+  sousAbri: boolean | null = false,
 ): RecommandationIrrigation {
-  // Précipitations cumulées 7 derniers jours
-  const precip7j = historique7j.reduce((sum, d) => sum + d.precipitation, 0)
+  const res = bilanCulture(meteo, culture, planche, { sousAbri, arrosages: culture.arrosages })
 
-  // ET0 cumulée 7 derniers jours
-  const et0_7j = historique7j.reduce((sum, d) => sum + d.et0, 0)
+  // Bilan des 7 derniers jours (pluie utile à l'écran, sans pluie sous abri).
+  // Les 7 derniers jours, aujourd'hui exclu : la définition de /meteo.
+  const pluie7j = sousAbri ? 0 : pluieSeptDerniersJours(meteo)
+  const bilanHydrique7j = Math.round((pluie7j - res.etcPotentielleMoyenne7j * 7) * 10) / 10
 
-  // Coefficient cultural estimé
-  const stadeRatio = culture.dateSemis
-    ? Math.min(1, (Date.now() - culture.dateSemis.getTime()) / (120 * 86400000)) // ~120j cycle moyen
-    : 0.5
-
-  const kc = getKc(culture.espece, stadeRatio)
-  const etc7j = et0_7j * kc
-
-  // Inclure la pluie du jour (forecast[0]) dans l'historique
-  // L'archive Open-Meteo s'arrête à hier, le forecast commence aujourd'hui
-  const pluieAujourdhui = previsions.length > 0 ? previsions[0].precipitation : 0
-  const precip7jTotal = precip7j + pluieAujourdhui
-
-  // Bilan hydrique 7j (avec pluie du jour)
-  const bilanHydrique7j = Math.round((precip7jTotal - etc7j) * 10) / 10
-
-  // Pluie prevue demain + après-demain (aujourd'hui est dans l'historique)
-  const pluiePrevue48h = previsions.slice(1, 3).reduce((sum, d) => sum + d.precipitation, 0)
-
-  // Pluie prevue 5 prochains jours (hors aujourd'hui)
-  const pluiePrevue5j = previsions.slice(1, 6).reduce((sum, d) => sum + d.precipitation, 0)
-
-  // Prochaine pluie significative (> 5mm)
-  const prochainePluie = previsions.slice(1).find(d => d.precipitation >= 5)?.date || null
-
-  // Jours sans pluie significative
+  // Jours sans pluie significative.
   let joursSansPluie = 0
-  if (pluieAujourdhui >= 1) {
-    joursSansPluie = 0
-  } else {
+  if (!sousAbri && meteo.aujourdhui.pluie < SEUIL_PLUIE_SIGNIFICATIVE) {
     joursSansPluie = 1
-    for (let i = historique7j.length - 1; i >= 0; i--) {
-      if (historique7j[i].precipitation < 1) joursSansPluie++
+    for (let i = meteo.historique.length - 1; i >= 0; i--) {
+      if (meteo.historique[i].pluie < SEUIL_PLUIE_SIGNIFICATIVE) joursSansPluie++
       else break
     }
   }
+  const prochainePluie = sousAbri ? null : meteo.previsions.find((j) => j.pluie >= 5)?.date ?? null
 
-  const joursDepuisIrrigation = culture.derniereIrrigation
-    ? Math.max(0, Math.floor((Date.now() - culture.derniereIrrigation.getTime()) / 86_400_000))
-    : null
-  // Un arrosage réellement noté est un apport d'eau au même titre qu'une
-  // pluie. Sans volume saisi on ne réécrit pas le bilan hydrique historique,
-  // mais on l'utilise au moins pour empêcher une fausse urgence immédiate.
-  const joursSansEau = joursDepuisIrrigation == null
-    ? joursSansPluie
-    : Math.min(joursSansPluie, joursDepuisIrrigation)
-
-  // Pluie cumulée des 48h passées (hier + avant-hier + aujourd'hui)
-  const pluie48hPassees = historique7j.slice(-2).reduce((s, d) => s + d.precipitation, 0) + pluieAujourdhui
-
-  // Facteur sol
-  const facteurSol = planche.retentionEau === 'Faible' ? 1.3
-    : planche.retentionEau === 'Élevée' ? 0.7
-    : 1.0
-
-  // Calcul de l'urgence — aligné avec /api/cultures/irriguer
-  let urgence: RecommandationIrrigation['urgence']
-  const deficit = Math.abs(Math.min(0, bilanHydrique7j)) * facteurSol
-  // Feedback Marc 2026-05-16 — Bug 14 : la formule précédente
-  // `deficit > 20 * besoinNormalise` (avec besoinNormalise = besoinEau/5)
-  // était INVERSÉE : une tomate (besoinEau=5) tolerait un déficit
-  // de 20mm avant critique alors qu'une roquette (besoinEau=1) basculait
-  // à 4mm. Or les plantes gourmandes en eau doivent passer en critique
-  // PLUS VITE. On utilise donc l'inverse normalisé (1 pour les peu
-  // exigeantes, 0.2 pour les très exigeantes) pour piloter les seuils.
-  const facteurBesoin = Math.max(0.2, (6 - culture.besoinEau) / 5) // 1.0 → 0.2
-
-  // Bilan prospectif : si on ajoute la pluie prévue 5j, est-ce que le déficit se comble ?
-  const bilanProspectif = bilanHydrique7j + pluiePrevue5j
-
-  // Cas favorable : pluie récente abondante (>8mm en 48h)
-  if (pluie48hPassees >= 8 && (pluiePrevue5j >= 5 || bilanHydrique7j > 5)) {
-    urgence = 'aucune'
-  } else if (bilanHydrique7j > 5 && pluiePrevue48h > 3) {
-    urgence = 'aucune'
-  } else if (pluiePrevue5j >= 15 && bilanProspectif > 0) {
-    // Pluie abondante prevue dans les 5j qui comblera le déficit
-    urgence = 'aucune'
-  } else if (pluiePrevue5j >= 10) {
-    // Pluie significative prevue dans les 5j — pas d'urgence critique
-    urgence = bilanProspectif > -5 ? 'faible' : 'moyenne'
-  } else if (pluiePrevue48h >= 10 && bilanHydrique7j > -10) {
-    urgence = 'faible'
-  } else if (deficit > 20 * facteurBesoin && joursSansEau >= 5 && pluiePrevue48h < 5 && pluiePrevue5j < 8) {
-    urgence = 'critique'
-  } else if (deficit > 10 * facteurBesoin && joursSansEau >= 3 && pluiePrevue48h < 8 && pluiePrevue5j < 10) {
-    urgence = 'haute'
-  } else if (deficit > 5 * facteurBesoin && joursSansEau > 2) {
-    urgence = 'moyenne'
-  } else if (bilanHydrique7j < 0) {
-    urgence = 'faible'
-  } else {
-    urgence = 'aucune'
-  }
-
-  // Quantité recommandée (L/m²). Feedback Marc 2026-05-16 — Bug 14 :
-  // on pondère par besoinEau (×0.4 à ×1.6) pour différencier les
-  // plantes peu exigeantes (engrais verts, laitue) des très exigeantes
-  // (tomate, courgette).
-  const ponderationBesoin = 0.4 + (culture.besoinEau - 1) * 0.3 // 0.4 → 1.6
-  const conseilQuantite = urgence === 'aucune' || joursDepuisIrrigation === 0 ? 0
-    : Math.round(Math.max(deficit, etc7j / 7 * 2) * facteurSol * ponderationBesoin * 10) / 10
-
-  // Message de conseil
-  const conseilMessage = genererConseilMessage(
-    urgence, bilanHydrique7j, pluiePrevue48h, pluiePrevue5j, prochainePluie,
-    conseilQuantite, joursSansPluie, joursDepuisIrrigation, planche.retentionEau
-  )
+  // Dose : remplir la réserve, à l'efficacité du système près.
+  const volume = volumeArrosage(res.doseMm, planche.surface, planche.irrigation)
+  const conseilQuantite = volume.litresParM2
+  // Sol de la planche inconnu : la dose n'est qu'un ordre de grandeur (QA cmv3jaru7).
+  const conseilMessage = conseilQuantite > 0
+    ? `${res.raison} ${phraseVolume(volume, 'pour la planche', res.solSource !== 'planche')}`
+    : res.raison
 
   return {
     cultureId: culture.id,
     cultureName: culture.espece,
     plancheName: planche.nom,
-    urgence,
+    urgence: res.urgence,
     bilanHydrique7j,
-    pluiePrevue48h: Math.round(pluiePrevue48h * 10) / 10,
+    pluiePrevue48h: res.pluiePrevue48h,
     conseilQuantite,
     conseilMessage,
     prochainePluie,
     joursSansPluie,
-    joursDepuisIrrigation,
+    joursDepuisIrrigation: joursDepuisArrosage(meteo, culture.derniereIrrigation, culture.arrosages),
   }
 }
 
-function genererConseilMessage(
-  urgence: string,
-  bilan7j: number,
-  pluie48h: number,
-  pluie5j: number,
-  prochainePluie: string | null,
-  quantite: number,
-  joursSansPluie: number,
-  joursDepuisIrrigation: number | null,
-  retentionEau: string | null
-): string {
-  if (joursDepuisIrrigation === 0) {
-    return bilan7j < 0
-      ? "Arrosage enregistré aujourd’hui. Le déficit météo des sept derniers jours reste à surveiller ; contrôlez l’humidité avant tout nouvel apport."
-      : "Arrosage enregistré aujourd’hui. Aucun apport supplémentaire n’est recommandé pour le moment."
-  }
-
-  if (urgence === 'aucune') {
-    if (pluie48h > 5) {
-      return `Pas besoin d'arroser. ${Math.round(pluie48h)}mm de pluie prévus dans les 48h.`
-    }
-    if (pluie5j >= 10) {
-      return `Pas besoin d'arroser. ${Math.round(pluie5j)}mm de pluie prévus dans les 5 prochains jours.`
-    }
-    return 'Bilan hydrique positif, pas besoin d\'irrigation.'
-  }
-
-  const parts: string[] = []
-
-  if (urgence === 'critique') {
-    parts.push(`Irrigation urgente recommandée : ${quantite} L/m².`)
-  } else if (urgence === 'haute') {
-    parts.push(`Irrigation recommandée : ${quantite} L/m².`)
-  } else if (urgence === 'moyenne') {
-    parts.push(`Irrigation à prévoir : ${quantite} L/m².`)
-  } else {
-    parts.push(`Irrigation légère conseillée : ${quantite} L/m².`)
-  }
-
-  if (joursSansPluie >= 5) {
-    parts.push(`${joursSansPluie} jours sans pluie.`)
-  }
-
-  if (bilan7j < -10) {
-    parts.push(`Déficit hydrique de ${Math.abs(bilan7j)}mm sur 7 jours.`)
-  }
-
-  if (pluie5j >= 10) {
-    parts.push(`${Math.round(pluie5j)}mm de pluie prévus dans les 5 prochains jours.`)
-  }
-
-  if (prochainePluie) {
-    parts.push(`Pluie prevue le ${new Date(prochainePluie).toLocaleDateString('fr-FR')}.`)
-  } else if (pluie48h >= 3) {
-    parts.push(`${Math.round(pluie48h)}mm de pluie prévus dans les 48h — possibilité d'attendre.`)
-  }
-
-  if (retentionEau === 'Faible') {
-    parts.push('Sol sableux : privilégier des arrosages fréquents et légers.')
-  } else if (retentionEau === 'Élevée') {
-    parts.push('Sol argileux : espacer les arrosages, bien mouiller en profondeur.')
-  }
-
-  return parts.join(' ')
-}
-
-/**
- * Sous serre ou tunnel, la pluie extérieure ne s'applique pas. On retire les
- * fragments liés à cette pluie sans casser les décimales des déficits.
- */
-export function adapterConseilSousAbri(message: string): string {
-  const conseil = message
-    .replace(/\d+(?:[.,]\d+)?mm de pluie prévus[^.]*\./gi, '')
-    .replace(/Pluie prevue le [^.]+\./gi, '')
-    .replace(/\d+ jours sans pluie\./gi, '')
-    .replace(/Déficit hydrique de \d+(?:[.,]\d+)?mm sur 7 jours\./gi, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim()
-
-  return conseil
-    ? `Sous abri — pas de pluie directe. ${conseil}`
-    : 'Sous abri — pas de pluie directe.'
-}
 
 // ============================================================
 // ALERTES MÉTÉO

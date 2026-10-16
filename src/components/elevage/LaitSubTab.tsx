@@ -12,7 +12,8 @@
 
 import * as React from "react"
 import { urlApercu } from "@/lib/apercu-document"
-import { usePathname, useRouter, useSearchParams } from "next/navigation"
+import { useSearchParams } from "next/navigation"
+import { updateDashboardSearchParams } from "@/lib/dashboard-navigation"
 import { Milk, FileText, LineChart, Plus, Copy, Loader2, Download, Trash2, ShieldAlert, TrendingUp, TrendingDown, Minus, Trophy, Truck, Warehouse, FlaskConical } from "lucide-react"
 import { LivraisonLaitSubTab } from "./LivraisonLaitSubTab"
 import { AffinageSubTab } from "./AffinageSubTab"
@@ -607,8 +608,6 @@ function QualiteView() {
 
 function CollecteView() {
   const { toast } = useToast()
-  const router = useRouter()
-  const pathname = usePathname()
   const searchParams = useSearchParams()
   const cibleUrl = searchParams.get("laitCible") === "lot" ? "lot" : "animal"
   const idUrl = Number.parseInt(searchParams.get("laitId") || "", 10)
@@ -677,8 +676,10 @@ function CollecteView() {
     if (params.get("laitCible") === target && params.get("laitId") === String(selectedId)) return
     params.set("laitCible", target)
     params.set("laitId", String(selectedId))
-    router.replace(`${pathname}?${params.toString()}`, { scroll: false })
-  }, [pathname, router, searchParams, selectedId, target])
+    // API History : router.replace sur la seule query est un no-op en
+    // production, la cible n'entrait jamais dans l'URL (QA cmv2ec55b).
+    updateDashboardSearchParams(params, "replace")
+  }, [searchParams, selectedId, target])
 
   const findCollecte = (day: string, traite: "Matin" | "Soir"): Collecte | undefined => {
     return collectes.find((c) => {
@@ -1229,8 +1230,13 @@ function DialogCreationLot(props: { open: boolean; onOpenChange: (b: boolean) =>
   const [form, setForm] = React.useState({
     dateFabrication: todayIso(),
     typeFromage: "Tomme",
-    nbPieces: 1,
-    poidsTotalKg: 1,
+    // Signalement 2026-09-29 (éleveur caprin) : « saisir 7 produit 17 ». L'état
+    // était un nombre reconverti à chaque frappe (`parseInt(...) || 1`) : le
+    // champ ne pouvait jamais être vidé, le 1 par défaut restait devant la
+    // saisie. Le formulaire garde la saisie brute (chaîne) et ne la convertit
+    // qu'à l'envoi — même règle que les autres champs numériques du module.
+    nbPieces: "1",
+    poidsTotalKg: "1",
     dluo: "",
     traitementThermique: "cru",
     statutBioSnapshot: "",
@@ -1278,8 +1284,8 @@ function DialogCreationLot(props: { open: boolean; onOpenChange: (b: boolean) =>
           dateFabrication: form.dateFabrication,
           typeFromage: form.typeFromage,
           volumeLaitUtiliseL: volumeSelection,
-          nbPieces: form.nbPieces,
-          poidsTotalKg: form.poidsTotalKg,
+          nbPieces: Math.max(1, parseInt(form.nbPieces, 10) || 1),
+          poidsTotalKg: Math.max(0, parseFloat(form.poidsTotalKg.replace(",", ".")) || 0),
           dluo: form.dluo || null,
           traitementThermique: form.traitementThermique,
           statutBioSnapshot: form.statutBioSnapshot || null,
@@ -1323,11 +1329,11 @@ function DialogCreationLot(props: { open: boolean; onOpenChange: (b: boolean) =>
           </div>
           <div>
             <Label>Nombre de pièces</Label>
-            <Input type="number" min="1" value={form.nbPieces} onChange={(e) => setForm({ ...form, nbPieces: parseInt(e.target.value) || 1 })} />
+            <Input type="number" min="1" step="1" inputMode="numeric" value={form.nbPieces} onChange={(e) => setForm({ ...form, nbPieces: e.target.value })} />
           </div>
           <div>
             <Label>Poids total (kg)</Label>
-            <Input type="number" step="0.01" min="0" value={form.poidsTotalKg} onChange={(e) => setForm({ ...form, poidsTotalKg: parseFloat(e.target.value) || 0 })} />
+            <Input type="number" step="0.01" min="0" inputMode="decimal" value={form.poidsTotalKg} onChange={(e) => setForm({ ...form, poidsTotalKg: e.target.value })} />
           </div>
           <div>
             <Label>DLUO</Label>

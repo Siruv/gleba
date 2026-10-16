@@ -5,7 +5,8 @@ import { BookOpen, ChevronRight, Globe2, Leaf, MapPin, Search, Sprout, TreeDecid
 import { MarketingShell } from "@/components/seo/MarketingShell";
 import prisma from "@/lib/prisma";
 import { nomPublic, originePublique, visibiliteEnfantPublic, visibiliteReferentielPublic } from "@/lib/referentiel-public";
-import { ESPECE_TYPES, libelleTypeEspece } from "@/lib/validations/espece";
+import { ESPECE_TYPES, estTypeVerger, libelleTypeEspece } from "@/lib/validations/espece";
+import { ogBase } from "@/lib/seo/og";
 
 export const dynamic = "force-dynamic";
 
@@ -14,6 +15,7 @@ export const metadata: Metadata = {
   description: "Explorez le référentiel agricole contributif de Gleba : légumes, arbres fruitiers, variétés et itinéraires techniques contextualisés par climat et terroir.",
   alternates: { canonical: "https://gleba.fr/referentiel" },
   openGraph: {
+    ...ogBase,
     title: "Le référentiel agricole ouvert de Gleba",
     description: "Des connaissances agricoles structurées, sourcées et adaptées aux terroirs.",
     url: "https://gleba.fr/referentiel",
@@ -33,6 +35,7 @@ const TYPES = [
   { value: "engrais_vert", label: "Engrais verts" },
   { value: "arbre_fruitier", label: "Arbres fruitiers" },
   { value: "petit_fruit", label: "Petits fruits" },
+  { value: "liane", label: "Lianes" },
 ] as const;
 
 /**
@@ -157,7 +160,7 @@ export default async function ReferentielPage({ searchParams }: PageProps) {
             <div className="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
               {especes.map((espece) => {
                 const name = nomPublic(espece);
-                const isTree = espece.type === "arbre_fruitier" || espece.type === "petit_fruit";
+                const isTree = estTypeVerger(espece.type);
                 const Icon = isTree ? TreeDeciduous : Leaf;
                 return (
                   <Link key={espece.id} href={`/referentiel/vegetaux/${encodeURIComponent(espece.id)}`} className="group rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:border-emerald-300 hover:shadow-md">

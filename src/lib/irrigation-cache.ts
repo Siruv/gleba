@@ -1,12 +1,17 @@
 /**
  * Cache en mémoire pour les recommandations d'irrigation
- * TTL : 1 heure — recalcul automatique à la prochaine connexion après expiration
+ * TTL : 2 minutes (voir TTL_MS)
  *
- * Clé : `${userId}_${parcelleId || 'all'}`
+ * Clé : `${userId}_${parcelleId || 'all'}_${jour}` (le jour : après minuit, le
+ * bilan de la veille ne sert plus).
  * Stocké dans le process Node.js (partagé entre toutes les requêtes du même worker)
  */
 
-const TTL_MS = 60 * 60 * 1000 // 1 heure
+// 2 minutes (revue du 2026-10-10) : le bilan se recalcule vite (météo en
+// generic_cache), et plusieurs saisies qui le nourrissent (import, assistant,
+// cultures, planches en masse) n'invalident pas ce cache. Il ne sert plus qu'à
+// absorber les appels groupés d'un même affichage.
+const TTL_MS = 2 * 60 * 1000
 
 interface CacheEntry<T> {
   data: T
@@ -34,7 +39,14 @@ class MemoryCache<T> {
   }
 
   set(key: string, data: T): void {
-    this.store.set(key, { data, cachedAt: Date.now() })
+    // Le jour est dans la clé : les entrées des jours passés ne sont plus
+    // jamais relues, on les purge ici plutôt que de les garder jusqu'au
+    // redémarrage.
+    const maintenant = Date.now()
+    for (const [cle, entree] of this.store) {
+      if (maintenant - entree.cachedAt > TTL_MS) this.store.delete(cle)
+    }
+    this.store.set(key, { data, cachedAt: maintenant })
   }
 
   /** Invalide toutes les entrées d'un utilisateur (ex: après une irrigation manuelle) */
@@ -55,6 +67,7 @@ class MemoryCache<T> {
 
 export const irrigationCache = new MemoryCache<unknown>()
 
-export function irrigationCacheKey(userId: string, parcelleId?: string | null): string {
-  return `${userId}_${parcelleId || 'all'}`
+export function irrigationCacheKey(userId: string, parcelleId?: string | null, maintenant: Date = new Date()): string {
+  const jour = `${maintenant.getFullYear()}-${maintenant.getMonth() + 1}-${maintenant.getDate()}`
+  return `${userId}_${parcelleId || 'all'}_${jour}`
 }

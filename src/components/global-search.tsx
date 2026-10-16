@@ -19,6 +19,8 @@
  */
 
 import * as React from "react"
+import { LIEN_CALENDRIER_LUNAIRE } from "@/components/lunaire/lecture"
+import { EVENEMENT_OUVRIR_RECHERCHE, ouvrirAssistant, ouvrirNouvelleIntervention } from "@/lib/accueil/evenements"
 import { useRouter, usePathname } from "next/navigation"
 import { Command } from "cmdk"
 import { Search, Loader2, ArrowRight } from "lucide-react"
@@ -101,6 +103,13 @@ export function GlobalSearch() {
     setOpen(false)
   }, [pathname])
 
+  // Accueil v2 (2026-10-09) : la barre de commande ouvre cette palette.
+  React.useEffect(() => {
+    const ouvrir = () => setOpen(true)
+    window.addEventListener(EVENEMENT_OUVRIR_RECHERCHE, ouvrir)
+    return () => window.removeEventListener(EVENEMENT_OUVRIR_RECHERCHE, ouvrir)
+  }, [])
+
   // Debounce search
   React.useEffect(() => {
     if (!open) return
@@ -159,18 +168,48 @@ export function GlobalSearch() {
           </div>
           <Command.List className="max-h-[60dvh] overflow-y-auto">
             {query.trim().length < 2 ? (
-              <div className="p-6 text-sm text-slate-500 text-center">
-                Tapez au moins 2 caractères pour rechercher dans cultures, variétés, arbres,
-                animaux, lots, clients, factures, parcelles, soins, récoltes, produits boutique.
-                <div className="mt-3 text-xs">
+              <>
+                {/* Accueil v2 : actions de saisie et assistant, avant toute recherche. */}
+                <Command.Group heading="Actions" className="text-xs text-slate-500 px-2 pt-2 pb-1">
+                  {[
+                    { id: "assistant", label: "Demander à Gleba", sub: "Poser une question, dicter une saisie", action: () => ouvrirAssistant() },
+                    { id: "tache", label: "Noter une tâche faite ou un arrosage", sub: "Tâches de la semaine", href: "/taches" },
+                    { id: "recolte", label: "Saisir une récolte", sub: "Quantité, planche, date", href: "/maraichage/recoltes" },
+                    pathname === "/interventions"
+                      ? { id: "intervention", label: "Noter une intervention", sub: "Désherbage, traitement, taille, pincement…", action: () => ouvrirNouvelleIntervention() }
+                      : { id: "intervention", label: "Noter une intervention", sub: "Désherbage, traitement, taille, pincement…", href: "/interventions?nouvelle=1" },
+                    { id: "plan", label: "Ouvrir le plan de la ferme", sub: "Planches, arbres, objets", href: "/jardin" },
+                    // Ticket QA cmv4zb9yy — le calendrier lunaire complet vit sur la page Météo (2026-10-12).
+                    { id: "lune", label: "Calendrier lunaire", sub: "Phase du jour, jours feuille, fruit, racine, fleur", href: LIEN_CALENDRIER_LUNAIRE },
+                  ].map((a) => (
+                    <Command.Item
+                      key={a.id}
+                      value={`action ${a.label} ${a.sub}`}
+                      onSelect={() => {
+                        setOpen(false)
+                        if (a.href) router.push(a.href)
+                        else a.action?.()
+                      }}
+                      className="flex items-center gap-2 px-3 py-2 rounded-md cursor-pointer aria-selected:bg-slate-100 text-sm"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="font-medium text-slate-900 truncate">{a.label}</div>
+                        <div className="text-xs text-slate-500 truncate">{a.sub}</div>
+                      </div>
+                      <ArrowRight className="h-3.5 w-3.5 text-slate-400" />
+                    </Command.Item>
+                  ))}
+                </Command.Group>
+                <div className="px-6 pb-5 pt-3 text-xs text-slate-500 text-center">
+                  Tapez au moins 2 caractères pour chercher une culture, un animal, une facture, un client…
                   Raccourcis : <kbd className="bg-slate-100 px-1 rounded">g</kbd>+
                   <kbd className="bg-slate-100 px-1 rounded">m/v/e/c</kbd> · navigation modules
                 </div>
-              </div>
+              </>
             ) : (
               <>
                 <Command.Empty className="p-6 text-sm text-slate-500 text-center">
-                  Aucun résultat pour "{query}".
+                  Aucun résultat pour « {query} ».
                 </Command.Empty>
                 {groups.map((g) => (
                   <Command.Group key={g.type} heading={g.type} className="text-xs text-slate-500 px-2 pt-2 pb-1">

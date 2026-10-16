@@ -10,7 +10,9 @@ import { nomItpDepuisSaisie } from '@/lib/itp-nom'
 import { requireAuthApi } from '@/lib/auth-utils'
 import { normalizeVarieteName } from '@/lib/normalize'
 import { invalidateKpi } from '@/lib/kpi'
-import { frequenceIrrigationJours } from '@/lib/irrigation-peremption'
+import { rendementEffectif } from '@/lib/recolte/rendement-effectif'
+import { uniteQuantiteRecolte, type UniteQuantite } from '@/lib/recolte/projection'
+import { enregistrerStockVariete } from '@/lib/stocks/stock-variete'
 
 interface ImportData {
   version?: string
@@ -169,6 +171,8 @@ interface ImportData {
     cultureId: number
     date: string
     quantite: number
+    /** kg | tige | piece | botte, tel que l'export l'emporte depuis 2026-08-20. */
+    unite?: string | null
     notes?: string | null
   }>
   fertilisations?: Array<{
@@ -451,7 +455,6 @@ export async function POST(request: NextRequest) {
             dureeRecolte: item.dureeRecolte,
             nbGrainesG: item.nbGrainesG,
             prixGraine: item.prixGraine,
-            dateStock: item.dateStock ? new Date(item.dateStock) : null,
             bio: item.bio,
             description: item.description,
           },
@@ -464,30 +467,19 @@ export async function POST(request: NextRequest) {
             dureeRecolte: item.dureeRecolte,
             nbGrainesG: item.nbGrainesG,
             prixGraine: item.prixGraine,
-            dateStock: item.dateStock ? new Date(item.dateStock) : null,
             bio: item.bio ?? false,
             description: item.description,
           },
         })
 
-        // Stock per-user
-        if (item.stockGraines !== undefined || item.stockPlants !== undefined) {
-          await tx.userStockVariete.upsert({
-            where: { userId_varieteId: { userId, varieteId: item.id } },
-            create: {
-              userId,
-              varieteId: item.id,
-              stockGraines: item.stockGraines ?? null,
-              stockPlants: item.stockPlants ?? null,
-              dateStock: item.dateStock ? new Date(item.dateStock) : new Date(),
-            },
-            update: {
-              ...(item.stockGraines !== undefined && { stockGraines: item.stockGraines }),
-              ...(item.stockPlants !== undefined && { stockPlants: item.stockPlants }),
-              dateStock: item.dateStock ? new Date(item.dateStock) : new Date(),
-            },
-          })
-        }
+        // Stock per-user : même chemin d'écriture que /api/stocks et
+        // /api/varietes ; la date de stock n'est plus une colonne de la variété
+        // (ticket cmv29j6q7).
+        await enregistrerStockVariete(tx, userId, item.id, {
+          stockGraines: item.stockGraines,
+          stockPlants: item.stockPlants,
+          dateStock: item.dateStock ? new Date(item.dateStock) : undefined,
+        })
 
         stats.varietes++
       }
@@ -768,7 +760,7 @@ export async function POST(request: NextRequest) {
     const plancheNameToIdMap = new Map<string, string>() // name → cuid
     if (data.planches?.length) {
       for (const item of data.planches) {
-        const plancheName = (item as any).nom || item.id // support both old (id) and new (nom) export formats
+        const plancheName = (item as { nom?: string | null }).nom || item.id // support both old (id) and new (nom) export formats
         const existing = await tx.planche.findUnique({
           where: {
             nom_userId: {
@@ -925,13 +917,36 @@ export async function POST(request: NextRequest) {
 
     // 13. Récoltes (ID auto-généré - créer de nouvelles avec le bon cultureId)
     if (data.recoltes?.length) {
+      // L'unité d'une récolte est figée à la saisie : l'export l'emporte, et
+      // l'import la perdait (relue en kilos). On reprend celle du fichier quand
+      // elle est canonique ; un export antérieur au 2026-08-20 n'en a pas, on
+      // dérive alors comme POST /api/recoltes : rendement effectif de l'espèce
+      // chez cet utilisateur (surcharge « Chez moi », sinon catalogue).
+      const UNITES_QUANTITE: ReadonlySet<string> = new Set(['kg', 'tige', 'piece', 'botte'])
+      const surchargesRendement = await tx.userStockEspece.findMany({
+        where: { userId, OR: [{ rendement: { not: null } }, { uniteRendement: { not: null } }] },
+        select: { especeId: true, rendement: true, uniteRendement: true },
+      })
+      const surchargeParEspece = new Map(
+        surchargesRendement.map((l) => [l.especeId, { rendement: l.rendement, uniteRendement: l.uniteRendement }]),
+      )
       for (const item of data.recoltes) {
         // Trouver le nouvel ID de la culture
         const newCultureId = cultureIdMap.get(item.cultureId)
         if (!newCultureId) continue // Skip si la culture n'a pas été importée
 
-        const especeExists = await tx.espece.findUnique({ where: { id: item.especeId } })
+        const especeExists = await tx.espece.findUnique({
+          where: { id: item.especeId },
+          select: { id: true, rendement: true, uniteRendement: true },
+        })
         if (!especeExists) continue
+
+        const unite: UniteQuantite =
+          item.unite && UNITES_QUANTITE.has(item.unite)
+            ? (item.unite as UniteQuantite)
+            : uniteQuantiteRecolte(
+                rendementEffectif(especeExists, surchargeParEspece.get(item.especeId)).uniteRendement,
+              )
 
         await tx.recolte.create({
           data: {
@@ -940,6 +955,7 @@ export async function POST(request: NextRequest) {
             cultureId: newCultureId,
             date: new Date(item.date),
             quantite: item.quantite,
+            unite,
             notes: item.notes,
           },
         })
@@ -1046,70 +1062,9 @@ export async function POST(request: NextRequest) {
 
     const totalImported = Object.values(stats).reduce((a, b) => a + b, 0)
 
-    // Générer les irrigations planifiées pour les cultures importées.
-    // Audit 2026-07 (#30) : auparavant on régénérait pour TOUTES les cultures
-    // actives sans déduplication ni borne au présent → chaque import doublait
-    // les plannings existants et créait des dizaines de dates passées « en
-    // retard ». On saute les cultures qui ont déjà un planning et on ne crée
-    // que des dates futures.
-    let irrigationsCreated = 0
-    const currentYear = new Date().getFullYear()
-    const aujourdhui = new Date()
-
-    const culturesAIrriguer = await tx.culture.findMany({
-      where: {
-        userId,
-        aIrriguer: true,
-        terminee: null,
-        annee: { in: [currentYear, currentYear + 1] },
-      },
-      include: {
-        espece: { select: { besoinEau: true } },
-      },
-    })
-
-    for (const culture of culturesAIrriguer) {
-      // Dédup : ne pas régénérer si un planning existe déjà pour cette culture.
-      const dejaPlanifie = await tx.irrigationPlanifiee.count({
-        where: { cultureId: culture.id, userId },
-      })
-      if (dejaPlanifie > 0) continue
-
-      const dateDebut = culture.datePlantation || culture.dateSemis
-      const dateFin = culture.finRecolte || culture.dateRecolte
-
-      if (!dateDebut) continue
-
-      // Cadence partagée avec le planificateur et la péremption. Cette copie
-      // ignorait le palier « besoin faible » (5 j) et arrosait tout tous les
-      // 3 jours : une culture importée périmait donc sur un cycle qu'elle
-      // n'avait jamais suivi.
-      const frequenceJours = frequenceIrrigationJours(culture.espece.besoinEau)
-
-      const irrigations: Date[] = []
-      let currentDate = new Date(dateDebut)
-      currentDate.setDate(currentDate.getDate() + frequenceJours)
-
-      const finDate = dateFin ? new Date(dateFin) : new Date(dateDebut.getFullYear(), 11, 31)
-
-      while (currentDate <= finDate) {
-        // Ne planifier que le futur : pas de tâche d'irrigation passée « en retard ».
-        if (currentDate >= aujourdhui) irrigations.push(new Date(currentDate))
-        currentDate.setDate(currentDate.getDate() + frequenceJours)
-      }
-
-      if (irrigations.length > 0) {
-        await tx.irrigationPlanifiee.createMany({
-          data: irrigations.map(date => ({
-            userId,
-            cultureId: culture.id,
-            datePrevue: date,
-            fait: false,
-          })),
-        })
-        irrigationsCreated += irrigations.length
-      }
-    }
+    // Plus de plan d'arrosage généré à l'import (refonte du 2026-10-10) : le
+    // besoin du jour se calcule depuis le bilan hydrique (src/lib/irrigation/a-arroser.ts).
+    const irrigationsCreated = 0
 
     return {
       totalImported,
@@ -1150,7 +1105,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      message: `${result.totalImported} enregistrements importés + ${result.irrigationsCreated} irrigations générées`,
+      message: `${result.totalImported} enregistrements importés`,
       stats: {
         ...result.stats,
         irrigations: result.irrigationsCreated,

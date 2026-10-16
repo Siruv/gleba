@@ -2,11 +2,17 @@ import prisma from "@/lib/prisma"
 import { irrigationCache } from "@/lib/irrigation-cache"
 import { cultureIrrigationDemarreeWhere } from "@/lib/irrigation-eligibility"
 import { idsAExpirer } from "@/lib/irrigation-peremption"
+import { whereArrosageNote } from "@/lib/irrigation/arrosages-notes"
+
+/** Deux « Noter » à moins de 10 minutes d'écart sont un seul arrosage. */
+export const FENETRE_DOUBLON_MS = 10 * 60_000
 
 interface EnregistrerArrosageParams {
   userId: string
   cultureIds: number[]
   dateEffective?: Date
+  /** Observation saisie avec l'arrosage (page Tâches) ; sinon libellé par défaut. */
+  notes?: string | null
 }
 
 export interface EnregistrerArrosageResult {
@@ -18,6 +24,11 @@ export interface EnregistrerArrosageResult {
   irrigationsPerimees: number
   irrigationsTraceesCreees: number
   dateEffective: Date
+  /**
+   * `derniereIrrigation` de chaque culture touchée AVANT ce geste (ISO ou
+   * null) : ce qu'il faut pour l'annuler exactement (`annulerArrosageCultures`).
+   */
+  derniereIrrigationAvant: Record<number, string | null>
 }
 
 /**
@@ -33,6 +44,7 @@ export async function enregistrerArrosageCultures({
   userId,
   cultureIds,
   dateEffective = new Date(),
+  notes,
 }: EnregistrerArrosageParams): Promise<EnregistrerArrosageResult> {
   const idsDemandes = Array.from(new Set(
     cultureIds.filter((id) => Number.isInteger(id) && id > 0)
@@ -47,6 +59,7 @@ export async function enregistrerArrosageCultures({
       irrigationsPerimees: 0,
       irrigationsTraceesCreees: 0,
       dateEffective,
+      derniereIrrigationAvant: {},
     }
   }
 
@@ -77,6 +90,7 @@ export async function enregistrerArrosageCultures({
       irrigationsPerimees: 0,
       irrigationsTraceesCreees: 0,
       dateEffective,
+      derniereIrrigationAvant: {},
     }
   }
 
@@ -94,9 +108,12 @@ export async function enregistrerArrosageCultures({
           : []),
       ],
     },
-    select: { id: true },
+    select: { id: true, derniereIrrigation: true },
   })
   const idsCibles = culturesCibles.map((culture) => culture.id)
+  const derniereIrrigationAvant = Object.fromEntries(
+    culturesCibles.map((c) => [c.id, c.derniereIrrigation ? c.derniereIrrigation.toISOString() : null]),
+  ) as Record<number, string | null>
 
   const finJournee = new Date(dateEffective)
   finJournee.setHours(23, 59, 59, 999)
@@ -140,15 +157,29 @@ export async function enregistrerArrosageCultures({
   // journée reçoivent donc une irrigation clôturée, qui sert de trace — un
   // passage périmé ne compte pas comme trace, sinon l'arrosage réel du jour
   // disparaîtrait du registre.
+  //
+  // Itération du 2026-10-10 : chaque arrosage noté a sa trace, un second
+  // arrosage le soir compris (il gardait sinon la seule trace du matin et
+  // perdait son observation). Seul un double geste dans les
+  // FENETRE_DOUBLON_MS (double tap, deux écrans) est dédoublonné.
   const closesAujourdhui = await prisma.irrigationPlanifiee.findMany({
     where: {
       userId,
       cultureId: { in: idsCibles },
       fait: true,
-      dateEffective: { gte: debutJournee, lte: finJournee },
+      dateEffective: {
+        gte: new Date(Math.max(debutJournee.getTime(), dateEffective.getTime() - FENETRE_DOUBLON_MS)),
+        lte: finJournee,
+      },
     },
-    select: { cultureId: true },
+    select: { id: true, cultureId: true, notes: true },
   })
+  // Double geste avec une observation : elle complète la trace existante au
+  // lieu d'être perdue avec le doublon.
+  const observation = notes?.trim().slice(0, 1000) || null
+  const tracesACompleter = observation
+    ? closesAujourdhui.filter((t) => !(t.notes ?? '').includes(observation))
+    : []
   const cultureIdsTracees = new Set<number>([
     ...aClore.map((irr) => irr.cultureId),
     ...closesAujourdhui.map((irr) => irr.cultureId),
@@ -184,9 +215,19 @@ export async function enregistrerArrosageCultures({
           datePrevue: dateEffective,
           fait: true,
           dateEffective,
-          notes: 'Arrosage noté depuis les conseils d’irrigation',
+          notes: observation || 'Arrosage noté',
         })),
       }),
+      ...tracesACompleter.map((t) =>
+        prisma.irrigationPlanifiee.update({
+          where: { id: t.id },
+          data: {
+            notes: !t.notes || t.notes === 'Arrosage noté'
+              ? observation
+              : `${t.notes} · ${observation}`.slice(0, 1000),
+          },
+        }),
+      ),
     ])
 
   irrigationCache.invalidateUser(userId)
@@ -199,5 +240,209 @@ export async function enregistrerArrosageCultures({
     irrigationsPerimees: perimeesUpdate.count,
     irrigationsTraceesCreees: tracesCreees.count,
     dateEffective,
+    derniereIrrigationAvant,
   }
+}
+
+export interface AnnulerArrosageParams {
+  userId: string
+  /** Horodatage EXACT du geste à annuler (renvoyé par `enregistrerArrosageCultures`). */
+  dateEffective: Date
+  /** `derniereIrrigation` d'avant le geste, par culture (renvoyé par le même appel). */
+  avant: Record<number, string | null>
+}
+
+/**
+ * Inverse exact de « Noter » (revue du modèle d'arrosage, 2026-10-10) : sans
+ * lui, un tap de trop effaçait le besoin de toute la planche pendant des
+ * jours et laissait une trace définitive au registre.
+ *
+ * Ne supprime que les traces posées par CE geste (même horodatage exact, même
+ * compte, cultures concernées) et ne restaure `derniereIrrigation` que si
+ * aucun arrosage plus récent ne l'a remplacé depuis.
+ */
+export async function annulerArrosageCultures({ userId, dateEffective, avant }: AnnulerArrosageParams) {
+  const ids = Object.keys(avant)
+    .map(Number)
+    .filter((id) => Number.isInteger(id) && id > 0)
+  if (ids.length === 0 || Number.isNaN(dateEffective.getTime())) {
+    return { tracesSupprimees: 0, culturesRestaurees: 0 }
+  }
+
+  const resultat = await prisma.$transaction(async (tx) => {
+    const cultures = await tx.culture.findMany({
+      where: { userId, id: { in: ids } },
+      select: { id: true, derniereIrrigation: true },
+    })
+    const idsAutorises = cultures.map((c) => c.id)
+    const traces = await tx.irrigationPlanifiee.deleteMany({
+      where: { userId, cultureId: { in: idsAutorises }, fait: true, dateEffective },
+    })
+    let culturesRestaurees = 0
+    for (const c of cultures) {
+      // Un arrosage noté depuis l'emporte : on ne le défait pas.
+      if (c.derniereIrrigation?.getTime() !== dateEffective.getTime()) continue
+      const precedente = avant[c.id]
+      const date = precedente ? new Date(precedente) : null
+      await tx.culture.update({
+        where: { id: c.id },
+        data: { derniereIrrigation: date && !Number.isNaN(date.getTime()) ? date : null },
+      })
+      culturesRestaurees++
+    }
+    return { tracesSupprimees: traces.count, culturesRestaurees }
+  })
+
+  irrigationCache.invalidateUser(userId)
+  return resultat
+}
+
+/**
+ * Supprime un arrosage noté depuis le registre d'interventions (ticket QA
+ * cmv2rfmzl : la ligne « via Irrigations » n'était ni modifiable ni
+ * supprimable, seul le toast « Annuler » rattrapait une erreur).
+ *
+ * « Noter » arrose toute la planche : un geste laisse une trace par culture de
+ * la planche, au même horodatage. On supprime donc le GESTE (toutes ses traces
+ * sur cette planche), sinon les colocataires gardaient l'arrosage. Chaque
+ * culture dont `derniereIrrigation` vient de ce geste (jusqu'à
+ * FENETRE_DOUBLON_MS après : un double « Noter » ne laisse qu'une trace mais
+ * avance l'horodatage) revient à son arrosage noté précédent, ou à rien.
+ * « Modifier » passe par la même suppression après création d'une
+ * intervention « arrosage » complète (volume, durée), que le bilan lit aussi.
+ */
+export async function supprimerArrosageNote({
+  userId,
+  traceId,
+}: {
+  userId: string
+  traceId: number
+}): Promise<{ supprime: boolean; cultureIds: number[] }> {
+  const trace = await prisma.irrigationPlanifiee.findFirst({
+    where: { id: traceId, userId, AND: [whereArrosageNote()] },
+    select: { id: true, cultureId: true, dateEffective: true, culture: { select: { plancheId: true } } },
+  })
+  if (!trace || !trace.dateEffective) return { supprime: false, cultureIds: [] }
+  const geste = trace.dateEffective
+
+  const traces = await prisma.irrigationPlanifiee.findMany({
+    where: {
+      userId,
+      dateEffective: geste,
+      AND: [whereArrosageNote()],
+      ...(trace.culture?.plancheId ? { culture: { plancheId: trace.culture.plancheId } } : { id: trace.id }),
+    },
+    select: { id: true, cultureId: true },
+  })
+  const ids = traces.map((t) => t.id)
+  const cultureIds = Array.from(new Set(traces.map((t) => t.cultureId)))
+
+  const [cultures, precedentes] = await Promise.all([
+    prisma.culture.findMany({
+      where: { userId, id: { in: cultureIds } },
+      select: { id: true, derniereIrrigation: true },
+    }),
+    prisma.irrigationPlanifiee.findMany({
+      where: {
+        userId,
+        cultureId: { in: cultureIds },
+        id: { notIn: ids },
+        dateEffective: { lt: geste },
+        AND: [whereArrosageNote()],
+      },
+      orderBy: { dateEffective: 'desc' },
+      select: { cultureId: true, dateEffective: true },
+    }),
+  ])
+  const precedente = new Map<number, Date | null>()
+  for (const p of precedentes) if (!precedente.has(p.cultureId)) precedente.set(p.cultureId, p.dateEffective)
+  const finGeste = geste.getTime() + FENETRE_DOUBLON_MS
+  const aRetablir = cultures.filter(
+    (c) => c.derniereIrrigation && c.derniereIrrigation.getTime() >= geste.getTime() && c.derniereIrrigation.getTime() <= finGeste,
+  )
+
+  await prisma.$transaction([
+    prisma.irrigationPlanifiee.deleteMany({ where: { id: { in: ids }, userId } }),
+    ...aRetablir.map((c) =>
+      prisma.culture.update({ where: { id: c.id }, data: { derniereIrrigation: precedente.get(c.id) ?? null } }),
+    ),
+  ])
+  irrigationCache.invalidateUser(userId)
+  return { supprime: true, cultureIds }
+}
+
+export interface EnregistrerArrosageMesureParams {
+  userId: string
+  cultureIds: number[]
+  /** Litres versés sur la planche. */
+  litres: number
+  notes?: string | null
+  /**
+   * Horodatage du geste : le bilan le date au jour du LIEU (`jourArrosage`) et
+   * l'écran au jour local. Une date de calendrier (minuit UTC) s'affichait la
+   * veille aux Antilles (revue du lot cmv3japsf).
+   */
+  dateEffective?: Date
+}
+
+/** Plus que n'importe quel arrosage d'une planche : une faute de frappe. */
+const LITRES_MAX_PAR_GESTE = 100_000
+
+/**
+ * « Noter » avec la quantité versée (ticket QA cmv3japsf : « Noter » sans
+ * quantité remettait le sol plein et le conseil passait à « Rien à faire »
+ * après un arrosage de quelques litres).
+ *
+ * L'arrosage devient une intervention « arrosage » réalisée (eau, litres) sur
+ * la planche, que le bilan lit avec son volume (`chargerArrosagesSaisis`) :
+ * il retranche l'eau versée au lieu de remettre la réserve pleine. Ni trace
+ * `IrrigationPlanifiee` ni `derniereIrrigation`, qui valent tous deux un plein.
+ * Une seule planche par geste : des litres ne se répartissent pas entre planches.
+ */
+export async function enregistrerArrosageMesure({
+  userId,
+  cultureIds,
+  litres,
+  notes,
+  dateEffective = new Date(),
+}: EnregistrerArrosageMesureParams): Promise<
+  { ok: true; interventionId: number; cultureIds: number[]; plancheId: string | null } | { ok: false; erreur: string }
+> {
+  if (!(Number.isFinite(litres) && litres > 0)) return { ok: false, erreur: 'Quantité versée invalide' }
+  if (litres > LITRES_MAX_PAR_GESTE) return { ok: false, erreur: 'Quantité versée invalide (plus de 100 000 L)' }
+  const ids = Array.from(new Set(cultureIds.filter((id) => Number.isInteger(id) && id > 0)))
+  const cultures = ids.length
+    ? await prisma.culture.findMany({ where: { userId, id: { in: ids } }, select: { id: true, plancheId: true } })
+    : []
+  if (cultures.length === 0) return { ok: false, erreur: 'Culture non trouvée' }
+  const planches = new Set(cultures.map((c) => c.plancheId))
+  if (planches.size > 1) return { ok: false, erreur: 'Une quantité se note planche par planche' }
+
+  const pilote = cultures.find((c) => c.id === ids[0]) ?? cultures[0]
+  const intervention = await prisma.intervention.create({
+    data: {
+      userId,
+      date: dateEffective,
+      type: 'arrosage',
+      cultureId: pilote.id,
+      plancheId: pilote.plancheId,
+      fait: true,
+      intrantNom: 'Eau',
+      intrantQuantite: Math.round(litres * 10) / 10,
+      intrantUnite: 'L',
+      notes: notes?.trim().slice(0, 1000) || null,
+    },
+    select: { id: true },
+  })
+  irrigationCache.invalidateUser(userId)
+  return { ok: true, interventionId: intervention.id, cultureIds: cultures.map((c) => c.id), plancheId: pilote.plancheId }
+}
+
+/** Inverse exact de `enregistrerArrosageMesure` (toast « Annuler »). */
+export async function annulerArrosageMesure({ userId, interventionId }: { userId: string; interventionId: number }) {
+  const { count } = await prisma.intervention.deleteMany({
+    where: { id: interventionId, userId, type: 'arrosage' },
+  })
+  irrigationCache.invalidateUser(userId)
+  return { interventionsSupprimees: count }
 }

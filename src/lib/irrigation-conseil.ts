@@ -11,16 +11,21 @@
  *  - Évapotranspiration (ET0) réelle
  *  - Rétention du sol, besoin eau de l'espece
  *
- * Les irrigations planifiées sont auto-validées quand la pluie est suffisante.
+ * Lecture pure depuis la refonte du 2026-10-10 : il n'existe plus de passages
+ * planifiés à clore quand il pleut. L'urgence alimente les lignes « à
+ * arroser » (`src/lib/irrigation/a-arroser.ts`).
  */
 
+import type { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
-import { fetchOpenMeteoForecast, fetchOpenMeteoHistory } from '@/lib/meteo'
-import type { MeteoJournaliere, MeteoPrevision } from '@/lib/meteo'
+import { joursEntre, volumeArrosage, type ResultatBilanSol } from '@/lib/irrigation/bilan-sol'
+import { bilanCulture, dernierArrosageDuLieu } from '@/lib/irrigation/bilan-culture'
+import { typeSousAbri } from '@/lib/irrigation/abri'
+import { chargerArrosagesSaisis, dernierArrosage } from '@/lib/irrigation/arrosages-saisis'
+import { chargerMeteoBilan, debutArrosagesBilan, jourLocalIso, pluieSeptDerniersJours, type MeteoBilan } from '@/lib/irrigation/meteo-bilan'
 import {
   getIrrigationFactors,
   calculerConsommationEauAvecSol,
-  calculerConsommationEauAvecMeteo,
   alerteSecheresse,
 } from '@/lib/soil-quality'
 import { cultureIrrigationDemarreeWhere } from '@/lib/irrigation-eligibility'
@@ -32,219 +37,118 @@ import { consommationHebdoTotale } from '@/lib/irrigation/consommation'
 interface MeteoParCoord {
   lat: number
   lng: number
-  historique: MeteoJournaliere[]
-  previsions: MeteoPrevision[]
-  pluie48hPassees: number  // mm cumulés hier + avant-hier
-  pluie7jPassees: number   // mm cumulés 7 derniers jours
-  et0_7j: number           // mm ET0 cumulés 7j
-  joursSansPluie: number   // jours consécutifs sans pluie (depuis le plus récent)
-  pluiePrevue48h: number   // mm prévus dans les 48h
+  /** Série du bilan hydrique (30 j passés, aujourd'hui, 7 j prévus). */
+  bilan: MeteoBilan
+  pluie48hPassees: number  // mm d'hier et d'avant-hier (aujourd'hui exclu, comme pluie7jPassees)
+  pluie7jPassees: number   // mm des 7 derniers jours, aujourd'hui exclu (définition de /meteo)
+  et0_7j: number           // mm ET0 des 7 derniers jours, aujourd'hui exclu
+  joursSansPluie: number   // jours consécutifs sans pluie significative
+  pluiePrevue48h: number   // mm prévus demain et après-demain
   pluiePrevue5j: number    // mm prévus dans les 5 prochains jours
-  joursAvantPluie: number  // nb jours avant prochaine pluie significative (>3mm)
+  joursAvantPluie: number  // jours avant la prochaine pluie significative (99 = aucune)
 }
 
-const TYPES_SOUS_ABRI = ['Serre', 'Tunnel', 'Châssis', 'Chassis']
-
-// ── Seuils ──────────────────────────────────────────────────
-
-/** Mm de pluie cumulés sur 48h pour considérer que le sol est suffisamment arrosé */
-const SEUIL_PLUIE_AUTO_VALIDE = 8
-
-/** Nb de jours couverts par la pluie selon la rétention du sol */
-function joursCouverts(pluieMm: number, retentionEau: string | null, et0Journalier: number): number {
-  // Combien de jours d'ETc sont couverts par la pluie reçue ?
-  // On considère 80% de la pluie comme efficace (le reste ruisselle)
-  const pluieEfficace = pluieMm * 0.8
-  if (et0Journalier <= 0) return 7 // Pas d'évaporation → longtemps
-
-  const factors = getIrrigationFactors(retentionEau || 'Moyenne')
-  // ETc ≈ ET0 × 0.8 (coeff moyen) × facteur sol
-  const etcJournalier = et0Journalier * 0.8 * factors.quantiteFactor
-
-  const jours = Math.floor(pluieEfficace / etcJournalier)
-
-  // Clamp selon rétention : sol sableux perd vite, argileux conserve
-  const maxJours = retentionEau === 'Faible' ? 4
-    : retentionEau === 'Élevée' ? 8
-    : 6
-
-  return Math.min(jours, maxJours)
-}
-
-// ── Calcul urgence météo ────────────────────────────────────
+// Seuils partagés avec le conseiller du Calendrier (meteo-agro.ts) et le moteur.
+import {
+  JOURS_APRES_DEBUT_RECOLTE_SANS_FIN,
+  JOURS_APRES_FIN_RECOLTE,
+  SEUIL_PLUIE_SIGNIFICATIVE,
+} from '@/lib/irrigation/seuils'
+export { JOURS_APRES_FIN_RECOLTE, SEUIL_PLUIE_SIGNIFICATIVE }
 
 type Urgence = 'critique' | 'haute' | 'moyenne' | 'faible' | 'aucune'
 
-function calculerUrgenceMeteo(
-  joursSansArrosage: number | null,
-  besoinEau: number,
-  retentionEau: string | null,
-  meteo: MeteoParCoord | null,
-  sousAbri: boolean
-): { urgence: Urgence; raison: string } {
-  // Pas de données météo → fallback simple
-  if (!meteo) {
-    return urgenceFallback(joursSansArrosage, besoinEau, retentionEau)
-  }
-
-  const factors = getIrrigationFactors(retentionEau || 'Moyenne')
-  const besoinNorm = besoinEau / 5 // 0–1
-
-  // Pluie effective (sous abri = 0)
-  const pluie7j = sousAbri ? 0 : meteo.pluie7jPassees
-  const pluie48h = sousAbri ? 0 : meteo.pluie48hPassees
-  const pluiePrevue48h = sousAbri ? 0 : meteo.pluiePrevue48h
-  const pluiePrevue5j = sousAbri ? 0 : meteo.pluiePrevue5j
-  const joursSansPluie = sousAbri ? 999 : meteo.joursSansPluie
-
-  // Bilan hydrique 7j
-  const etc7j = meteo.et0_7j * (0.6 + besoinNorm * 0.6) * factors.quantiteFactor
-  const bilanHydrique = pluie7j - etc7j
-
-  // ── Cas favorable : beaucoup de pluie récente ──
-  // S'il a plu > seuil ces dernières 48h et qu'il y a encore de la pluie prévue
-  if (pluie48h >= SEUIL_PLUIE_AUTO_VALIDE) {
-    const et0Moy = meteo.et0_7j / Math.max(meteo.historique.length, 1)
-    const joursCouv = joursCouverts(pluie48h, retentionEau, et0Moy)
-
-    if (pluiePrevue5j >= 5) {
-      return {
-        urgence: 'aucune',
-        raison: `${Math.round(pluie48h)}mm de pluie ces 2 derniers jours + ${Math.round(pluiePrevue5j)}mm prévus. Aucun arrosage necessaire.`,
-      }
-    }
-    if (joursCouv >= 3) {
-      return {
-        urgence: 'aucune',
-        raison: `${Math.round(pluie48h)}mm de pluie ces 2 derniers jours — sol couvert pour ~${joursCouv} jours.`,
-      }
+/**
+ * Résumé météo d'une zone pour l'écran (pluies passées et prévues), tiré de
+ * la même série que le bilan hydrique.
+ */
+export function resumeMeteo(bilan: MeteoBilan): Omit<MeteoParCoord, 'lat' | 'lng' | 'bilan'> {
+  const derniers7 = bilan.historique.slice(-7)
+  const pluieAujourdhui = bilan.aujourdhui.pluie
+  let joursSansPluie = 0
+  if (pluieAujourdhui < SEUIL_PLUIE_SIGNIFICATIVE) {
+    joursSansPluie = 1
+    for (let i = bilan.historique.length - 1; i >= 0; i--) {
+      if (bilan.historique[i].pluie < SEUIL_PLUIE_SIGNIFICATIVE) joursSansPluie++
+      else break
     }
   }
-
-  // ── Pluie récente modérée ──
-  if (pluie7j >= 15 && bilanHydrique > 0) {
-    return {
-      urgence: 'aucune',
-      raison: `Bilan hydrique positif (+${Math.round(bilanHydrique)}mm). ${Math.round(pluie7j)}mm de pluie en 7j.`,
-    }
-  }
-
-  // ── Pluie significative prevue dans les 5j ──
-  const bilanProspectif = bilanHydrique + pluiePrevue5j
-  if (pluiePrevue5j >= 15 && bilanProspectif > 0) {
-    return {
-      urgence: 'aucune',
-      raison: `${Math.round(pluiePrevue5j)}mm de pluie prévus dans les 5 prochains jours — déficit comblé.`,
-    }
-  }
-  if (pluiePrevue5j >= 10) {
-    return {
-      urgence: bilanProspectif > -5 ? 'faible' : 'moyenne',
-      raison: `${Math.round(pluiePrevue5j)}mm de pluie prévus dans les 5 prochains jours.${bilanProspectif > -5 ? ' Arrosage léger suffisant.' : ''}`,
-    }
-  }
-
-  // ── Pluie prevue imminente ──
-  if (pluiePrevue48h >= 10) {
-    if (bilanHydrique > -10) {
-      return {
-        urgence: 'faible',
-        raison: `${Math.round(pluiePrevue48h)}mm de pluie prévus dans 48h — reporter l'arrosage.`,
-      }
-    }
-  }
-
-  // ── Calcul déficit ──
-  const deficit = Math.abs(Math.min(0, bilanHydrique)) * factors.urgenceFactor
-
-  // Prendre en compte le temps depuis le dernier arrosage OU la dernière pluie significative
-  const joursEffectifsSansEau = Math.min(
-    joursSansArrosage ?? 999,
-    joursSansPluie
-  )
-
-  // ── Seuils dynamiques ──
-  if (deficit > 20 * besoinNorm && joursEffectifsSansEau >= 5 && pluiePrevue48h < 5 && pluiePrevue5j < 8) {
-    return {
-      urgence: 'critique',
-      raison: `Déficit hydrique de ${Math.round(deficit)}mm. ${joursEffectifsSansEau}j sans eau. Pas de pluie prévue.`,
-    }
-  }
-
-  if (deficit > 10 * besoinNorm && joursEffectifsSansEau >= 3 && pluiePrevue48h < 8 && pluiePrevue5j < 10) {
-    return {
-      urgence: 'haute',
-      raison: `Déficit de ${Math.round(deficit)}mm, ${joursEffectifsSansEau}j sans eau.${pluiePrevue48h > 0 ? ` ${Math.round(pluiePrevue48h)}mm prévus.` : ''}`,
-    }
-  }
-
-  if (deficit > 5 && joursEffectifsSansEau > 2) {
-    return {
-      urgence: 'moyenne',
-      raison: `Déficit modéré (${Math.round(deficit)}mm). ${joursEffectifsSansEau}j sans eau.`,
-    }
-  }
-
-  if (bilanHydrique < 0) {
-    return {
-      urgence: 'faible',
-      raison: `Léger déficit (${Math.round(Math.abs(bilanHydrique))}mm). Surveiller.`,
-    }
-  }
-
+  const idx = bilan.previsions.findIndex((j) => j.pluie >= SEUIL_PLUIE_SIGNIFICATIVE)
   return {
-    urgence: 'aucune',
-    raison: `Bilan hydrique OK (+${Math.round(bilanHydrique)}mm).`,
+    pluie48hPassees: bilan.historique.slice(-2).reduce((s, j) => s + j.pluie, 0),
+    // Ticket QA cmv2rf6mb : même définition que /meteo (`pluieSeptDerniersJours`).
+    pluie7jPassees: pluieSeptDerniersJours(bilan),
+    et0_7j: derniers7.reduce((s, j) => s + j.et0, 0),
+    joursSansPluie,
+    pluiePrevue48h: bilan.previsions.slice(0, 2).reduce((s, j) => s + j.pluie, 0),
+    pluiePrevue5j: bilan.previsions.slice(0, 5).reduce((s, j) => s + j.pluie, 0),
+    joursAvantPluie: idx >= 0 ? idx + 1 : 99,
   }
 }
 
-/** Fallback quand on n'a pas de données météo (pas de coordonnées parcelle) */
-function urgenceFallback(
+/**
+ * Sans météo, pas de bilan : on ne sait pas s'il a plu. L'ancien compteur de
+ * jours rendait « critique » tous les 3 à 4 jours, été comme hiver ; le
+ * conseil plafonne donc à « moyenne » (à surveiller, jamais une tâche) et dit
+ * pourquoi : parcelle à géolocaliser, ou service météo momentanément muet.
+ */
+export function urgenceFallback(
   joursSansEau: number | null,
   besoinEau: number,
-  retentionEau: string | null
+  retentionEau: string | null,
+  cause: 'sans-coordonnees' | 'meteo-indisponible' = 'sans-coordonnees',
 ): { urgence: Urgence; raison: string } {
+  const conseil = cause === 'meteo-indisponible'
+    ? 'Météo momentanément indisponible, conseil à revoir plus tard.'
+    : 'Géolocalisez une parcelle pour un conseil météo.'
   if (joursSansEau === null) {
-    return { urgence: 'moyenne', raison: 'Jamais arrosé (pas de données météo).' }
+    return { urgence: 'moyenne', raison: `Jamais arrosé. ${conseil}` }
   }
-
   const factors = getIrrigationFactors(retentionEau || 'Moyenne')
-  const joursAjustes = joursSansEau * factors.urgenceFactor
-  const seuilCritique = besoinEau >= 4 ? 3 : 4
-  const seuilHaute = besoinEau >= 4 ? 2 : 3
-
-  if (joursAjustes >= seuilCritique) {
-    return { urgence: 'critique', raison: `${joursSansEau}j sans arrosage (pas de données météo).` }
-  }
-  if (joursAjustes >= seuilHaute) {
-    return { urgence: 'haute', raison: `${joursSansEau}j sans arrosage.` }
-  }
-  if (joursAjustes >= 1) {
-    return { urgence: 'moyenne', raison: `${joursSansEau}j sans arrosage.` }
+  const seuil = besoinEau >= 4 ? 2 : 3
+  if (joursSansEau * factors.urgenceFactor >= seuil) {
+    return { urgence: 'moyenne', raison: `${joursSansEau}j sans arrosage. ${conseil}` }
   }
   return { urgence: 'faible', raison: 'Arrosé récemment.' }
 }
 
-// ── Calcul complet ──────────────────────────────────────────
-
-export type ConseilIrrigation = Awaited<ReturnType<typeof computeConseilIrrigation>>
-
 /**
- * `persisterAutoValidation` : un acteur en LECTURE SEULE obtient le même
- * conseil, sans qu'aucune irrigation ne soit clôturée en base pour lui.
+ * Cultures réellement en place à arroser (revue du 2026-10-10) :
+ * - une vivace non terminée, quelle que soit son année ;
+ * - une annuelle de la saison ou de la précédente (un poireau d'hiver semé en
+ *   2026 est encore en terre en janvier 2027), dont la fenêtre de récolte
+ *   n'est pas finie depuis plus de JOURS_APRES_FIN_RECOLTE jours (sans fin
+ *   connue : JOURS_APRES_DEBUT_RECOLTE_SANS_FIN jours après son début), ou
+ *   sans date de récolte. 12 % des cultures retenues le 2026-10-10 avaient fini
+ *   leur récolte sans être clôturées : elles sortaient « à arroser ».
  */
-export async function computeConseilIrrigation(
-  userId: string,
-  annee: number,
-  persisterAutoValidation = true,
-) {
+export function whereCulturesEnPlace(annee: number, maintenant: Date = new Date()): Prisma.CultureWhereInput {
+  const borne = new Date(maintenant.getTime() - JOURS_APRES_FIN_RECOLTE * 86_400_000)
+  const borneSansFin = new Date(maintenant.getTime() - JOURS_APRES_DEBUT_RECOLTE_SANS_FIN * 86_400_000)
+  return {
+    AND: [
+      { OR: [{ espece: { vivace: true } }, { annee: { in: [annee - 1, annee] } }] },
+      {
+        OR: [
+          { espece: { vivace: true } },
+          { dateRecolte: null, finRecolte: null },
+          { finRecolte: { gte: borne } },
+          // Sans fin de récolte, `dateRecolte` n'en est que le début.
+          { finRecolte: null, dateRecolte: { gte: borneSansFin } },
+        ],
+      },
+    ],
+  }
+}
+
+export async function computeConseilIrrigation(userId: string, annee: number) {
   // 1. Récupérer cultures actives avec planches + coordonnées parcelle
   const cultures = await prisma.culture.findMany({
     where: {
       userId,
-      annee,
       terminee: null,
       AND: [
+        whereCulturesEnPlace(annee),
         cultureIrrigationDemarreeWhere,
         {
           OR: [
@@ -272,6 +176,8 @@ export async function computeConseilIrrigation(
       semisFait: true,
       dateSemis: true,
       datePlantation: true,
+      dateRecolte: true,
+      finRecolte: true,
       nbRangs: true,
       longueur: true,
       espece: {
@@ -281,6 +187,7 @@ export async function computeConseilIrrigation(
           couleur: true,
           besoinEau: true,
           irrigation: true,
+          vivace: true,
         },
       },
       planche: {
@@ -300,6 +207,7 @@ export async function computeConseilIrrigation(
               id: true,
               centroidLat: true,
               centroidLng: true,
+              typeSol: true,
             },
           },
         },
@@ -307,23 +215,6 @@ export async function computeConseilIrrigation(
       variete: {
         select: {
           id: true,
-        },
-      },
-      irrigationsPlanifiees: {
-        where: {
-          fait: false,
-          perimee: false,
-          datePrevue: {
-            gte: new Date(),
-            lte: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-          },
-        },
-        select: {
-          id: true,
-          datePrevue: true,
-        },
-        orderBy: {
-          datePrevue: 'asc',
         },
       },
     },
@@ -337,6 +228,7 @@ export async function computeConseilIrrigation(
   //    Fallback : si une culture n'a pas de parcelle géo, utiliser la première
   //    parcelle de l'utilisateur avec des coordonnées
   const meteoParCoord = new Map<string, MeteoParCoord>()
+  const coordsParZone = new Map<string, { lat: number; lng: number }>()
   const cultureCoordKey = new Map<number, string>() // cultureId → coordKey
 
   // Fallback coords : première parcelle géo de l'utilisateur
@@ -345,12 +237,15 @@ export async function computeConseilIrrigation(
 
   const premiereParcelle = await prisma.parcelleGeo.findFirst({
     where: { userId, centroidLat: { not: null }, centroidLng: { not: null } },
-    select: { centroidLat: true, centroidLng: true },
+    select: { centroidLat: true, centroidLng: true, typeSol: true },
   })
   if (premiereParcelle?.centroidLat && premiereParcelle?.centroidLng) {
     fallbackLat = premiereParcelle.centroidLat
     fallbackLng = premiereParcelle.centroidLng
   }
+  // Une planche sans parcelle prend la météo de la première parcelle : elle
+  // en prend aussi le sol (revue du 2026-10-10).
+  const solParcelleRepli = premiereParcelle?.typeSol ?? null
 
   for (const c of cultures) {
     let lat = c.planche?.parcelleGeo?.centroidLat
@@ -367,144 +262,50 @@ export async function computeConseilIrrigation(
     const key = `${Math.round(lat * 100)}_${Math.round(lng * 100)}`
     cultureCoordKey.set(c.id, key)
 
-    if (!meteoParCoord.has(key)) {
-      meteoParCoord.set(key, {
-        lat, lng,
-        historique: [], previsions: [],
-        pluie48hPassees: 0, pluie7jPassees: 0, et0_7j: 0,
-        joursSansPluie: 0, pluiePrevue48h: 0, pluiePrevue5j: 0,
-        joursAvantPluie: 99,
-      })
-    }
+    if (!coordsParZone.has(key)) coordsParZone.set(key, { lat, lng })
   }
 
-  // 3. Fetch météo pour chaque zone (en parallèle)
+  // 3. Météo du bilan hydrique pour chaque zone (en parallèle). Une zone en
+  //    échec reste absente : ses cultures passent par le repli « météo
+  //    indisponible », jamais par des zéros qui diraient « tout va bien ».
+  const zonesEnEchec = new Set<string>()
   await Promise.all(
-    Array.from(meteoParCoord.entries()).map(async ([key, entry]) => {
+    Array.from(coordsParZone.entries()).map(async ([key, { lat, lng }]) => {
       try {
-        const today = new Date()
-        const weekAgo = new Date(today)
-        weekAgo.setDate(weekAgo.getDate() - 8)
-        const yesterday = new Date(today)
-        yesterday.setDate(yesterday.getDate() - 1)
-
-        const [historique, forecastData] = await Promise.all([
-          fetchOpenMeteoHistory(
-            entry.lat, entry.lng,
-            weekAgo.toISOString().split('T')[0],
-            yesterday.toISOString().split('T')[0]
-          ),
-          fetchOpenMeteoForecast(entry.lat, entry.lng),
-        ])
-
-        const previsions = forecastData.daily
-
-        // Le forecast inclut aujourd'hui (jour 0). L'archive s'arrête à hier.
-        // On intègre la pluie du jour en cours (forecast[0]) dans les calculs passés.
-        const pluieAujourdhui = previsions.length > 0 ? previsions[0].precipitation : 0
-        const et0Aujourdhui = previsions.length > 0 ? previsions[0].et0 : 0
-
-        // Pluie cumulée : hier + avant-hier + aujourd'hui (forecast)
-        const derniers2jArchive = historique.slice(-2)
-        const pluie48hPassees = derniers2jArchive.reduce((s, d) => s + d.precipitation, 0) + pluieAujourdhui
-
-        // Pluie cumulée 7j = historique + aujourd'hui
-        const pluie7jPassees = historique.reduce((s, d) => s + d.precipitation, 0) + pluieAujourdhui
-
-        // ET0 cumulée 7j + aujourd'hui
-        const et0_7j = historique.reduce((s, d) => s + d.et0, 0) + et0Aujourdhui
-
-        // Jours consécutifs sans pluie significative (>1mm)
-        // Si aujourd'hui il pleut, joursSansPluie = 0
-        let joursSansPluie = 0
-        if (pluieAujourdhui >= 1) {
-          joursSansPluie = 0
-        } else {
-          joursSansPluie = 1 // au moins aujourd'hui
-          for (let i = historique.length - 1; i >= 0; i--) {
-            if (historique[i].precipitation < 1) joursSansPluie++
-            else break
-          }
+        const bilan = await chargerMeteoBilan(lat, lng)
+        if (!bilan) {
+          zonesEnEchec.add(key)
+          return
         }
-
-        // Pluie prevue demain + après-demain (aujourd'hui est déjà compté dans pluie48hPassees)
-        const pluiePrevue48h = previsions.slice(1, 3).reduce((s, d) => s + d.precipitation, 0)
-
-        // Pluie prevue 5 prochains jours (hors aujourd'hui)
-        const pluiePrevue5j = previsions.slice(1, 6).reduce((s, d) => s + d.precipitation, 0)
-
-        // Jours avant prochaine pluie significative (>3mm), à partir de demain
-        let joursAvantPluie = 99
-        for (let i = 1; i < previsions.length; i++) {
-          if (previsions[i].precipitation >= 3) {
-            joursAvantPluie = i
-            break
-          }
-        }
-
-        meteoParCoord.set(key, {
-          lat: entry.lat, lng: entry.lng,
-          historique, previsions,
-          pluie48hPassees, pluie7jPassees, et0_7j,
-          joursSansPluie, pluiePrevue48h, pluiePrevue5j, joursAvantPluie,
-        })
+        meteoParCoord.set(key, { lat, lng, bilan, ...resumeMeteo(bilan) })
       } catch (err) {
         console.error(`Erreur météo pour zone ${key}:`, err)
-        // On garde les valeurs par défaut (0) — fallback sans météo
+        zonesEnEchec.add(key)
       }
     })
   )
 
-  // 4. Auto-valider les irrigations planifiées si la pluie est suffisante
-  const irrigationsAutoValidees: number[] = []
-  for (const c of cultures) {
-    const coordKey = cultureCoordKey.get(c.id)
-    const meteo = coordKey ? meteoParCoord.get(coordKey) ?? null : null
-    if (!meteo) continue
-
-    const sousAbri = TYPES_SOUS_ABRI.includes(c.planche?.type ?? '')
-    if (sousAbri) continue // Sous abri = pluie n'aide pas
-
-    const pluie48h = meteo.pluie48hPassees
-    if (pluie48h < SEUIL_PLUIE_AUTO_VALIDE) continue
-
-    // Auto-valider UNIQUEMENT les irrigations DUES (aujourd'hui ou en retard)
-    // couvertes par la pluie PASSÉE. Avant, on validait aussi les irrigations
-    // FUTURES sur la base des prévisions (joursCouv) : une irrigation de demain
-    // passait « faite » dès aujourd'hui, définitivement, via un simple GET
-    // (audit 2026-07, #34/#46). Les prévisions peuvent changer : on attend
-    // l'échéance réelle.
-    for (const irr of c.irrigationsPlanifiees) {
-      if (new Date(irr.datePrevue).getTime() <= Date.now()) {
-        irrigationsAutoValidees.push(irr.id)
-      }
-    }
-  }
-
-  // Batch auto-validation en DB
-  if (irrigationsAutoValidees.length > 0 && persisterAutoValidation) {
-    await prisma.irrigationPlanifiee.updateMany({
-      where: {
-        id: { in: irrigationsAutoValidees },
-        fait: false, // sécurité
-        // Un passage abandonné n'est pas « couvert par la pluie » : le clore
-        // inventerait un arrosage dans le registre d'interventions.
-        perimee: false,
-      },
-      data: {
-        fait: true,
-        dateEffective: new Date(),
-        notes: `Auto-validé : pluie suffisante (${new Date().toLocaleDateString('fr-FR')})`,
-      },
-    })
-  }
+  // 4. Arrosages saisis depuis le début de l'historique du bilan, par
+  //    culture : « Noter » et interventions « arrosage » avec leur volume
+  //    (`arrosages-saisis.ts`).
+  const arrosagesParCulture = await chargerArrosagesSaisis(userId, cultures, debutArrosagesBilan())
 
   // 5. Calculer urgence + enrichir chaque culture
   const now = Date.now()
   const culturesAvecUrgence = cultures.map(c => {
+    // Dernier arrosage : « Noter » ou intervention « arrosage » (ticket cmv2rdmdn).
+    const arrosages = arrosagesParCulture.get(c.id) ?? []
+    // Jours de calendrier du LIEU, comme le conseiller (`dernierArrosageDuLieu`),
+    // pas des tranches de 24 h : noté hier soir, « Auj. » le restait jusqu'au
+    // soir ; un arrosage daté d'après aujourd'hui ne compte pas (ticket QA
+    // cmv3jatw8). Sans météo, jour de Paris.
+    const meteoLieu = meteoParCoord.get(cultureCoordKey.get(c.id) ?? '')?.bilan ?? null
+    const duLieu = meteoLieu ? dernierArrosageDuLieu(meteoLieu, c.derniereIrrigation, arrosages) : null
+    const dernierArrosageConnu = meteoLieu ? duLieu?.date ?? null : dernierArrosage(c.derniereIrrigation, arrosages)
     let joursSansEau: number | null = null
-    if (c.derniereIrrigation) {
-      joursSansEau = Math.floor((now - new Date(c.derniereIrrigation).getTime()) / (1000 * 60 * 60 * 24))
+    if (meteoLieu && duLieu) joursSansEau = joursEntre(duLieu.jour, meteoLieu.aujourdhui.date)
+    else if (!meteoLieu && dernierArrosageConnu) {
+      joursSansEau = Math.max(0, joursEntre(jourLocalIso(dernierArrosageConnu), jourLocalIso(new Date(now))))
     }
 
     // Âge depuis plantation/semis
@@ -521,39 +322,61 @@ export async function computeConseilIrrigation(
 
     const besoinEau = c.espece?.besoinEau || 3
     const retentionEauSol = c.planche?.retentionEau || null
-    const sousAbri = TYPES_SOUS_ABRI.includes(c.planche?.type ?? '')
+    // Type de planche absent : null, le bilan le signale (ticket QA cmv3ja7nr).
+    const abri = typeSousAbri(c.planche?.type)
+    const sousAbri = abri === true
 
     // Météo pour cette culture
     const coordKey = cultureCoordKey.get(c.id)
     const meteo = coordKey ? meteoParCoord.get(coordKey) ?? null : null
 
-    // Consommation estimée — météo-aware si possible
-    let consommationSemaine: number
-    if (meteo && meteo.historique.length > 0) {
-      const et0Moy = meteo.et0_7j / Math.max(meteo.historique.length, 1)
-      const { litres } = calculerConsommationEauAvecMeteo(
-        surface, besoinEau, retentionEauSol,
-        { et0Journalier: et0Moy, precipitations7j: sousAbri ? 0 : meteo.pluie7jPassees }
-      )
-      consommationSemaine = litres
-    } else {
-      consommationSemaine = calculerConsommationEauAvecSol(surface, besoinEau, retentionEauSol)
-    }
+    // Bilan hydrique de la réserve du sol (moteur unique, bilan-sol.ts).
+    const bilan: ResultatBilanSol | null = meteo
+      ? bilanCulture(
+          meteo.bilan,
+          {
+            espece: c.espece?.nom ?? c.especeId,
+            besoinEau,
+            vivace: c.espece?.vivace ?? false,
+            dateSemis: c.dateSemis,
+            datePlantation: c.datePlantation,
+            semisFait: c.semisFait,
+            plantationFaite: c.plantationFaite,
+            dateRecolte: c.dateRecolte,
+            finRecolte: c.finRecolte,
+            derniereIrrigation: c.derniereIrrigation,
+          },
+          {
+            typeSol: c.planche?.typeSol ?? null,
+            retentionEau: retentionEauSol,
+            typeSolParcelle: c.planche?.parcelleGeo ? c.planche.parcelleGeo.typeSol : solParcelleRepli,
+            irrigation: c.planche?.irrigation ?? null,
+          },
+          { sousAbri: abri, arrosages },
+        )
+      : null
+    const coordKeyCulture = cultureCoordKey.get(c.id)
+    const { urgence, raison } = bilan
+      ? { urgence: bilan.urgence, raison: bilan.raison }
+      : urgenceFallback(
+          joursSansEau, besoinEau, retentionEauSol,
+          coordKeyCulture && zonesEnEchec.has(coordKeyCulture) ? 'meteo-indisponible' : 'sans-coordonnees',
+        )
 
-    // Urgence avec météo
-    const { urgence, raison } = calculerUrgenceMeteo(
-      joursSansEau, besoinEau, retentionEauSol, meteo, sousAbri
-    )
+    // Besoin de la semaine : ETc potentielle moyenne des 7 derniers jours ×
+    // surface (mm × m² = L). Pas la consommation réelle, que le manque d'eau
+    // réduit : une planche assoiffée afficherait un besoin plus faible.
+    const consommationSemaine = bilan
+      ? bilan.etcPotentielleMoyenne7j * 7 * surface
+      : calculerConsommationEauAvecSol(surface, besoinEau, retentionEauSol)
+
+    // Volume d'un passage : dose au sol / efficacité du système, sur la surface de la culture.
+    const volume = bilan ? volumeArrosage(bilan.doseMm, surface, c.planche?.irrigation) : null
 
     // Alerte sécheresse (sol faible rétention + pas pluie + culture exigeante)
     const joursSansPluieEffectifs = meteo ? (sousAbri ? 999 : meteo.joursSansPluie) : 0
     const alerteSecheresseActive = alerteSecheresse(
       joursSansEau, retentionEauSol, besoinEau, joursSansPluieEffectifs
-    )
-
-    // Compter irrigations planifiées restantes (exclure celles auto-validées)
-    const irrigationsRestantes = c.irrigationsPlanifiees.filter(
-      irr => !irrigationsAutoValidees.includes(irr.id)
     )
 
     // Résumé météo pour le frontend
@@ -568,6 +391,8 @@ export async function computeConseilIrrigation(
 
     return {
       ...c,
+      // « Noter » ou intervention « arrosage », le plus récent.
+      derniereIrrigation: dernierArrosageConnu,
       joursSansEau,
       ageJours,
       isJeune,
@@ -576,9 +401,24 @@ export async function computeConseilIrrigation(
       sousAbri,
       alerteSecheresse: alerteSecheresseActive,
       consommationEauSemaine: Math.round(consommationSemaine * 10) / 10,
-      prochainesIrrigations: irrigationsRestantes.length,
-      irrigationsAutoValidees: c.irrigationsPlanifiees.length - irrigationsRestantes.length,
       meteo: meteoResume,
+      /** Réserve du sol (null sans météo). Dose en mm = L/m² ; litres pour la surface. */
+      reserve: bilan && volume
+        ? {
+            depletionMm: bilan.depletionMm,
+            reserveFacileMm: bilan.reserveFacileMm,
+            reserveUtileMm: bilan.reserveUtileMm,
+            tauxEpuisement: bilan.tauxEpuisement,
+            joursAvantSeuil: bilan.joursAvantSeuil,
+            doseMm: bilan.doseMm,
+            litresParM2: volume.litresParM2,
+            litresConseilles: volume.litres,
+            passages: volume.passages,
+            kc: bilan.kc,
+            profondeurRacinesM: bilan.profondeurRacinesM,
+            dernierApport: bilan.dernierApport,
+          }
+        : null,
     }
   })
 
@@ -617,8 +457,6 @@ export async function computeConseilIrrigation(
     haute: culturesAvecUrgence.filter(c => c.urgence === 'haute').length,
     aucune: culturesAvecUrgence.filter(c => c.urgence === 'aucune').length,
     jamaisArrose: culturesAvecUrgence.filter(c => c.joursSansEau === null).length,
-    prochainesIrrigations7j: culturesAvecUrgence.reduce((s, c) => s + c.prochainesIrrigations, 0),
-    irrigationsAutoValidees: irrigationsAutoValidees.length,
     consommationTotaleEstimee: consommationHebdoTotale(culturesAvecUrgence),
     parTypeIrrigation: Object.entries(parTypeIrrigation).map(([type, cultures]) => ({
       type,

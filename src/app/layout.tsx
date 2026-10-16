@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
-import { Space_Grotesk, Inter, JetBrains_Mono } from "next/font/google";
+import { Space_Grotesk, Inter, JetBrains_Mono, Fraunces } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
 
 import { Toaster } from "@/components/ui/toaster";
@@ -14,6 +15,7 @@ import { BandeauExploitation } from "@/components/exploitation/BandeauExploitati
 import { ChatBubble } from "@/components/chat/ChatBubble";
 import { DailyBriefingPopup } from "@/components/chat/DailyBriefingPopup";
 import { PushRegister } from "@/components/notifications/push-register";
+import { CoquilleV2 } from "@/components/accueil/CoquilleV2";
 
 
 const spaceGrotesk = Space_Grotesk({
@@ -36,13 +38,34 @@ const jetbrainsMono = JetBrains_Mono({
   weight: ["400", "500"],
 });
 
+// Charte « carnet de ferme » : Geist pour l'interface (fichier local déjà
+// dans le dépôt) et Fraunces pour les titres, exposées sous --font-ui et
+// --font-display. Depuis L2 (2026-10-09), font-sans et font-heading pointent
+// dessus (tailwind.config.ts) ; Inter et Space Grotesk restent chargées
+// jusqu'au retrait L5, prouvé par captures.
+const geist = localFont({
+  src: "./fonts/GeistVF.woff",
+  variable: "--font-ui",
+  display: "swap",
+  weight: "100 900",
+});
+
+const fraunces = Fraunces({
+  subsets: ["latin", "latin-ext"],
+  variable: "--font-display",
+  display: "swap",
+  axes: ["opsz"],
+});
+
 export const metadata: Metadata = {
   title: {
-    default: "Gleba — Logiciel libre pour micro-fermes diversifiées",
+    default: "Gleba — Logiciel libre de maraîchage et de micro-ferme",
     template: "%s | Gleba",
   },
   description: "Le carnet d'exploitation libre des micro-fermes professionnelles ou en installation : planification maraîchère, verger, élevage, traçabilité et gestion.",
   keywords: [
+    "logiciel maraîchage libre",
+    "logiciel maraîchage open source",
     "logiciel micro-ferme",
     "logiciel micro-ferme professionnelle",
     "logiciel ferme diversifiée",
@@ -64,8 +87,8 @@ export const metadata: Metadata = {
   publisher: "Gleba",
   metadataBase: new URL("https://gleba.fr"),
   openGraph: {
-    title: "Gleba — Le carnet d'exploitation libre des micro-fermes",
-    description: "Planifiez le maraîchage, suivez le verger et gardez une traçabilité cohérente jusqu'à la gestion de l'exploitation.",
+    title: "Gleba, le carnet libre des micro-fermes",
+    description: "Chaque matin, ce qu'il y a à faire, planche par planche : maraîchage, verger, élevage, météo de la parcelle et plan de la ferme dans un même dossier.",
     url: "https://gleba.fr",
     siteName: "Gleba",
     locale: "fr_FR",
@@ -75,14 +98,14 @@ export const metadata: Metadata = {
         url: "/og-image.png",
         width: 1200,
         height: 630,
-        alt: "Gleba, carnet d'exploitation libre pour micro-fermes diversifiées",
+        alt: "Gleba, le carnet libre des micro-fermes : l'écran Aujourd'hui",
       },
     ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "Gleba — Carnet d'exploitation libre pour micro-fermes",
-    description: "Maraîchage, verger, élevage et traçabilité dans un même outil, hébergé pour vous ou auto-hébergeable.",
+    title: "Gleba, le carnet libre des micro-fermes",
+    description: "Maraîchage, verger, élevage et traçabilité dans un même carnet, hébergé pour vous ou auto-hébergeable.",
     images: ["/og-image.png"],
   },
   robots: {
@@ -96,9 +119,9 @@ export const metadata: Metadata = {
       "max-snippet": -1,
     },
   },
-  alternates: {
-    canonical: "https://gleba.fr",
-  },
+  // Pas de canonical ici : héritée, elle désignait l'accueil comme original
+  // de toute page qui n'en déclare pas (/communaute, /glossaire, /licence).
+  // Chaque page publique pose la sienne.
   icons: {
     icon: [
       { url: "/icon-192.png", type: "image/png", sizes: "192x192" },
@@ -124,8 +147,8 @@ const jsonLdSoftware = {
   name: "Gleba",
   applicationCategory: "BusinessApplication",
   applicationSubCategory: "Farm Management Software",
-  operatingSystem: "Web, Self-hosted (Docker)",
-  description: "Carnet d'exploitation libre pour les micro-fermes professionnelles ou en installation : planification maraîchère, verger, élevage, traçabilité et gestion.",
+  operatingSystem: "Web, Linux (Docker)",
+  description: "Logiciel libre de gestion pour micro-fermes professionnelles ou en installation : planification maraîchère, verger, élevage, traçabilité et gestion. L'écran Aujourd'hui rassemble chaque matin ce qu'il y a à faire, classé par urgence.",
   url: "https://gleba.fr",
   author: {
     "@type": "Person",
@@ -133,20 +156,29 @@ const jsonLdSoftware = {
   },
   license: "https://www.gnu.org/licenses/agpl-3.0.html",
   image: "https://gleba.fr/og-image.png",
+  screenshot: "https://gleba.fr/screenshots/vitrine-plan-bureau.webp",
   inLanguage: "fr-FR",
+  isAccessibleForFree: true,
+  // Le code est gratuit ; le service hébergé l'est pendant la bêta seulement
+  // (Gleba-produit § Modèle économique) : ne pas promettre davantage ici.
+  offers: {
+    "@type": "Offer",
+    price: "0",
+    priceCurrency: "EUR",
+    description: "Logiciel libre AGPL-3.0 ; service hébergé sur gleba.fr gratuit pendant la bêta.",
+  },
   featureList: [
-    "Planification maraîchère et rotation des cultures",
-    "Calendrier de semis et calendrier lunaire",
-    "Gestion de verger (25 espèces, 40 variétés)",
-    "Suivi d'élevage (volailles, ruches, ovins)",
-    "Comptabilité et facturation",
-    "Traçabilité phytosanitaire (AMM, DAR)",
-    "Plan 2D interactif de l'exploitation",
-    "Météo et conseils d'irrigation",
-    "Assistant IA en langage naturel",
-    "135 espèces végétales pré-configurées",
+    "Écran Aujourd'hui : tâches du jour classées par urgence",
+    "Planification maraîchère, calendrier de semis et rotation des cultures",
+    "Plan 2D et vue 3D de la ferme sur photo aérienne et cadastre",
+    "Météo à la parcelle et conseils d'irrigation",
+    "Suivi du verger arbre par arbre",
+    "Ateliers d'élevage : lots, soins, naissances, productions",
+    "Registre phytosanitaire (AMM, dose, DAR, ZNT)",
+    "Stocks, boutique de vente directe, factures et TVA",
+    "Assistant IA connecté aux données de l'exploitation",
+    "Auto-hébergement Docker Compose et export complet des données",
   ],
-  aggregateRating: undefined,
 };
 
 const jsonLdOrganization = {
@@ -154,7 +186,7 @@ const jsonLdOrganization = {
   "@type": "Organization",
   name: "Gleba",
   url: "https://gleba.fr",
-  logo: "https://gleba.fr/gleba-logo.png",
+  logo: "https://gleba.fr/icon-512.png",
   email: "contact@gleba.fr",
   founder: {
     "@type": "Person",
@@ -199,12 +231,13 @@ export default function RootLayout({
         />
       </head>
       <body
-        className={`${inter.variable} ${spaceGrotesk.variable} ${jetbrainsMono.variable} font-sans antialiased`}
+        className={`${inter.variable} ${spaceGrotesk.variable} ${jetbrainsMono.variable} ${geist.variable} ${fraunces.variable} font-sans antialiased`}
       >
         <SessionProvider>
           <ImpersonationBanner />
           <BandeauExploitation />
           <OnboardingRedirect />
+          <CoquilleV2 />
           {children}
           <DailyBriefingPopup />
           <ChatBubble />

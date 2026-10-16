@@ -3,9 +3,7 @@
 import * as React from "react"
 import {
   Droplets,
-  AlertTriangle,
   CheckCircle2,
-  CloudRain,
   Loader2,
   ChevronDown,
   ChevronUp,
@@ -15,10 +13,17 @@ import {
   TrendingDown,
   Minus,
   Info,
-  Droplet,
 } from "lucide-react"
-import { Button } from "@/components/ui/button"
+import Link from "next/link"
 import { useToast } from "@/hooks/use-toast"
+import { Button } from "@/components/ui/button"
+import { LigneRegistre } from "@/components/accueil/LigneRegistre"
+import { PastilleEtat, type EtatRegistre } from "@/components/accueil/PastilleEtat"
+import { formatNombre } from "@/lib/format-utils"
+import { libelleIrrigation } from "@/lib/planches/libelle-irrigation"
+import { annulerArrosage, noterArrosage } from "@/lib/irrigation/noter-arrosage"
+import { aideQuantite, detailArrosageNote, lireLitres, litresConseilles } from "@/lib/irrigation/quantite-versee"
+import { notifierEnregistrement } from "@/lib/notifications-ecran"
 
 // ============================================================
 // TYPES
@@ -43,6 +48,11 @@ interface RecommandationIrrigation {
   etatCulture: string
   derniereIrrigation: string | null
   irrigationSysteme: string | null
+  /** null : type de planche non renseigné. */
+  sousAbri: boolean | null
+  surfaceM2: number
+  /** Champs de la planche à renseigner pour un conseil sûr (« type », « sol »). */
+  plancheACompleter: string[]
 }
 
 interface IrrigationData {
@@ -126,34 +136,33 @@ export function IrrigationAdvisor({ parcelleId, lat, lng, scopeLabel }: Irrigati
     }
   }, [parcelleId])
 
-  const marquerArrosee = React.useCallback(async (reco: RecommandationIrrigation) => {
+  // Ticket QA cmv3japsf : « Noter » demande la quantité versée. Avec elle, le
+  // bilan retranche ces litres ; « Quantité inconnue » (litres null) compte un
+  // arrosage complet, comme avant. Même route que les autres écrans.
+  const marquerArrosee = React.useCallback(async (reco: RecommandationIrrigation, litres: number | null) => {
     setSavingPlancheId(reco.plancheId)
     try {
-      const response = await fetch("/api/cultures/irriguer", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cultureIds: reco.cultureIds, marquerArrosage: true }),
-      })
-      if (!response.ok) throw new Error("Impossible de noter l'arrosage")
+      const resultat = await noterArrosage(reco.cultureIds, null, litres, "advisor")
+      if (!resultat.ok) throw new Error(resultat.erreur)
       await fetchRecos(true)
-      window.dispatchEvent(new CustomEvent("gleba:irrigation-updated", {
-        detail: { source: "advisor" },
-      }))
-      toast({
-        title: "Planche arrosée",
-        description: (reco.cultureCount > 1
-          ? `${reco.cultureCount} cultures synchronisées et alertes recalculées.`
-          : "La recommandation vient d’être recalculée.")
-          // QA cmsioeku5 — l'arrosage est désormais tracé : on le dit, sinon
-          // l'utilisateur ne sait pas où retrouver l'opération.
-          + " Arrosage consigné dans les interventions.",
+      // QA cmsioeku5 — l'arrosage est tracé : on dit où le retrouver.
+      notifierEnregistrement({
+        titre: "Arrosage noté",
+        detail: detailArrosageNote(reco.plancheName, litres),
+        // L'annulation émet « gleba:irrigation-updated » : le conseil se recharge.
+        annuler: async () => {
+          const annule = await annulerArrosage(resultat.annulation)
+          if (!annule.ok) throw new Error(annule.erreur)
+        },
       })
-    } catch {
+      return true
+    } catch (e) {
       toast({
         variant: "destructive",
         title: "Erreur",
-        description: "Impossible de noter l’arrosage.",
+        description: e instanceof Error && e.message ? e.message : "Impossible de noter l’arrosage.",
       })
+      return false
     } finally {
       setSavingPlancheId(null)
     }
@@ -275,9 +284,7 @@ export function IrrigationAdvisor({ parcelleId, lat, lng, scopeLabel }: Irrigati
             </span>
           )}
           {data.urgentes > 0 && (
-            <span className="text-xs font-medium text-red-600 bg-red-50 px-2 py-1 rounded-full">
-              {data.urgentes} urgente{data.urgentes > 1 ? "s" : ""}
-            </span>
+            <PastilleEtat etat="critique" libelle={`${data.urgentes} urgente${data.urgentes > 1 ? "s" : ""}`} />
           )}
           <button
             onClick={(e) => { e.stopPropagation(); fetchRecos(true) }}
@@ -375,7 +382,7 @@ export function IrrigationAdvisor({ parcelleId, lat, lng, scopeLabel }: Irrigati
         Les conseils tiennent compte des arrosages notés. Un équipement automatique
         indique le système installé, pas qu&apos;un passage a réellement eu lieu.
       </div>
-      <div className="divide-y">
+      <div>
         {displayed.map((reco) => (
           <RecoRow
             key={reco.plancheId}
@@ -412,6 +419,21 @@ export function IrrigationAdvisor({ parcelleId, lat, lng, scopeLabel }: Irrigati
 // LIGNE DE RECOMMANDATION
 // ============================================================
 
+/** Champs de planche manquants, tels que la fiche planche les nomme. */
+const CHAMPS_PLANCHE: Record<string, string> = {
+  type: "type (plein champ, serre, tunnel)",
+  sol: "sol",
+}
+
+/** Verbe d'une recommandation d'arrosage, par urgence. */
+const ETAT_URGENCE: Record<RecommandationIrrigation["urgence"], { etat: EtatRegistre; libelle: string }> = {
+  critique: { etat: "critique", libelle: "À arroser d'urgence" },
+  haute: { etat: "attention", libelle: "À arroser" },
+  moyenne: { etat: "neutre", libelle: "À surveiller" },
+  faible: { etat: "info", libelle: "Peut attendre" },
+  aucune: { etat: "ok", libelle: "Rien à faire" },
+}
+
 function RecoRow({
   reco,
   saving,
@@ -419,84 +441,123 @@ function RecoRow({
 }: {
   reco: RecommandationIrrigation
   saving: boolean
-  onWater: (reco: RecommandationIrrigation) => Promise<void>
+  onWater: (reco: RecommandationIrrigation, litres: number | null) => Promise<boolean>
 }) {
   const [expanded, setExpanded] = React.useState(false)
+  /** Litres en cours de saisie ; null : formulaire fermé. */
+  const [litres, setLitres] = React.useState<string | null>(null)
 
-  const urgenceConfig = {
-    critique: { bg: "bg-red-50", text: "text-red-700", border: "border-red-200", label: "Critique", icon: AlertTriangle },
-    haute: { bg: "bg-orange-50", text: "text-orange-700", border: "border-orange-200", label: "Haute", icon: AlertTriangle },
-    moyenne: { bg: "bg-yellow-50", text: "text-yellow-700", border: "border-yellow-200", label: "Moyenne", icon: Droplets },
-    faible: { bg: "bg-blue-50", text: "text-blue-700", border: "border-blue-200", label: "Faible", icon: Droplets },
-    aucune: { bg: "bg-green-50", text: "text-green-700", border: "border-green-200", label: "OK", icon: CheckCircle2 },
+  // P4 « une liste est un registre » (2026-10-09) : l'urgence se lit en
+  // verbe dans une pastille, plus en fond rouge ni en badge « Critique ».
+  const { etat, libelle } = ETAT_URGENCE[reco.urgence]
+  const arroseeAujourdhui = reco.joursDepuisIrrigation === 0
+  // Encore à arroser après un apport partiel : on peut noter le complément.
+  const aArroser = reco.urgence === "critique" || reco.urgence === "haute"
+  // Mêmes chiffres et mêmes mots que les Tâches et le Calendrier (`quantite-versee.ts`).
+  const conseilLitres = litresConseilles(reco.conseilQuantite, reco.surfaceM2)
+  const litresSaisis = litres === null ? NaN : lireLitres(litres)
+  const enregistrer = async (quantite: number | null) => {
+    if (await onWater(reco, quantite)) setLitres(null)
   }
-
-  const config = urgenceConfig[reco.urgence]
-  const Icon = config.icon
+  const aCompleter = (reco.plancheACompleter ?? []).map((champ) => CHAMPS_PLANCHE[champ] ?? champ)
 
   return (
-    <div className={`${reco.urgence === "critique" || reco.urgence === "haute" ? config.bg : ""}`}>
-      <div
-        className="px-3 py-2 flex items-center justify-between cursor-pointer hover:bg-slate-50/50 transition-colors"
-        onClick={() => setExpanded(!expanded)}
-      >
-        <div className="flex items-center gap-2 min-w-0">
-          <Icon className={`h-4 w-4 flex-shrink-0 ${config.text}`} />
-          <div className="min-w-0">
-            <p className="text-sm font-medium truncate">
-              {reco.cultureName}
-              {reco.varietyName ? ` · ${reco.varietyName}` : ""}
-            </p>
-            <p className="text-xs text-slate-400 truncate">
-              {reco.plancheName} · {reco.etatCulture}
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
-          {reco.pluiePrevue48h > 3 && (
-            <span className="text-xs text-blue-500 flex items-center gap-0.5">
-              <CloudRain className="h-3 w-3" />
-              {Math.round(reco.pluiePrevue48h)}mm
+    <div>
+      <LigneRegistre
+        etat={etat}
+        titre={
+          <button
+            type="button"
+            onClick={() => setExpanded(!expanded)}
+            aria-expanded={expanded}
+            className="-my-1.5 flex min-h-11 min-w-0 max-w-full items-center gap-1.5 text-left hover:underline"
+          >
+            {expanded ? (
+              <ChevronUp className="h-4 w-4 shrink-0 text-ardoise" aria-hidden />
+            ) : (
+              <ChevronDown className="h-4 w-4 shrink-0 text-ardoise" aria-hidden />
+            )}
+            {/* cultureName porte déjà la variété (libelleEspeceVariete) :
+                la rajouter la répétait (QA cmv2ex2vq). */}
+            <span className="truncate">{reco.cultureName}</span>
+          </button>
+        }
+        meta={[
+          reco.plancheName,
+          reco.cultureCount > 1 ? `${reco.cultureCount} cultures` : reco.etatCulture,
+          reco.pluiePrevue48h > 3 ? `${Math.round(reco.pluiePrevue48h)} mm de pluie sous 48 h` : "",
+          arroseeAujourdhui ? "Arrosée aujourd'hui" : "",
+          // Tickets QA cmv3ja7nr et cmv3jaru7 : un conseil calculé sans type
+          // ou sans sol de planche le dit, avec le chemin pour le compléter.
+          aCompleter.length > 0 ? (
+            <Link href={`/maraichage/planches/${encodeURIComponent(reco.plancheId)}`} className="font-medium text-argile underline underline-offset-2">
+              Planche à compléter : {aCompleter.join(", ")}
+            </Link>
+          ) : "",
+        ]}
+        pastille={<PastilleEtat etat={etat} libelle={libelle} className="hidden sm:inline-flex" />}
+        action={
+          arroseeAujourdhui && !aArroser
+            ? undefined
+            : {
+                libelle: saving ? "…" : "Noter",
+                disabled: saving || litres !== null,
+                onClick: () => setLitres(conseilLitres ? String(conseilLitres) : ""),
+              }
+        }
+      />
+
+      {litres !== null && (
+        <form
+          className="space-y-2 border-b border-lin-doux bg-slate-50/60 px-4 py-3 pl-7"
+          onSubmit={(e) => {
+            e.preventDefault()
+            if (litresSaisis > 0) void enregistrer(litresSaisis)
+          }}
+        >
+          <label htmlFor={`litres-${reco.plancheId}`} className="block text-xs font-medium text-encre">
+            Quantité versée sur {reco.plancheName}
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="flex items-center gap-1.5">
+              <input
+                id={`litres-${reco.plancheId}`}
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
+                autoFocus
+                value={litres}
+                onChange={(e) => setLitres(e.target.value)}
+                className="h-9 w-28 rounded-md border border-input bg-white px-2 text-sm"
+              />
+              <span className="text-sm text-slate-600">L</span>
             </span>
-          )}
-          <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${config.bg} ${config.text} border ${config.border}`}>
-            {config.label}
-          </span>
-          {reco.joursDepuisIrrigation === 0 ? (
-            <span className="hidden text-xs font-medium text-cyan-700 sm:inline">
-              Arrosée aujourd&apos;hui
-            </span>
-          ) : (
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="h-7 px-2 text-xs text-cyan-700"
-              disabled={saving}
-              onClick={(event) => {
-                event.stopPropagation()
-                void onWater(reco)
-              }}
-              title={reco.cultureCount > 1
-                ? `Noter l'arrosage de toute la planche (${reco.cultureCount} cultures)`
-                : "Noter l’arrosage d’aujourd’hui"}
-            >
-              {saving
-                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                : <Droplet className="h-3.5 w-3.5" />}
-              <span className="ml-1 hidden sm:inline">Noter</span>
+            <Button type="submit" size="sm" className="h-9" disabled={saving || !(litresSaisis > 0)}>
+              Enregistrer
             </Button>
-          )}
-        </div>
-      </div>
+            <Button type="button" size="sm" variant="outline" className="h-9" disabled={saving} onClick={() => void enregistrer(null)}>
+              Quantité inconnue
+            </Button>
+            <Button type="button" size="sm" variant="ghost" className="h-9" disabled={saving} onClick={() => setLitres(null)}>
+              Fermer
+            </Button>
+          </div>
+          <p className="text-[11px] leading-relaxed text-slate-500">
+            {aideQuantite(reco.conseilQuantite, reco.surfaceM2)}
+          </p>
+        </form>
+      )}
 
       {expanded && (
-        <div className="px-3 pb-2 pl-9">
+        <div className="border-b border-lin-doux px-4 pb-3 pl-7">
           <p className="text-xs text-slate-600 leading-relaxed">{reco.conseilMessage}</p>
           <div className="flex items-center gap-3 mt-1.5 text-[10px] text-slate-400">
-            <span>Bilan 7j : {reco.bilanHydrique7j > 0 ? "+" : ""}{reco.bilanHydrique7j}mm</span>
-            <span>{reco.joursSansPluie}j sans pluie</span>
-            {reco.conseilQuantite > 0 && <span className="font-medium text-blue-600">{reco.conseilQuantite} L/m2</span>}
+            <span>Bilan 7 j : {reco.bilanHydrique7j > 0 ? "+" : ""}{formatNombre(reco.bilanHydrique7j, 1)} mm</span>
+            {/* Sous abri, il ne pleut pas : « 0 j sans pluie » n'avait pas de sens. */}
+            {reco.sousAbri ? <span>Sous abri</span> : <span>{reco.joursSansPluie} j sans pluie</span>}
+            {reco.conseilQuantite > 0 && (
+              <span className="font-medium text-blue-600">{formatNombre(reco.conseilQuantite, 1)} L/m²</span>
+            )}
           </div>
           <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-slate-500">
             {reco.derniereIrrigation && (
@@ -504,7 +565,8 @@ function RecoRow({
                 Dernier arrosage : {new Date(reco.derniereIrrigation).toLocaleDateString("fr-FR")}
               </span>
             )}
-            {reco.irrigationSysteme && <span>Équipement : {reco.irrigationSysteme}</span>}
+            {/* « Goutte-a-goutte » enregistré par la fiche planche (QA cmv3javy4). */}
+            {reco.irrigationSysteme && <span>Équipement : {libelleIrrigation(reco.irrigationSysteme)}</span>}
           </div>
         </div>
       )}

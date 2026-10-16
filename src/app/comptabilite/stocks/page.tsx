@@ -34,16 +34,22 @@ const MODULE_ICONS: Record<string, React.ReactNode> = {
   elevage: <Bird className="h-4 w-4 text-amber-600" />,
 }
 
-const MODULE_COLORS: Record<string, string> = {
-  potager: "bg-green-100 text-green-800",
-  verger: "bg-lime-100 text-lime-800",
-  elevage: "bg-amber-100 text-amber-800",
+interface StocksStats {
+  totalItems: number
+  alertes: number
+  valeurTotale: number
+  valeurParModule?: Record<string, number>
+  parModule: Record<string, number>
 }
 
 interface Reconciliation {
   annee: number
+  aDesRecoltes: boolean
+  /** Part en kilos seulement ; afficher les champs `*Texte`, ventilés par unité. */
   totalRecoltesAnnee: number
+  totalRecoltesAnneeTexte: string
   parStatut: Record<string, number>
+  parStatutTexte: Record<string, string>
 }
 
 export default function StocksPage() {
@@ -51,7 +57,7 @@ export default function StocksPage() {
   const [isLoading, setIsLoading] = React.useState(true)
   const [stocks, setStocks] = React.useState<StockItem[]>([])
   const [alertes, setAlertes] = React.useState<StockItem[]>([])
-  const [stats, setStats] = React.useState<any>(null)
+  const [stats, setStats] = React.useState<StocksStats | null>(null)
   const [reconciliation, setReconciliation] = React.useState<Reconciliation | null>(null)
   const [selectedModule, setSelectedModule] = React.useState<string>("all")
 
@@ -66,7 +72,7 @@ export default function StocksPage() {
         setStats(result.stats)
         setReconciliation(result.reconciliationPotager ?? null)
       }
-    } catch (error) {
+    } catch {
       toast({ variant: "destructive", title: "Erreur", description: "Impossible de charger les données" })
     } finally {
       setIsLoading(false)
@@ -225,7 +231,7 @@ export default function StocksPage() {
         {/* Bug cmp8sqkh2 (Marc 2026-05-16) — Conciliation Récoltes potager
             pour expliquer l'écart entre dashboard et stocks (90 kg récoltés
             ≠ 85 kg en stock = 5 kg vendus/donnés). */}
-        {reconciliation && reconciliation.totalRecoltesAnnee > 0 && (
+        {reconciliation && reconciliation.aDesRecoltes && (
           <Card className="mb-6 border-violet-200 bg-violet-50/50">
             <CardHeader className="pb-2">
               <CardTitle className="text-sm">
@@ -236,12 +242,12 @@ export default function StocksPage() {
               <div className="grid gap-3 grid-cols-2 md:grid-cols-4 text-sm">
                 <div>
                   <p className="text-xs text-muted-foreground">Total récolté</p>
-                  <p className="font-semibold">{reconciliation.totalRecoltesAnnee.toFixed(1)} kg</p>
+                  <p className="font-semibold">{reconciliation.totalRecoltesAnneeTexte}</p>
                 </div>
-                {Object.entries(reconciliation.parStatut).map(([statut, kg]) => (
+                {Object.entries(reconciliation.parStatutTexte).map(([statut, texte]) => (
                   <div key={statut}>
                     <p className="text-xs text-muted-foreground capitalize">{statut.replace(/_/g, ' ')}</p>
-                    <p className="font-medium">{kg.toFixed(1)} kg</p>
+                    <p className="font-medium">{texte}</p>
                   </div>
                 ))}
               </div>

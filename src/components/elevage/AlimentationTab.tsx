@@ -5,7 +5,8 @@
  */
 
 import * as React from "react"
-import { useRouter, useSearchParams } from "next/navigation"
+import { useSearchParams } from "next/navigation"
+import { updateDashboardSearchParams } from "@/lib/dashboard-navigation"
 import {
   Package,
   TrendingDown,
@@ -64,7 +65,6 @@ export function AlimentationTab({ year }: { year?: number } = {}) {
   // s'ouvrait pas. On lit `sub` (onglet) et `animalId` (pré-remplissage du
   // soin) depuis l'URL et on se resynchronise à chaque navigation interne.
   const [activeSub, setActiveSub] = React.useState<string>("stocks")
-  const router = useRouter()
   const searchParams = useSearchParams()
   const [soinAnimalId, setSoinAnimalId] = React.useState<string | null>(null)
   const [ouvrirNouveauSoin, setOuvrirNouveauSoin] = React.useState(false)
@@ -106,9 +106,11 @@ export function AlimentationTab({ year }: { year?: number } = {}) {
       params.set("sub", "soins")
       params.delete("animalId")
       params.delete("action")
-      router.replace(`/elevage?${params.toString()}`, { scroll: false })
+      // API History : router.replace sur la seule query est un no-op en
+      // production (QA cmv2ec55b), le deep-link restait dans l'URL.
+      updateDashboardSearchParams(params, "replace")
     }
-  }, [searchParams, router])
+  }, [searchParams])
 
   const handleSubChange = React.useCallback((sub: string) => {
     setActiveSub(sub)
@@ -117,8 +119,8 @@ export function AlimentationTab({ year }: { year?: number } = {}) {
     params.set("sub", sub)
     params.delete("animalId")
     params.delete("action")
-    router.replace(`/elevage?${params.toString()}`, { scroll: false })
-  }, [router, searchParams])
+    updateDashboardSearchParams(params, "replace")
+  }, [searchParams])
 
   return (
     <Tabs value={activeSub} onValueChange={handleSubChange} className="space-y-4">
@@ -843,7 +845,14 @@ function ConsommationsSubTab({ year }: { year?: number } = {}) {
                       emptyLabel="Sélectionner un animal"
                     />
                   )}
-                  <p className="text-xs text-muted-foreground">Une saisie globale sera ventilée par effectif dans l'analyse économique.</p>
+                  {/* QA cmv2evlla — l'aide promettait une ventilation par effectif
+                      que l'analyse économique n'a jamais faite : une saisie
+                      globale y reste dans « Non affecté » (analyse-couts). */}
+                  <p className="text-xs text-muted-foreground">
+                    {formData.cible === "tous"
+                      ? "Une saisie globale n'est imputée à aucun atelier : l'économie de l'élevage la compte dans « Non affecté », sans répartition ; seule l'économie lait & fromage en retient une part au prorata des têtes laitières. Choisissez un lot ou un animal pour imputer son coût."
+                      : "Le coût est imputé à l'atelier de l'espèce choisie dans l'économie de l'élevage."}
+                  </p>
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2"><Label>Date</Label><Input type="date" value={formData.date} onChange={(e) => setFormData(f => ({ ...f, date: e.target.value }))} /></div>
@@ -1005,6 +1014,19 @@ function remiseEnVente(fin: string | null): Date | null {
   return d
 }
 
+// Tickets vigie2cc83585 / cmupz9djj (2026-10-01) — une injection réalisée
+// affiche sa date RÉELLE (sinon sa date prévue) et se redate depuis l'écran.
+function versDateHeureLocale(iso: string | Date): string {
+  const d = new Date(iso)
+  const p = (n: number) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+function dateAfficheeInjection(injection: { datePrevue: string; dateRealisee: string | null; statut: string }): string {
+  const d = injection.statut === "realisee" && injection.dateRealisee ? injection.dateRealisee : injection.datePrevue
+  return new Date(d).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })
+}
+
 const SOIN_TYPE_LABELS: Record<string, string> = {
   vaccination: "Vaccination",
   vermifuge: "Vermifuge",
@@ -1102,6 +1124,9 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
   const [periode, setPeriode] = React.useState<PeriodeListe>("exercice")
   // QA 2026-05-15 — édition par ligne
   const [editingSoinId, setEditingSoinId] = React.useState<number | null>(null)
+  const [datationInjection, setDatationInjection] = React.useState<
+    { soinId: number; injectionId: string; numero: number; valeur: string; marquerFaite: boolean } | null
+  >(null)
 
   const [formData, setFormData] = React.useState(soinFormVide)
   const [ajoutLotPharmacieOuvert, setAjoutLotPharmacieOuvert] = React.useState(false)
@@ -1433,22 +1458,76 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
     }
   }
 
-  const changerInjection = async (soinId: number, injectionId: string, statut: "a_faire" | "realisee" | "annulee") => {
+  const envoyerInjection = async (
+    soinId: number,
+    injectionId: string,
+    corps: { statut?: "a_faire" | "realisee" | "annulee"; dateRealisee?: string | null },
+    titre: string,
+  ): Promise<boolean> => {
     try {
       const res = await fetch(`/api/elevage/soins/${soinId}/injections`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ injectionId, statut, dateRealisee: statut === "realisee" ? new Date().toISOString() : null }),
+        body: JSON.stringify({ injectionId, ...corps }),
       })
       if (!res.ok) {
         const body = await res.json().catch(() => null)
         throw new Error(body?.error || "Mise à jour impossible")
       }
-      toast({ title: statut === "realisee" ? "Injection enregistrée" : statut === "annulee" ? "Injection annulée" : "Injection rouverte" })
+      toast({ title: titre })
       fetchData()
+      return true
     } catch (error) {
       toast({ variant: "destructive", title: "Erreur", description: error instanceof Error ? error.message : "Mise à jour impossible" })
+      return false
     }
+  }
+
+  const changerInjection = async (
+    soinId: number,
+    injection: { id: string; numero: number; datePrevue: string },
+    statut: "a_faire" | "realisee" | "annulee",
+  ) => {
+    if (statut === "realisee") {
+      // Une injection prévue il y a plus d'un jour est presque toujours une
+      // ressaisie : on demande sa date réelle (pré-remplie avec la date
+      // prévue) au lieu d'horodater l'instant du clic, qui fausserait le
+      // délai d'attente. Une injection du jour reste validée en un clic.
+      const prevue = new Date(injection.datePrevue)
+      if (Date.now() - prevue.getTime() > 24 * 3_600_000) {
+        setDatationInjection({ soinId, injectionId: injection.id, numero: injection.numero, valeur: versDateHeureLocale(prevue), marquerFaite: true })
+        return
+      }
+      await envoyerInjection(soinId, injection.id, { statut, dateRealisee: new Date().toISOString() }, "Injection enregistrée")
+      return
+    }
+    await envoyerInjection(soinId, injection.id, { statut, dateRealisee: null }, statut === "annulee" ? "Injection annulée" : "Injection rouverte")
+  }
+
+  const ouvrirDatation = (soinId: number, injection: { id: string; numero: number; datePrevue: string; dateRealisee: string | null }) => {
+    setDatationInjection({
+      soinId,
+      injectionId: injection.id,
+      numero: injection.numero,
+      valeur: versDateHeureLocale(injection.dateRealisee ?? injection.datePrevue),
+      marquerFaite: false,
+    })
+  }
+
+  const validerDatation = async () => {
+    if (!datationInjection) return
+    const date = new Date(datationInjection.valeur)
+    if (!datationInjection.valeur || Number.isNaN(date.getTime())) {
+      toast({ variant: "destructive", title: "Date invalide", description: "Saisissez la date et l'heure de l'injection." })
+      return
+    }
+    const ok = await envoyerInjection(
+      datationInjection.soinId,
+      datationInjection.injectionId,
+      { statut: "realisee", dateRealisee: date.toISOString() },
+      datationInjection.marquerFaite ? "Injection enregistrée" : "Date de l'injection corrigée",
+    )
+    if (ok) setDatationInjection(null)
   }
 
   // Bug testeur 2026-05-31 — arrivée depuis « + Soin » d'une fiche animale :
@@ -1563,9 +1642,24 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
         toast({ variant: "destructive", title: "Erreur", description: json.error || "Échec" })
         return
       }
+      // QA cmv29egw6 — dire ce qui a été retenu pour le rappel : le serveur ne
+      // matérialise un rappel que si le soin est fait ET la date de rappel
+      // postérieure au soin (sinon la date est gardée sur un soin fait, que
+      // les listes « à faire » n'affichent jamais) ; l'éleveur le découvrait
+      // au calendrier. Le retour nomme la date du rappel créé, ou dit pourquoi
+      // la date demandée n'en a pas produit. Une date jamais arrivée au
+      // serveur (saisie non prise) ne peut pas être annoncée ici.
+      const dateRappelDemandee = datePrevueSoumise
+        ? new Date(datePrevueSoumise).toLocaleDateString("fr-FR")
+        : null
+      const infosRappel = json.rappel?.id
+        ? `Rappel planifié le ${dateRappelDemandee}.`
+        : !isEdit && formData.fait && dateRappelDemandee
+          ? `Aucun rappel créé : la date ${dateRappelDemandee} n'est pas postérieure au soin.`
+          : null
       toast({
         title: isEdit ? "Soin mis à jour" : "Soin enregistré",
-        description: json.info || undefined,
+        description: [json.info, infosRappel].filter(Boolean).join(" ") || undefined,
       })
       setIsDialogOpen(false)
       resetSoinForm()
@@ -2090,6 +2184,33 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
               </form>
             </DialogContent>
           </Dialog>
+          <Dialog open={datationInjection !== null} onOpenChange={(o) => { if (!o) setDatationInjection(null) }}>
+            <DialogContent className="max-w-sm">
+              <DialogHeader>
+                <DialogTitle>Date réelle de l&apos;injection n°{datationInjection?.numero}</DialogTitle>
+                <DialogDescription>
+                  Le délai d&apos;attente court depuis la dernière injection réalisée.
+                  Corriger la première injection corrige aussi la date du soin.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-2">
+                <Label htmlFor="date-injection">Date et heure</Label>
+                <Input
+                  id="date-injection"
+                  type="datetime-local"
+                  value={datationInjection?.valeur ?? ""}
+                  onChange={(e) => {
+                    const valeur = e.target.value
+                    setDatationInjection((d) => (d ? { ...d, valeur } : d))
+                  }}
+                />
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button type="button" variant="outline" onClick={() => setDatationInjection(null)}>Annuler</Button>
+                <Button type="button" onClick={validerDatation}>Enregistrer</Button>
+              </div>
+            </DialogContent>
+          </Dialog>
         </div>
       </div>
 
@@ -2185,15 +2306,20 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
                           {soin.injections.map((injection) => (
                             <div key={injection.id} className="flex items-center gap-1 text-[11px] whitespace-nowrap">
                               <span className={injection.statut === "realisee" ? "text-green-700" : injection.statut === "annulee" ? "text-slate-400 line-through" : "text-amber-700"}>
-                                #{injection.numero} · {new Date(injection.datePrevue).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })}
+                                #{injection.numero} · {dateAfficheeInjection(injection)}
                               </span>
                               {injection.statut === "a_faire" ? (
                                 <>
-                                  <Button type="button" variant="ghost" size="sm" className="h-6 px-1.5 text-[11px]" onClick={() => changerInjection(soin.id, injection.id, "realisee")}>Faite</Button>
-                                  <Button type="button" variant="ghost" size="sm" className="h-6 px-1.5 text-[11px]" onClick={() => changerInjection(soin.id, injection.id, "annulee")}>Annuler</Button>
+                                  <Button type="button" variant="ghost" size="sm" className="h-6 px-1.5 text-[11px]" onClick={() => changerInjection(soin.id, injection, "realisee")}>Faite</Button>
+                                  <Button type="button" variant="ghost" size="sm" className="h-6 px-1.5 text-[11px]" onClick={() => changerInjection(soin.id, injection, "annulee")}>Annuler</Button>
                                 </>
                               ) : (
-                                <Button type="button" variant="ghost" size="sm" className="h-6 px-1.5 text-[11px]" onClick={() => changerInjection(soin.id, injection.id, "a_faire")}>Rouvrir</Button>
+                                <>
+                                  {injection.statut === "realisee" && (
+                                    <Button type="button" variant="ghost" size="sm" className="h-6 px-1.5 text-[11px]" onClick={() => ouvrirDatation(soin.id, injection)}>Dater</Button>
+                                  )}
+                                  <Button type="button" variant="ghost" size="sm" className="h-6 px-1.5 text-[11px]" onClick={() => changerInjection(soin.id, injection, "a_faire")}>Rouvrir</Button>
+                                </>
                               )}
                             </div>
                           ))}
@@ -2298,15 +2424,20 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
                         {soin.injections.map((injection) => (
                           <div key={injection.id} className="flex items-center justify-between gap-2 text-xs">
                             <span className={injection.statut === "realisee" ? "text-green-700" : injection.statut === "annulee" ? "text-slate-400 line-through" : "text-amber-700"}>
-                              #{injection.numero} · {new Date(injection.datePrevue).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })}
+                              #{injection.numero} · {dateAfficheeInjection(injection)}
                             </span>
                             {injection.statut === "a_faire" ? (
                               <div className="flex gap-1 shrink-0">
-                                <Button type="button" variant="outline" size="sm" className="h-8 px-2 text-xs" onClick={() => changerInjection(soin.id, injection.id, "realisee")}>Injection faite</Button>
-                                <Button type="button" variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={() => changerInjection(soin.id, injection.id, "annulee")}>Annuler</Button>
+                                <Button type="button" variant="outline" size="sm" className="h-8 px-2 text-xs" onClick={() => changerInjection(soin.id, injection, "realisee")}>Injection faite</Button>
+                                <Button type="button" variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={() => changerInjection(soin.id, injection, "annulee")}>Annuler</Button>
                               </div>
                             ) : (
-                              <Button type="button" variant="ghost" size="sm" className="h-8 px-2 text-xs shrink-0" onClick={() => changerInjection(soin.id, injection.id, "a_faire")}>Rouvrir</Button>
+                              <div className="flex gap-1 shrink-0">
+                                {injection.statut === "realisee" && (
+                                  <Button type="button" variant="outline" size="sm" className="h-8 px-2 text-xs" onClick={() => ouvrirDatation(soin.id, injection)}>Dater</Button>
+                                )}
+                                <Button type="button" variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={() => changerInjection(soin.id, injection, "a_faire")}>Rouvrir</Button>
+                              </div>
                             )}
                           </div>
                         ))}

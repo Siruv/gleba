@@ -204,13 +204,32 @@ export default function PlanchesPage() {
       return
     }
 
-    if (!(await confirmDialog(`Supprimer la planche "${row.nom}" ?`))) return
+    // Les fertilisations (import Potaléger) partent avec la planche : aucun
+    // écran ne les gère, on le dit avant de confirmer (QA cmv29i9ad).
+    const fertilisations = row._count.fertilisations ?? 0
+    const avertissement =
+      fertilisations > 1
+        ? ` Ses ${fertilisations} fertilisations importées seront supprimées avec elle.`
+        : fertilisations === 1
+          ? " Sa fertilisation importée sera supprimée avec elle."
+          : ""
+    if (!(await confirmDialog(`Supprimer la planche "${row.nom}" ?${avertissement}`))) return
 
     try {
       const response = await fetch(`/api/planches/${encodeURIComponent(row.id)}`, {
         method: "DELETE",
       })
-      if (!response.ok) throw new Error("Erreur lors de la suppression")
+      if (!response.ok) {
+        // QA cmv29i9ad — le refus serveur dit ce qui retient la planche
+        // (interventions, fertilisations) : on l'affiche tel quel.
+        const corps = (await response.json().catch(() => null)) as { error?: string } | null
+        toast({
+          variant: "destructive",
+          title: "Impossible de supprimer",
+          description: corps?.error || "Impossible de supprimer la planche",
+        })
+        return
+      }
       toast({
         title: "Planche supprimée",
         description: `La planche "${row.nom}" a été supprimée`,

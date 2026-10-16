@@ -1,6 +1,18 @@
 {
   "extends": ["next/core-web-vitals", "next/typescript"],
   "rules": {
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "recharts",
+            "importNames": ["ResponsiveContainer"],
+            "message": "Importer ResponsiveContainer depuis @/components/ui/responsive-container : celui de Recharts avertit width(-1) au premier rendu (ticket cmv29ksh8)."
+          }
+        ]
+      }
+    ],
     "no-restricted-syntax": [
       "warn",
       {
@@ -10,6 +22,10 @@
       {
         "selector": "JSXText[value=/\\b(Variete|Varietes|Espece|Especes|Annee|Annees|Recolte|Recoltes|Categorie|Categories|Itineraire|Itineraires|Parametre|Parametres|Maraichage|Reference|References|Detail|Details|Necessaire|Necessaires|Pepiniere|Definir|Definit|Definissent|Plantees|Semees|Terminees|Sauvegardees|Numerote|Genere|Generee|Etape|Etat|Selectionner|Selection|Duree|Delai|Creer)\\b/]",
         "message": "Mot français sans accent dans le texte JSX. Corriger en ajoutant les diacritiques attendus (ex: Recolte → Récolte). Voir CONTRIBUTING.md."
+      },
+      {
+        "selector": "CallExpression[callee.property.name=/^(flyTo|flyToBounds)$/]",
+        "message": "Pas de flyTo/flyToBounds Leaflet : le vol étire le SVG des contours sans les recalculer (aplat vert, contours perdus si interrompu). Utiliser setView/fitBounds (ticket cmv2ek8t6)."
       }
     ]
   }

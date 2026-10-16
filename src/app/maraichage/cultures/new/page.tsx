@@ -10,9 +10,9 @@ import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { ArrowLeft, Sprout, Save } from "lucide-react"
 import { formatSemaine } from "@/lib/assistant-helpers"
-import { useForm } from "react-hook-form"
+import { useForm, type FieldErrors } from "react-hook-form"
 import { zodResolver } from "@hookform/resolvers/zod"
-import { format } from "date-fns"
+import { addDays, addYears, differenceInCalendarDays, format } from "date-fns"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -46,6 +46,7 @@ import {
 import { useToast } from "@/hooks/use-toast"
 import { AppHeader, PageToolbar } from "@/components/shell/AppHeader"
 import { cultureFormSchema, type CreateCultureInput } from "@/lib/validations"
+import type { AjustementOccupation } from "@/lib/planche-validation"
 import { estimerNombrePlantsStrict } from "@/lib/assistant-helpers"
 import { RotationAdviceCompact } from "@/components/planche"
 import { EspeceCombobox, type EspeceOption } from "@/components/especes/EspeceCombobox"
@@ -55,6 +56,8 @@ import {
   resolveDashboardYear,
 } from "@/lib/dashboard-year"
 import { nomAffichableItp, nomAffichableItpAvecFenetre } from "@/lib/itp-label"
+import { choisirItpParDefaut, type MotifProposition } from "@/lib/cultures/itp-planche"
+import { AvisItpPlanche } from "@/components/cultures/AvisItpPlanche"
 import { badgeOrigine } from "@/lib/referentiel-communaute"
 import { datesDepuisItp, recolteApresDebut, semaineSemisEffective } from "@/lib/cultures/dates-itp"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -91,6 +94,83 @@ interface ITPData {
   nbRangs: number | null
   espacement: number | null
   espacementRangs: number | null
+  /** Conduite imposée (« Sous abri », « Plein champ ») ou null (ticket cmv4z6yhg). */
+  typePlanche: string | null
+}
+
+const CHAMPS_DATE = ["dateSemis", "datePlantation", "dateRecolte"] as const
+type ChampDate = (typeof CHAMPS_DATE)[number]
+type ChampSaisi = ChampDate | "finRecolte" | "nbRangs" | "espacement"
+const LIBELLE_CHAMP_DATE: Record<ChampDate, string> = {
+  dateSemis: "semis",
+  datePlantation: "plantation",
+  dateRecolte: "récolte",
+}
+
+/** Libellés des champs, pour dire lequel bloque l'enregistrement (QA cmv2r1v63). */
+const LIBELLE_CHAMP_FORMULAIRE: Record<string, string> = {
+  especeId: "Espèce",
+  varieteId: "Variété",
+  itpId: "Itinéraire technique",
+  plancheId: "Planche",
+  annee: "Année",
+  dateSemis: "Date semis",
+  datePlantation: "Date plantation",
+  dateRecolte: "Début de récolte",
+  finRecolte: "Fin de récolte",
+  longueur: "Longueur",
+  nbRangs: "Nb rangs",
+  espacement: "Espacement",
+  quantite: "Quantité",
+  notes: "Notes",
+}
+
+/**
+ * Cycle proposé par un ITP pour une année, partagé par le pré-remplissage et
+ * « Resynchroniser » (le bouton ne décalait pas une fenêtre dépassée et posait
+ * des dates passées).
+ *
+ * Bug #33 + bug Ail #509 — Calculer les dates ITP brutes et, si la première
+ * jalon (semis ou plantation) est passée pour l'année courante, décaler
+ * l'ENSEMBLE du cycle uniformément. Sinon on cassait le cycle : ex. semis
+ * remplacé par today, plantation par today, récolte laissée à la date ITP
+ * qui tombait par hasard sur today → cycle d'1 jour.
+ * Chronologie : une étape antérieure au semis tombe l'année suivante (ITP
+ * chevauchant deux années, ex. semis août → récolte janvier).
+ * QA cmsfxvbab — l'ancrage est délégué à datesDepuisItp, qui gère les ITP
+ * « implantation seule » (sans semaine de semis ni de plantation, leur
+ * récolte était posée en absolu, donc éventuellement avant le semis).
+ */
+function cycleItpPropose(itp: ITPData, year: number, today: Date) {
+  const cycle = datesDepuisItp(year, itp)
+  let dateSemis = cycle.dateSemis
+  let datePlantation = cycle.datePlantation
+  let dateRecolte = cycle.dateRecolte
+  let info: string | null = null
+
+  if (year === today.getFullYear()) {
+    const firstAnchor = dateSemis ?? datePlantation
+    if (firstAnchor && firstAnchor < today) {
+      // Audit fuseaux #76 : décalage en JOURS calendaires (setDate), pas en
+      // millisecondes. L'ajout d'un offset ms qui traverse le passage à
+      // l'heure d'été (mars) décalait les dates d'1h → un jour de trop près
+      // de minuit. setDate préserve l'heure locale et gère le DST.
+      const decalageJours = Math.ceil((today.getTime() - firstAnchor.getTime()) / 86400000)
+      const addJours = (d: Date | null) => {
+        if (!d) return d
+        const r = new Date(d)
+        r.setDate(r.getDate() + decalageJours)
+        return r
+      }
+      dateSemis = addJours(dateSemis)
+      datePlantation = addJours(datePlantation)
+      dateRecolte = addJours(dateRecolte)
+      const semaineAncrage = semaineSemisEffective(itp) ?? itp.semainePlantation
+      const semaineLabel = semaineAncrage ? formatSemaine(semaineAncrage) : ""
+      info = `Fenêtre ITP ${semaineLabel} dépassée — cycle décalé de ${decalageJours} j (semis/plantation/récolte alignés).`
+    }
+  }
+  return { dateSemis, datePlantation, dateRecolte, info }
 }
 
 export default function NewCulturePage() {
@@ -102,11 +182,15 @@ export default function NewCulturePage() {
   const [especes, setEspeces] = React.useState<EspeceOption[]>([])
   const [varietes, setVarietes] = React.useState<{ id: string; nom: string | null; especeId: string }[]>([])
   const [itps, setItps] = React.useState<ITPData[]>([])
-  const [planches, setPlanches] = React.useState<{ id: string; nom?: string; longueur: number | null }[]>([])
+  const [planches, setPlanches] = React.useState<{ id: string; nom?: string; longueur: number | null; type?: string | null }[]>([])
   const [isSubmitting, setIsSubmitting] = React.useState(false)
   // QA cmsp5927v — un refus d'occupation de planche n'existait que dans un toast
   // de 5 s : l'utilisateur revoyait un formulaire vide sans savoir pourquoi.
   const [submitError, setSubmitError] = React.useState<string | null>(null)
+  // QA cmv2r1v63 — « Réduire à 2 rangs » est proposé comme une action : la
+  // suggestion s'applique au champ, au lieu d'être recopiée à la main.
+  const [ajustementsRefus, setAjustementsRefus] = React.useState<AjustementOccupation[]>([])
+  const [infoAjustement, setInfoAjustement] = React.useState<string | null>(null)
   // Bug #1 — modale violation rotation (renvoyée par le backend en 409).
   const [rotationWarning, setRotationWarning] = React.useState<{
     payload: CreateCultureInput
@@ -192,6 +276,13 @@ export default function NewCulturePage() {
   // la culture partait avec itpId null. On ré-affirme l'auto-sélection tant
   // que l'utilisateur n'a pas fait de choix lui-même.
   const autoItpRef = React.useRef<string | null>(null)
+  // Pourquoi aucun ITP n'est proposé d'office (ticket cmv4z6yhg), pour l'avis.
+  const [motifProposition, setMotifProposition] = React.useState<MotifProposition | null>(null)
+  // Choix explicite d'un item, même égal à la proposition : Radix n'émet pas
+  // `onValueChange` pour une valeur inchangée (contre-revue du 2026-10-12).
+  const marquerChoixItp = React.useCallback(() => {
+    autoItpRef.current = null
+  }, [])
   React.useEffect(() => {
     const wanted = autoItpRef.current
     if (!wanted) return
@@ -249,12 +340,11 @@ export default function NewCulturePage() {
           form.setValue("varieteId", null)
           const loadedItps = itpsData.data || []
           setItps(loadedItps)
-          // Auto-sélectionner le premier ITP disponible
-          if (loadedItps.length > 0) {
-            autoItpRef.current = loadedItps[0].id
-            form.setValue("itpId", loadedItps[0].id)
-          } else {
+          // La proposition d'office est posée par l'effet « ITP proposé »
+          // plus bas, qui tient compte de la planche (ticket cmv4z6yhg).
+          if (loadedItps.length === 0) {
             autoItpRef.current = null
+            setMotifProposition(null)
             form.setValue("itpId", null)
           }
         })
@@ -262,11 +352,13 @@ export default function NewCulturePage() {
           setVarietes([])
           setItps([])
           autoItpRef.current = null
+          setMotifProposition(null)
           form.setValue("itpId", null)
         })
     } else {
       setVarietes([])
       setItps([])
+      setMotifProposition(null)
     }
   }, [selectedEspece, form])
 
@@ -275,8 +367,112 @@ export default function NewCulturePage() {
   // jamais une édition de la seule récolte ni le remplissage initial de l'ITP.
   const debutCycleRef = React.useRef<string | null>(null)
 
+  // QA cmv2qzhkf — les ITP arrivent en différé après le choix de l'espèce (et
+  // l'effet ci-dessous rejoue au changement d'année ou à la ré-affirmation de
+  // l'ITP auto-sélectionné) : des dates saisies entre-temps étaient écrasées
+  // par le calendrier de l'ITP, et la culture partait aux dates ITP. Une date
+  // touchée par l'utilisateur n'est plus réécrite par le pré-remplissage ; seul
+  // le bouton du bandeau rapplique l'ITP. Même règle pour rangs et espacement,
+  // et la récolte saisie ne suit plus le début de cycle tant qu'elle lui reste
+  // postérieure.
+  const saisiesManuellesRef = React.useRef(new Set<ChampSaisi>())
+  const [datesSaisies, setDatesSaisies] = React.useState(false)
+  const marquerSaisie = React.useCallback((champ: ChampSaisi) => {
+    saisiesManuellesRef.current.add(champ)
+    if ((CHAMPS_DATE as readonly string[]).includes(champ)) setDatesSaisies(true)
+  }, [])
+  const appliquerCycleItp = React.useCallback(
+    (itp: ITPData, year: number) => {
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      const cycle = cycleItpPropose(itp, year, today)
+      setDateSemisInfo(cycle.info)
+      // Les trois dates sont celles de l'ITP, absentes comprises : une
+      // plantation laissée par un ITP précédent (ou tapée) sur un ITP en semis
+      // direct n'appartient pas au calendrier appliqué.
+      form.setValue("dateSemis", cycle.dateSemis ?? null)
+      form.setValue("datePlantation", cycle.datePlantation ?? null)
+      form.setValue("dateRecolte", cycle.dateRecolte ?? null)
+      // Le cycle ITP vient d'être posé en bloc : mémoriser son début pour que
+      // l'effet de recalage ne réécrive pas la récolte calculée par datesDepuisItp.
+      const debutCycle = cycle.datePlantation ?? cycle.dateSemis
+      if (debutCycle) debutCycleRef.current = debutCycle.toISOString()
+    },
+    [form]
+  )
+  // Revue du 2026-10-10 (cmv2qzhkf) — un semis seul tapé avant l'arrivée des
+  // ITP laissait plantation et récolte vides, et la culture partait sans date
+  // de récolte. Les dates encore vides (et que l'utilisateur n'a pas vidées)
+  // sont complétées par le calendrier de l'ITP, recalé sur la première date
+  // saisie que l'ITP connaît aussi. Les dates saisies ne bougent pas.
+  const completerDatesManquantes = React.useCallback(
+    (itp: ITPData, year: number) => {
+      const saisies = saisiesManuellesRef.current
+      const cycle = datesDepuisItp(year, itp)
+      const valeur = (champ: ChampDate) => {
+        const v = form.getValues(champ)
+        return v ? new Date(v) : null
+      }
+      const ancre = CHAMPS_DATE.find((champ) => saisies.has(champ) && valeur(champ) && cycle[champ])
+      if (!ancre) return
+      const decalage = differenceInCalendarDays(valeur(ancre)!, cycle[ancre]!)
+      let complete = false
+      for (const champ of CHAMPS_DATE) {
+        const reference = cycle[champ]
+        if (saisies.has(champ) || valeur(champ) || !reference) continue
+        form.setValue(champ, addDays(reference, decalage))
+        complete = true
+      }
+      if (!complete) return
+      const debut = valeur("datePlantation") ?? valeur("dateSemis")
+      if (debut) debutCycleRef.current = debut.toISOString()
+      setDateSemisInfo(
+        `Dates manquantes complétées depuis l'ITP, recalées sur votre ${LIBELLE_CHAMP_DATE[ancre]}.`
+      )
+    },
+    [form]
+  )
+
+  // Ticket QA cmv4z6yhg — ITP proposé d'office. Le premier ITP par confiance
+  // était retenu quelle que soit la planche : sur « Marc-v7-1010 », sans type,
+  // la culture partait avec « radis — sous abri forcé » et son calendrier. La
+  // proposition tient compte du type de la planche (règle `choisirItpParDefaut`,
+  // partagée avec l'avis sous le champ) : planche typée → premier ITP qui lui
+  // convient ; planche sans type → seulement un ITP sans conduite imposée,
+  // sinon rien, et l'avis dit quoi compléter. Un choix manuel n'est jamais
+  // touché ; les dates calculées depuis un ITP retiré ne lui survivent pas,
+  // les dates saisies restent.
+  const plancheSelectionnee = React.useMemo(
+    () => planches.find((p) => p.id === selectedPlanche) ?? null,
+    [planches, selectedPlanche]
+  )
+  React.useEffect(() => {
+    if (itps.length === 0) return
+    const courant = form.getValues("itpId")
+    const choixManuel = Boolean(courant) && courant !== autoItpRef.current && itps.some((i) => i.id === courant)
+    if (choixManuel) {
+      setMotifProposition(null)
+      return
+    }
+    const { itp, motif } = choisirItpParDefaut(itps, plancheSelectionnee)
+    setMotifProposition(motif)
+    const propose = itp?.id ?? null
+    autoItpRef.current = propose
+    if (propose === (courant || null)) return
+    if (propose) {
+      form.setValue("itpId", propose)
+      return
+    }
+    form.setValue("itpId", null)
+    for (const champ of [...CHAMPS_DATE, "nbRangs", "espacement"] as const) {
+      if (!saisiesManuellesRef.current.has(champ)) form.setValue(champ, null)
+    }
+    debutCycleRef.current = null
+  }, [itps, plancheSelectionnee, form])
+
   // PROMPT 20b — Auto-remplissage ITP → dates de culture
-  // L'année est dans les deps : changer d'année recalcule les dates si ITP fixé.
+  // L'année est dans les deps : changer d'année recalcule les dates si ITP fixé ;
+  // des dates saisies (QA cmv2qzhkf, plus haut) suivent l'année (effet suivant).
   const selectedYear = form.watch("annee")
   React.useEffect(() => {
     // QA cmsw8z9jt — ITP vidé ⇒ purger le bandeau « fenêtre dépassée », sinon
@@ -288,70 +484,70 @@ export default function NewCulturePage() {
     const itp = itps.find((i) => i.id === selectedItp)
     if (!itp) return
 
-    const year = selectedYear || new Date().getFullYear()
-    const today = new Date()
-    today.setHours(0, 0, 0, 0)
-
-    setDateSemisInfo(null)
-
-    // Bug #33 + bug Ail #509 — Calculer les dates ITP brutes et, si la première
-    // jalon (semis ou plantation) est passée pour l'année courante, décaler
-    // l'ENSEMBLE du cycle uniformément. Sinon on cassait le cycle : ex. semis
-    // remplacé par today, plantation par today, récolte laissée à la date ITP
-    // qui tombait par hasard sur today → cycle d'1 jour.
-    // Chronologie : une étape antérieure au semis tombe l'année suivante (ITP
-    // chevauchant deux années, ex. semis août → récolte janvier).
-    // QA cmsfxvbab — l'ancrage est délégué à datesDepuisItp, qui gère les ITP
-    // « implantation seule » (sans semaine de semis ni de plantation, leur
-    // récolte était posée en absolu, donc éventuellement avant le semis).
-    const cycle = datesDepuisItp(year, itp)
-    let semisDate = cycle.dateSemis
-    let plantationDate = cycle.datePlantation
-    let recolteDate = cycle.dateRecolte
-
-    if (year === today.getFullYear()) {
-      const firstAnchor = semisDate ?? plantationDate
-      if (firstAnchor && firstAnchor < today) {
-        // Audit fuseaux #76 : décalage en JOURS calendaires (setDate), pas en
-        // millisecondes. L'ajout d'un offset ms qui traverse le passage à
-        // l'heure d'été (mars) décalait les dates d'1h → un jour de trop près
-        // de minuit. setDate préserve l'heure locale et gère le DST.
-        const decalageJours = Math.ceil((today.getTime() - firstAnchor.getTime()) / 86400000)
-        const addJours = (d: Date | null) => {
-          if (!d) return d
-          const r = new Date(d)
-          r.setDate(r.getDate() + decalageJours)
-          return r
-        }
-        semisDate = addJours(semisDate)
-        plantationDate = addJours(plantationDate)
-        recolteDate = addJours(recolteDate)
-        const semaineAncrage = semaineSemisEffective(itp) ?? itp.semainePlantation
-        const semaineLabel = semaineAncrage ? formatSemaine(semaineAncrage) : ""
-        setDateSemisInfo(
-          `Fenêtre ITP ${semaineLabel} dépassée — cycle décalé de ${decalageJours} j (semis/plantation/récolte alignés).`
-        )
-      }
-    }
-
-    if (semisDate) form.setValue("dateSemis", semisDate)
-    if (plantationDate) form.setValue("datePlantation", plantationDate)
-    if (recolteDate) form.setValue("dateRecolte", recolteDate)
-    // Le cycle ITP vient d'être posé en bloc : mémoriser son début pour que
-    // l'effet de recalage ne réécrive pas la récolte calculée par datesDepuisItp.
-    const debutCycle = plantationDate ?? semisDate
-    if (debutCycle) debutCycleRef.current = debutCycle.toISOString()
-    if (itp.nbRangs) {
+    const saisies = saisiesManuellesRef.current
+    if (!saisies.has("nbRangs") && itp.nbRangs) {
       form.setValue("nbRangs", itp.nbRangs)
     }
     // Bug #29 — Pré-remplir espacement depuis l'ITP. Fallback sur espacementRangs
     // si espacement (sur le rang) absent, pour ne pas laisser le champ vide alors
     // que le calcul "Quantité plants" l'utilise.
     const espVal = itp.espacement ?? itp.espacementRangs
-    if (espVal) {
+    if (!saisies.has("espacement") && espVal) {
       form.setValue("espacement", Math.round(espVal))
     }
-  }, [selectedItp, selectedYear, itps, form])
+    if (CHAMPS_DATE.some((champ) => saisies.has(champ))) {
+      // Dates de l'utilisateur conservées : le bandeau « fenêtre dépassée »
+      // d'un ITP précédent ne les décrit plus.
+      setDateSemisInfo(null)
+      completerDatesManquantes(itp, selectedYear || new Date().getFullYear())
+      return
+    }
+    appliquerCycleItp(itp, selectedYear || new Date().getFullYear())
+  }, [selectedItp, selectedYear, itps, form, appliquerCycleItp, completerDatesManquantes])
+
+  // Revue du 2026-10-10 (cmv2qzhkf) — changer l'année gardait les dates saisies
+  // dans l'ancienne, sans signal : une culture 2027 partait semée en 2026. Les
+  // dates saisies CALÉES SUR L'ANCIENNE ANNÉE la suivent, décalées du même
+  // nombre d'années ; des dates déjà tapées pour une autre saison (saison 2027
+  // préparée depuis la vue 2026, puis année corrigée) ne bougent pas. Sans date
+  // de cycle saisie, l'effet précédent recalcule le cycle de l'ITP, et seule une
+  // fin de récolte saisie restée avant ce nouveau début est décalée.
+  const anneeDatesRef = React.useRef<number | null>(null)
+  React.useEffect(() => {
+    // Année en cours de frappe (« 2 », « 20 »…) : attendre une année complète.
+    if (!selectedYear || selectedYear < 2000 || selectedYear > 2100) return
+    const precedente = anneeDatesRef.current
+    anneeDatesRef.current = selectedYear
+    if (precedente === null || precedente === selectedYear) return
+    const saisies = saisiesManuellesRef.current
+    const lire = (champ: ChampDate | "finRecolte") => {
+      const v = form.getValues(champ)
+      return v ? new Date(v) : null
+    }
+    let champs: (ChampDate | "finRecolte")[] = []
+    if (CHAMPS_DATE.some((champ) => saisies.has(champ))) {
+      const debut = lire("datePlantation") ?? lire("dateSemis") ?? lire("dateRecolte")
+      if (debut && debut.getFullYear() === precedente) champs = [...CHAMPS_DATE, "finRecolte"]
+    } else if (saisies.has("finRecolte")) {
+      const fin = lire("finRecolte")
+      const debut = lire("datePlantation") ?? lire("dateSemis")
+      if (fin && debut && fin < debut) champs = ["finRecolte"]
+    }
+    const ecart = selectedYear - precedente
+    let decalees = 0
+    for (const champ of champs) {
+      const v = lire(champ)
+      if (!v) continue
+      form.setValue(champ, addYears(v, ecart))
+      decalees++
+    }
+    if (decalees === 0) return
+    const debut = lire("datePlantation") ?? lire("dateSemis")
+    if (debut) debutCycleRef.current = debut.toISOString()
+    setDateSemisInfo(
+      `Année ${selectedYear} : vos dates sont décalées de ${ecart > 0 ? "+" : ""}${ecart} an${Math.abs(ecart) > 1 ? "s" : ""}.`
+    )
+  }, [selectedYear, form])
 
   // QA cmsfxvbab + friction 2026-08-14 — la date de récolte SUIT le début de
   // cycle saisi. Les dates n'étaient recalculées qu'au changement d'ITP : un
@@ -360,11 +556,17 @@ export default function NewCulturePage() {
   // partait dans un payload que l'API refuse en 400. À chaque changement de
   // semis/plantation, la récolte est recalée en préservant la durée du cycle
   // ITP (`recolteApresDebut`, source unique). Éditer la seule récolte ne
-  // déclenche rien : le choix manuel tient tant que le début ne bouge plus.
+  // déclenche rien, et une récolte saisie à la main tient même quand le début
+  // bouge, tant qu'elle lui reste postérieure (QA cmv2qzhkf).
   const watchedDateSemis = form.watch("dateSemis")
   const watchedDatePlantation = form.watch("datePlantation")
   React.useEffect(() => {
-    const debutRaw = watchedDatePlantation ?? watchedDateSemis
+    // Valeurs COURANTES du formulaire, pas celles du rendu : quand un autre
+    // effet du même passage vient de poser la plantation (complétion depuis
+    // l'ITP), les valeurs observées sont encore celles d'avant, et la récolte
+    // était recalée sur le semis avec la durée prévue depuis la plantation
+    // (récolte au 20/12 pour une plantation au 06/12, constaté en production).
+    const debutRaw = form.getValues("datePlantation") ?? form.getValues("dateSemis")
     if (!debutRaw) return
     const debut = new Date(debutRaw)
     if (Number.isNaN(debut.getTime())) return
@@ -378,6 +580,7 @@ export default function NewCulturePage() {
     if (Number.isNaN(recolte.getTime())) return
     const recolteIncoherente = recolte <= debut
     if (!debutChange && !recolteIncoherente) return
+    if (saisiesManuellesRef.current.has("dateRecolte") && !recolteIncoherente) return
 
     const itp = itps.find((i) => i.id === selectedItp)
     if (!itp) return
@@ -429,6 +632,8 @@ export default function NewCulturePage() {
   const submitCulture = async (data: CreateCultureInput, confirmRotation = false) => {
     setIsSubmitting(true)
     setSubmitError(null)
+    setAjustementsRefus([])
+    setInfoAjustement(null)
     try {
       const response = await fetch("/api/cultures", {
         method: "POST",
@@ -451,8 +656,17 @@ export default function NewCulturePage() {
         // Les refus d'occupation de planche arrivent avec des suggestions
         // d'ajustement : elles ne servent à rien dans un toast de 5 s.
         const suggestions: string[] = Array.isArray(payload?.suggestions) ? payload.suggestions : []
+        const ajustements: AjustementOccupation[] = Array.isArray(payload?.ajustements) ? payload.ajustements : []
         const message = [payload?.error || "Erreur lors de la création", ...suggestions].join(" · ")
-        setSubmitError(message)
+        // Les ajustements applicables sont des boutons sous le message : on ne
+        // les répète pas dans le texte.
+        const applicables = ajustements.filter((a) => a.reduireRangs)
+        setAjustementsRefus(applicables)
+        setSubmitError(
+          applicables.length > 0
+            ? [payload?.error || "Erreur lors de la création", ...suggestions.filter((t) => !applicables.some((a) => a.message === t))].join(" · ")
+            : message
+        )
         throw new Error(message)
       }
 
@@ -486,6 +700,43 @@ export default function NewCulturePage() {
 
   const onSubmit = (data: CreateCultureInput) => submitCulture(data, false)
 
+  // QA cmv2r1v63 — un envoi bloqué par le formulaire (date incohérente…)
+  // laissait affiché le refus de l'essai précédent : « la même erreur revient »
+  // alors que rien n'était parti. Le message dit désormais ce qui bloque.
+  const onInvalid = (erreurs: FieldErrors<CreateCultureInput>) => {
+    setAjustementsRefus([])
+    setInfoAjustement(null)
+    const champs = Object.keys(erreurs).map((champ) => LIBELLE_CHAMP_FORMULAIRE[champ] ?? champ)
+    setSubmitError(
+      champs.length > 0
+        ? `Enregistrement impossible : vérifiez ${champs.length > 1 ? "les champs" : "le champ"} ${champs.join(", ")}.`
+        : "Enregistrement impossible : vérifiez le formulaire."
+    )
+  }
+
+  // Un refus décrit l'essai précédent : il s'efface dès que l'utilisateur
+  // modifie un champ (les pré-remplissages par setValue ne comptent pas).
+  React.useEffect(() => {
+    const abonnement = form.watch((_valeurs, { type }) => {
+      if (type !== "change") return
+      setSubmitError(null)
+      setAjustementsRefus([])
+      setInfoAjustement(null)
+    })
+    return () => abonnement.unsubscribe()
+  }, [form])
+
+  const appliquerAjustement = (ajustement: AjustementOccupation) => {
+    if (!ajustement.reduireRangs) return
+    marquerSaisie("nbRangs")
+    form.setValue("nbRangs", ajustement.reduireRangs, { shouldDirty: true, shouldValidate: true })
+    setAjustementsRefus([])
+    setSubmitError(null)
+    setInfoAjustement(
+      `Nombre de rangs ramené à ${ajustement.reduireRangs} : enregistrez pour créer la culture.`
+    )
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 aurora-bg-subtle">
       <div className="fixed inset-0 dot-grid opacity-40 pointer-events-none" aria-hidden="true" />
@@ -511,7 +762,7 @@ export default function NewCulturePage() {
           recouvrir les boutons de soumission en bas de formulaire mobile. */}
       <main className="container mx-auto px-4 py-6 pb-24 max-w-2xl">
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
+          <form onSubmit={form.handleSubmit(onSubmit, onInvalid)} className="space-y-6">
             <Card>
               <CardHeader>
                 <CardTitle>Plante et emplacement</CardTitle>
@@ -576,7 +827,14 @@ export default function NewCulturePage() {
                     <FormItem>
                       <FormLabel>Itinéraire technique (ITP)</FormLabel>
                       <Select
-                        onValueChange={field.onChange}
+                        onValueChange={(v) => {
+                          // Un choix explicite n'est plus réévalué au changement de
+                          // planche (relecture cmv4z6yhg) ; la ré-affirmation Radix
+                          // sur "" reste intacte. Radix ne signale pas la re-sélection
+                          // de la valeur courante : voir `marquerChoixItp` sur l'item.
+                          if (v) autoItpRef.current = null
+                          field.onChange(v)
+                        }}
                         value={field.value || undefined}
                         disabled={!selectedEspece || itps.length === 0}
                       >
@@ -587,7 +845,14 @@ export default function NewCulturePage() {
                         </FormControl>
                         <SelectContent>
                           {itps.map((itp) => (
-                            <SelectItem key={itp.id} value={itp.id}>
+                            <SelectItem
+                              key={itp.id}
+                              value={itp.id}
+                              onPointerUp={marquerChoixItp}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") marquerChoixItp()
+                              }}
+                            >
                               <span className="flex items-center gap-2">
                                 {nomAffichableItpAvecFenetre(itp)}
                                 {/* Origine dite dans la liste elle-même : sans
@@ -609,6 +874,12 @@ export default function NewCulturePage() {
                       <FormMessage />
                     </FormItem>
                   )}
+                />
+
+                <AvisItpPlanche
+                  itp={itps.find((i) => i.id === selectedItp) ?? null}
+                  planche={plancheSelectionnee}
+                  motifSansProposition={motifProposition}
                 />
 
                 <FormField
@@ -690,7 +961,8 @@ export default function NewCulturePage() {
                   return (
                     <div className="flex items-center justify-between gap-2 text-xs text-slate-600 bg-blue-50 border border-blue-100 rounded p-2 mt-2">
                       <span>
-                        💡 Dates pré-remplies depuis l&apos;ITP <strong>{nomAffichableItp(itp)}</strong> (
+                        💡 {datesSaisies ? "Calendrier de l'ITP" : "Dates pré-remplies depuis l'ITP"}{" "}
+                        <strong>{nomAffichableItp(itp)}</strong> (
                         {[
                           itp.semaineSemis ? `${formatSemaine(itp.semaineSemis)} semis` : null,
                           // QA cmsfxvbab — ITP sans jalon semis/plantation : la
@@ -700,24 +972,21 @@ export default function NewCulturePage() {
                             : null,
                           itp.semainePlantation ? `${formatSemaine(itp.semainePlantation)} plantation` : null,
                           itp.semaineRecolte ? `${formatSemaine(itp.semaineRecolte)} récolte` : null,
-                        ].filter(Boolean).join(" · ")}). Modifiable.
+                        ].filter(Boolean).join(" · ")}).{" "}
+                        {datesSaisies ? "Vos dates saisies sont conservées." : "Modifiable."}
                       </span>
                       <button
                         type="button"
                         className="text-blue-700 underline hover:text-blue-900"
                         onClick={() => {
-                          const year = form.getValues("annee") || new Date().getFullYear()
-                          // QA cmsfxvbab — même ancrage que l'auto-remplissage :
-                          // le bouton posait les trois dates sur `year` sans
-                          // cascade, donc une récolte antérieure au semis sur un
-                          // ITP à cheval sur deux années.
-                          const cycle = datesDepuisItp(year, itp)
-                          if (cycle.dateSemis) form.setValue("dateSemis", cycle.dateSemis)
-                          if (cycle.datePlantation) form.setValue("datePlantation", cycle.datePlantation)
-                          if (cycle.dateRecolte) form.setValue("dateRecolte", cycle.dateRecolte)
+                          for (const champ of CHAMPS_DATE) saisiesManuellesRef.current.delete(champ)
+                          setDatesSaisies(false)
+                          // QA cmsfxvbab — même ancrage (et même décalage d'une
+                          // fenêtre dépassée) que l'auto-remplissage.
+                          appliquerCycleItp(itp, form.getValues("annee") || new Date().getFullYear())
                         }}
                       >
-                        Resynchroniser
+                        {datesSaisies ? "Appliquer les dates de l'ITP" : "Resynchroniser"}
                       </button>
                     </div>
                   )
@@ -738,6 +1007,7 @@ export default function NewCulturePage() {
                             value={field.value ? format(new Date(field.value), "yyyy-MM-dd") : ""}
                             onChange={(e) => {
                               const date = e.target.value ? new Date(e.target.value) : null
+                              marquerSaisie("dateSemis")
                               field.onChange(date)
                               setDateSemisInfo(null)
                               // Antidater est le geste de qui enregistre un
@@ -784,6 +1054,7 @@ export default function NewCulturePage() {
                             value={field.value ? format(new Date(field.value), "yyyy-MM-dd") : ""}
                             onChange={(e) => {
                               const date = e.target.value ? new Date(e.target.value) : null
+                              marquerSaisie("datePlantation")
                               field.onChange(date)
                               if (cocherApresSaisieManuelle(date)) {
                                 form.setValue("plantationFaite", true)
@@ -822,9 +1093,10 @@ export default function NewCulturePage() {
                             type="date"
                             {...field}
                             value={field.value ? format(new Date(field.value), "yyyy-MM-dd") : ""}
-                            onChange={(e) =>
+                            onChange={(e) => {
+                              marquerSaisie("dateRecolte")
                               field.onChange(e.target.value ? new Date(e.target.value) : null)
-                            }
+                            }}
                           />
                         </FormControl>
                         <FormMessage />
@@ -846,9 +1118,10 @@ export default function NewCulturePage() {
                             type="date"
                             {...field}
                             value={field.value ? format(new Date(field.value), "yyyy-MM-dd") : ""}
-                            onChange={(e) =>
+                            onChange={(e) => {
+                              marquerSaisie("finRecolte")
                               field.onChange(e.target.value ? new Date(e.target.value) : null)
-                            }
+                            }}
                           />
                         </FormControl>
                         <FormDescription>
@@ -905,11 +1178,12 @@ export default function NewCulturePage() {
                             min="1"
                             {...field}
                             value={field.value ?? ""}
-                            onChange={(e) =>
+                            onChange={(e) => {
+                              marquerSaisie("nbRangs")
                               field.onChange(
                                 e.target.value ? parseInt(e.target.value) : null
                               )
-                            }
+                            }}
                           />
                         </FormControl>
                         <FormMessage />
@@ -931,11 +1205,12 @@ export default function NewCulturePage() {
                             min="1"
                             {...field}
                             value={field.value ?? ""}
-                            onChange={(e) =>
+                            onChange={(e) => {
+                              marquerSaisie("espacement")
                               field.onChange(
                                 e.target.value ? parseInt(e.target.value) : null
                               )
-                            }
+                            }}
                           />
                         </FormControl>
                         <FormMessage />
@@ -1010,7 +1285,27 @@ export default function NewCulturePage() {
             </Card>
 
             {submitError && (
-              <p role="alert" className="text-sm text-red-600">{submitError}</p>
+              <div role="alert" className="space-y-2 text-sm text-red-600">
+                <p>{submitError}</p>
+                {ajustementsRefus.length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {ajustementsRefus.map((a) => (
+                      <Button
+                        key={a.message}
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => appliquerAjustement(a)}
+                      >
+                        {a.message}
+                      </Button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {infoAjustement && (
+              <p role="status" className="text-sm text-emerald-700">{infoAjustement}</p>
             )}
 
             <div className="flex justify-end gap-4">

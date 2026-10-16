@@ -4,21 +4,25 @@
  * GET /api/meteo/irrigation?parcelleId=X → filtré par parcelle
  * GET /api/meteo/irrigation?refresh=1 → force le recalcul (ignore le cache)
  *
- * Cache en mémoire TTL 1h — recalcul automatique à la première connexion après expiration.
+ * Cache en mémoire de 2 minutes (src/lib/irrigation-cache.ts).
  */
 
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { requireAuthApi, getUserId } from '@/lib/auth-utils'
-import { fetchEcowittData, fetchOpenMeteoForecast, fetchOpenMeteoHistory, fetchWundergroundData } from '@/lib/meteo'
-import { adapterConseilSousAbri, genererRecommandationIrrigation } from '@/lib/meteo-agro'
+import { chargerMeteoBilan, debutArrosagesBilan } from '@/lib/irrigation/meteo-bilan'
+import { chargerArrosagesSaisis } from '@/lib/irrigation/arrosages-saisis'
+import { dernierArrosageDuLieu } from '@/lib/irrigation/bilan-culture'
+import { genererRecommandationIrrigation } from '@/lib/meteo-agro'
 import { irrigationCache, irrigationCacheKey } from '@/lib/irrigation-cache'
 import { cultureIrrigationDemarreeWhere } from '@/lib/irrigation-eligibility'
+import { whereCulturesEnPlace } from '@/lib/irrigation-conseil'
 import { grouperRecommandationsParPlanche } from '@/lib/irrigation-planche'
-import type { MeteoJournaliere, MeteoPrevision } from '@/lib/meteo'
+import { etatCulture } from '@/lib/cultures/etat'
+import { surfaceCultureM2 } from '@/lib/culture-surface'
+import { typeSousAbri } from '@/lib/irrigation/abri'
+import { sourceSol } from '@/lib/irrigation/bilan-sol'
 import type { Prisma } from '@prisma/client'
-
-const TYPES_SOUS_ABRI = ['Serre', 'Tunnel', 'Châssis', 'Chassis']
 
 export async function GET(request: NextRequest) {
   const { error, session } = await requireAuthApi()
@@ -32,8 +36,7 @@ export async function GET(request: NextRequest) {
 
     const cacheKey = irrigationCacheKey(userId, parcelleId)
 
-    // Vérifier le cache (sauf si refresh forcé) AVANT tout appel externe :
-    // un hit de cache ne doit pas payer la requête station météo.
+    // Vérifier le cache (sauf si refresh forcé) AVANT tout appel externe.
     if (!forceRefresh) {
       const cached = irrigationCache.get(cacheKey) as {
         data: unknown; cachedAt: Date; ageSeconds: number
@@ -51,21 +54,13 @@ export async function GET(request: NextRequest) {
 
     // ── Calcul complet ──────────────────────────────────────────
 
-    const station = await prisma.stationMeteo.findFirst({ where: { userId, active: true } })
-    let stationToday: MeteoJournaliere | null = null
-    if (station?.provider === 'ecowitt' && station.appKey && station.apiKey) {
-      stationToday = await fetchEcowittData(station.appKey, station.apiKey, station.stationId)
-    } else if (station?.provider === 'wunderground' && station.apiKey) {
-      stationToday = await fetchWundergroundData(station.apiKey, station.stationId)
-    } else if (station?.provider === 'open-meteo-reference' && station.lat && station.lng) {
-      stationToday = (await fetchOpenMeteoForecast(station.lat, station.lng)).daily[0] ?? null
-    }
-
     // Récupérer les cultures actives (non terminées) avec leurs planches et parcelles
+    // Mêmes cultures que les lignes « à arroser » (revue du 2026-10-10) : une
+    // culture finie non clôturée ne doit pas sortir « critique » ici.
     const whereClause: Prisma.CultureWhereInput = {
       userId,
       terminee: null,
-      AND: [cultureIrrigationDemarreeWhere],
+      AND: [cultureIrrigationDemarreeWhere, whereCulturesEnPlace(new Date().getFullYear())],
       planche: parcelleId
         ? { is: { parcelleGeoId: parcelleId } }
         : { isNot: null },
@@ -75,9 +70,9 @@ export async function GET(request: NextRequest) {
       where: whereClause,
       include: {
         espece: {
-          select: { id: true, nom: true, besoinEau: true },
+          select: { id: true, nom: true, besoinEau: true, vivace: true },
         },
-        variete: { select: { nom: true } },
+        variete: { select: { nom: true, isPlaceholder: true } },
         planche: {
           select: {
             id: true,
@@ -85,6 +80,8 @@ export async function GET(request: NextRequest) {
             type: true,
             irrigation: true,
             surface: true,
+            largeur: true,
+            longueur: true,
             retentionEau: true,
             typeSol: true,
             parcelleGeo: {
@@ -92,6 +89,7 @@ export async function GET(request: NextRequest) {
                 id: true,
                 centroidLat: true,
                 centroidLng: true,
+                typeSol: true,
               },
             },
           },
@@ -110,12 +108,14 @@ export async function GET(request: NextRequest) {
     let fallbackLng: number | null = null
     const premiereParcelle = await prisma.parcelleGeo.findFirst({
       where: { userId, centroidLat: { not: null }, centroidLng: { not: null } },
-      select: { centroidLat: true, centroidLng: true },
+      select: { centroidLat: true, centroidLng: true, typeSol: true },
     })
     if (premiereParcelle?.centroidLat && premiereParcelle?.centroidLng) {
       fallbackLat = premiereParcelle.centroidLat
       fallbackLng = premiereParcelle.centroidLng
     }
+    // Même repli que le conseil des tâches : météo ET sol de la première parcelle.
+    const solParcelleRepli = premiereParcelle?.typeSol ?? null
 
     // Regrouper les cultures par coordonnées de parcelle (évite les appels API redondants)
     const parCoords = new Map<string, {
@@ -136,83 +136,76 @@ export async function GET(request: NextRequest) {
       parCoords.get(key)!.cultures.push(culture)
     }
 
+    // Arrosages saisis sur l'historique du bilan, « Noter » et interventions
+    // « arrosage » (même chargeur que le conseil des tâches).
+    const arrosages = await chargerArrosagesSaisis(userId, cultures, debutArrosagesBilan())
+
+    // Même série que le conseil des tâches (30 jours d'archive, aujourd'hui,
+    // 7 jours prévus), chargée en parallèle pour toutes les zones. La pluie du
+    // jour d'une station de l'exploitation n'est plus appliquée à ce seul
+    // écran : les deux écrans décident sur les mêmes données (aucune station
+    // active le 2026-10-10).
+    const zones = Array.from(parCoords.values())
+    const meteos = await Promise.all(zones.map((z) => chargerMeteoBilan(z.lat, z.lng).catch(() => null)))
+
     const recommandationsCultures = []
 
-    for (const [, group] of parCoords) {
-      let historique7j: MeteoJournaliere[]
-      let previsions: MeteoPrevision[]
-
-      try {
-        const today = new Date()
-        const weekAgo = new Date(today)
-        weekAgo.setDate(weekAgo.getDate() - 8)
-        const yesterday = new Date(today)
-        yesterday.setDate(yesterday.getDate() - 1)
-
-        historique7j = await fetchOpenMeteoHistory(
-          group.lat, group.lng,
-          weekAgo.toISOString().split('T')[0],
-          yesterday.toISOString().split('T')[0]
-        )
-
-        const forecast = await fetchOpenMeteoForecast(group.lat, group.lng)
-        previsions = forecast.daily
-        if (stationToday && previsions[0]?.date === stationToday.date) {
-          previsions[0] = {
-            ...previsions[0],
-            precipitation: stationToday.precipitation,
-            tempMin: stationToday.tempMin,
-            tempMax: stationToday.tempMax,
-            windSpeedMax: stationToday.windSpeedMax,
-          }
-        }
-      } catch {
-        continue
-      }
+    for (const [i, group] of zones.entries()) {
+      const meteo = meteos[i]
+      if (!meteo) continue
 
       for (const culture of group.cultures) {
-        const sousAbri = TYPES_SOUS_ABRI.includes(culture.planche?.type ?? '')
-
-        // Sous abri : neutraliser les précipitations extérieures dans le calcul
-        const historiquePourCalcul: MeteoJournaliere[] = sousAbri
-          ? historique7j.map(d => ({ ...d, precipitation: 0 }))
-          : historique7j
-        const previsionsPourCalcul = sousAbri
-          ? previsions.map(d => ({ ...d, precipitation: 0 }))
-          : previsions
-
+        // null : type de planche non renseigné, le conseil le dit (ticket QA cmv3ja7nr).
+        const sousAbri = typeSousAbri(culture.planche?.type)
+        const surface = surfaceCultureM2({ planche: culture.planche })
         const reco = genererRecommandationIrrigation(
-          historiquePourCalcul,
-          previsionsPourCalcul,
+          meteo,
           {
             id: culture.id,
             espece: culture.espece.nom || culture.especeId,
             besoinEau: culture.espece.besoinEau ?? 3,
+            vivace: culture.espece.vivace ?? false,
             dateSemis: culture.dateSemis,
+            datePlantation: culture.datePlantation,
+            semisFait: culture.semisFait,
+            plantationFaite: culture.plantationFaite,
+            dateRecolte: culture.dateRecolte,
+            finRecolte: culture.finRecolte,
             derniereIrrigation: culture.derniereIrrigation,
+            arrosages: arrosages.get(culture.id) ?? [],
           },
           {
             nom: culture.planche!.nom,
-            surface: culture.planche!.surface ?? 10,
+            // Surface de la planche (sinon largeur × longueur) ; inconnue : pas de litres.
+            surface,
             retentionEau: culture.planche!.retentionEau,
             typeSol: culture.planche!.typeSol,
-          }
+            typeSolParcelle: culture.planche!.parcelleGeo ? culture.planche!.parcelleGeo.typeSol : solParcelleRepli,
+            irrigation: culture.planche!.irrigation,
+          },
+          sousAbri,
         )
-
-        if (sousAbri) {
-          reco.conseilMessage = adapterConseilSousAbri(reco.conseilMessage)
-          reco.pluiePrevue48h = 0
-          reco.prochainePluie = null
-          reco.joursSansPluie = 0
-        }
 
         recommandationsCultures.push({
           ...reco,
           plancheId: culture.planche!.id,
-          varietyName: culture.variete?.nom ?? null,
-          etatCulture: culture.plantationFaite ? 'Plantée' : 'Semée',
-          derniereIrrigation: culture.derniereIrrigation?.toISOString() ?? null,
+          // Variété de repli « Non spécifiée » : le drapeau du référentiel fait foi.
+          varietyName: culture.variete?.isPlaceholder ? null : culture.variete?.nom ?? null,
+          // QA cmv2eg99z — même état que la liste des cultures : une culture
+          // récoltée s'affichait « Semée » (cascade recopiée sans `recolteFaite`).
+          etatCulture: etatCulture(culture),
+          // Jour du lieu, comme le bilan et « Arrosée aujourd'hui » (QA cmv3jatw8).
+          derniereIrrigation:
+            dernierArrosageDuLieu(meteo, culture.derniereIrrigation, arrosages.get(culture.id) ?? [])?.date.toISOString() ?? null,
           irrigationSysteme: culture.planche?.irrigation ?? null,
+          sousAbri,
+          surfaceM2: surface,
+          // Ce qui manque à la planche pour un conseil sûr, affiché avec un
+          // lien vers sa fiche (tickets QA cmv3ja7nr et cmv3jaru7).
+          plancheACompleter: [
+            ...(sousAbri === null ? ['type'] : []),
+            ...(sourceSol({ typeSol: culture.planche!.typeSol, retentionEau: culture.planche!.retentionEau }) !== 'planche' ? ['sol'] : []),
+          ],
         })
       }
     }

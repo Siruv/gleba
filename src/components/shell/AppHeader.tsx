@@ -16,13 +16,15 @@ import * as React from "react"
 import Link from "next/link"
 import Image from "next/image"
 import { useSession } from "next-auth/react"
-import { Settings } from "lucide-react"
+import { Megaphone, Settings } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { UserMenu } from "@/components/auth/UserMenu"
 import { ModulesNav } from "@/components/auth/ModulesNav"
 import { BoutiqueHeaderButton } from "@/components/auth/BoutiqueHeaderButton"
 import { HeaderMeteoWidget } from "@/components/meteo/HeaderMeteoWidget"
 import { useHideOnScroll } from "@/hooks/use-hide-on-scroll"
+import { useVersionAccueil } from "@/hooks/use-version-accueil"
+import { usePathname } from "next/navigation"
 import type { ModuleId } from "@/lib/modules"
 
 interface AppHeaderProps {
@@ -37,6 +39,12 @@ export function AppHeader({ current, showLune = false }: AppHeaderProps) {
   // Retour Guillaume 2026-07-17 : le header s'efface en descendant (seuls
   // les onglets du module restent), réapparaît dès qu'on remonte.
   const hidden = useHideOnScroll()
+  // Accueil v2 (L4, 2026-10-09) : pour un compte en v2, le rail remplace cet
+  // en-tête sur grand écran ; la hauteur publiée tombe à 0 et la barre
+  // d'onglets des modules se colle en haut. L'en-tête reste sur téléphone.
+  const pathname = usePathname()
+  const { version } = useVersionAccueil()
+  const railActif = version === "v2" || pathname === "/aujourdhui"
 
   // Ticket cmsx5x1z2 — la barre d'onglets des modules se collait sous le header
   // avec un décalage codé en dur (`top-[61px]`), qui suppose un header d'une
@@ -64,9 +72,10 @@ export function AppHeader({ current, showLune = false }: AppHeaderProps) {
   return (
     <header
       ref={headerRef}
-      className={`border-b bg-white/95 backdrop-blur-sm sticky top-0 z-50 transition-transform duration-200 motion-reduce:transition-none ${
+      // Charte « carnet de ferme » (2026-10-09) : craie, lin, Geist ; aucune action déplacée.
+      className={`sticky top-0 z-50 border-b border-lin bg-craie/95 font-ui text-encre backdrop-blur-sm transition-transform duration-200 motion-reduce:transition-none ${
         hidden ? "-translate-y-full" : "translate-y-0"
-      }`}
+      } ${railActif ? "lg:hidden" : ""}`}
     >
       <div className="container mx-auto px-4 py-2.5 flex items-center justify-between gap-2 max-w-[1600px] flex-wrap">
         <div className="flex items-center gap-3 min-w-0">
@@ -85,8 +94,20 @@ export function AppHeader({ current, showLune = false }: AppHeaderProps) {
         <div className="flex items-center gap-2 flex-wrap justify-end">
           {session?.user && <ModulesNav current={current} />}
           {session?.user && <BoutiqueHeaderButton />}
+          {/* Signalement 2026-10-06 : la communauté (demandes d'évolution et
+              votes) n'était atteignable que par le menu du profil, sous un
+              libellé anglais ; un utilisateur a dû demander à l'assistant où
+              elle était. Elle a sa place dans le bandeau, comme Paramètres. */}
+          {session?.user && (
+            <Link href="/communaute">
+              <Button variant="ghost" size="sm" className="text-ardoise hover:bg-papier hover:text-encre" aria-label="Communauté" title="Communauté : demandes d'évolution et votes">
+                <Megaphone className="h-4 w-4" />
+                <span className="ml-1.5 hidden 2xl:inline">Communauté</span>
+              </Button>
+            </Link>
+          )}
           <Link href="/parametres">
-            <Button variant="ghost" size="sm" aria-label="Paramètres">
+            <Button variant="ghost" size="sm" className="text-ardoise hover:bg-papier hover:text-encre" aria-label="Paramètres">
               <Settings className="h-4 w-4" />
             </Button>
           </Link>
@@ -104,7 +125,7 @@ export function AppHeader({ current, showLune = false }: AppHeaderProps) {
  */
 export function PageToolbar({ children }: { children: React.ReactNode }) {
   return (
-    <div className="border-b bg-white/70 backdrop-blur-sm">
+    <div className="border-b border-lin bg-craie/80 backdrop-blur-sm">
       <div className="container mx-auto px-4 py-3 flex items-center justify-between gap-2 flex-wrap max-w-[1600px]">
         {children}
       </div>

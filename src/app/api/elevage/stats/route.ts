@@ -6,6 +6,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { whereSoinAnimalPresent } from '@/lib/elevage/soins-a-faire'
 import { calculerStockOeufs } from '@/lib/stocks-helpers'
 import { computeStockOeufsParLots } from '@/lib/elevage/stock-oeufs-lots'
 import { tauxPonteSaisonnalise } from '@/lib/lait'
@@ -31,6 +32,10 @@ export async function GET(request: NextRequest) {
     const endOfYear = new Date(annee, 11, 31, 23, 59, 59)
     const startOfPrevYear = new Date(annee - 1, 0, 1)
     const endOfPrevYear = new Date(annee - 1, 11, 31, 23, 59, 59)
+
+    // Lots de ponte : une seule lecture, partagée par le stock physique et les
+    // statuts (commercialisables, bloqués véto).
+    const stockOeufsLotsPromise = computeStockOeufsParLots(userId)
 
     // Stats animaux
     const [
@@ -151,12 +156,13 @@ export async function GET(request: NextRequest) {
         _count: true,
       }),
 
-      // Soins à planifier (non faits)
+      // Soins à planifier (non faits), d'un animal encore présent (ticket cmv294whk)
       prisma.soinAnimal.count({
         where: {
           userId,
           fait: false,
           datePrevue: { lte: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) }, // 30 jours
+          AND: [whereSoinAnimalPresent()],
         },
       }),
 
@@ -183,14 +189,15 @@ export async function GET(request: NextRequest) {
         return lowStock.filter(a => a.stock !== null && a.stockMin !== null && a.stock <= a.stockMin).length
       }),
 
-      // Stock œufs calculé
-      calculerStockOeufs(userId),
+      // Stock œufs : physique (QA cmv29bm4o — même chiffre que Production >
+      // Œufs, calculé une seule fois et partagé avec la ligne suivante).
+      stockOeufsLotsPromise.then((lots) => calculerStockOeufs(userId, lots)),
 
       // QA cmsw97cn5 (2026-08-16) — statuts par lot (SSOT partagée avec
       // Production > Œufs et l'assistant) : le dashboard annonçait
       // « disponibles » un stock physique intégralement DCR dépassée/bloqué
       // véto, et son seuil d'alerte portait sur le physique.
-      computeStockOeufsParLots(userId),
+      stockOeufsLotsPromise,
 
       // Mortalité annee (animaux morts cette annee)
       prisma.animal.count({

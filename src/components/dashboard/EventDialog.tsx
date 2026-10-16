@@ -136,7 +136,12 @@ export function EventDialog({ event, open, onOpenChange, onUpdate }: EventDialog
             quantite: parsedQuantite,
           }),
         })
-        if (!responseRecolte.ok) throw new Error("Erreur création récolte")
+        if (!responseRecolte.ok) {
+          // Le refus du serveur dit quoi corriger (récolte avant la
+          // plantation, cmv2r19al) : il était remplacé par un message muet.
+          const p = await responseRecolte.json().catch(() => null)
+          throw new Error(p?.error || "Impossible d'enregistrer la récolte")
+        }
 
         // Marquer la culture comme récoltée
         await fetch(`/api/cultures/${event.id}`, {
@@ -152,11 +157,11 @@ export function EventDialog({ event, open, onOpenChange, onUpdate }: EventDialog
 
         onUpdate()
         onOpenChange(false)
-      } catch {
+      } catch (error) {
         toast({
           variant: "destructive",
           title: "Erreur",
-          description: "Impossible d'enregistrer la récolte",
+          description: error instanceof Error ? error.message : "Impossible d'enregistrer la récolte",
         })
       } finally {
         setLoading(false)
@@ -328,7 +333,18 @@ export function EventDialog({ event, open, onOpenChange, onUpdate }: EventDialog
             </div>
           )}
 
-          {/* Actions */}
+          {/* Actions — un arrosage affiché est un arrosage déjà noté (refonte du
+              2026-10-10) : rien à cocher ni à décocher ici. */}
+          {event.type === "irrigation" ? (
+            <div className="space-y-2">
+              <div className="text-xs text-muted-foreground p-3 bg-muted/50 rounded-lg">
+                Arrosage noté. Les planches à arroser aujourd&apos;hui sont dans les tâches du jour.
+              </div>
+              <Link href={`/maraichage/cultures/${event.cultureId}`} className="block">
+                <Button variant="outline" className="w-full">Voir la culture</Button>
+              </Link>
+            </div>
+          ) : (
           <div className="flex flex-col-reverse gap-2 sm:flex-row">
             <Button
               onClick={handleToggle}
@@ -345,21 +361,20 @@ export function EventDialog({ event, open, onOpenChange, onUpdate }: EventDialog
                 <>Annuler</>
               ) : completionMode && event.type === "recolte" ? (
                 <>Enregistrer la récolte</>
-              ) : completionMode && event.type === "irrigation" ? (
-                <>Confirmer l’arrosage</>
               ) : (
                 <>Marquer comme fait</>
               )}
             </Button>
-            <Link href={`/maraichage/cultures/${event.type === 'irrigation' ? event.cultureId : event.id}`} className="flex-1">
+            <Link href={`/maraichage/cultures/${event.id}`} className="flex-1">
               <Button variant="outline" className="w-full">
                 Modifier
               </Button>
             </Link>
           </div>
+          )}
 
           {/* Info selon type */}
-          {event.fait || (event.type !== "recolte" && event.type !== "irrigation") ? (
+          {event.type !== "irrigation" && (event.fait || event.type !== "recolte") ? (
             <div className="text-xs text-muted-foreground p-3 bg-muted/50 rounded-lg">
               {config.action}
             </div>

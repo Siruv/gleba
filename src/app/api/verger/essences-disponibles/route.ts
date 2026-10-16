@@ -19,6 +19,7 @@
  */
 
 import { NextRequest, NextResponse } from "next/server"
+import { ESPECE_TYPES_VERGER, estTypeVerger, type EspeceTypeVerger } from "@/lib/validations/espece"
 import prisma from "@/lib/prisma"
 import { requireAuthApi } from "@/lib/auth-utils"
 import { visibiliteReferentiel } from "@/lib/referentiel-communaute"
@@ -33,7 +34,7 @@ export type EssenceItem = {
   source: "forestiere" | "fruitier" | "bocagere"
   // Pour source "fruitier" : distingue arbre fruitier et petit fruit
   // (QA cmsnnu2q2 — Fraise/Framboise étaient badgées « Fruitier »).
-  sousType?: "arbre_fruitier" | "petit_fruit"
+  sousType?: EspeceTypeVerger
   id: string // forestière.id | espece.id | essence_bocagere.id
   nom: string
   nomLatin: string
@@ -131,12 +132,18 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  // 2) Source "fruitier" — Espece WHERE type IN ('arbre_fruitier','petit_fruit').
+  // 2) Source "fruitier" — Espece WHERE type IN (ESPECE_TYPES_VERGER).
   if (type === "verger" || type === "agroforesterie") {
     const fruitiers = await prisma.espece.findMany({
-      where: { AND: [{ type: { in: ["arbre_fruitier", "petit_fruit"] } }, visibiliteReferentiel(userId)] },
+      where: { AND: [{ type: { in: [...ESPECE_TYPES_VERGER] } }, visibiliteReferentiel(userId)] },
       select: {
         id: true,
+        // Ticket cmv2908du (QA 2026-10-10) — l'id d'une espèce n'est son nom
+        // que pour le catalogue historique ; une espèce créée depuis (perso,
+        // communauté, référentiel outre-mer) a un cuid pour id et son nom dans
+        // `nom`. « Citrus paradisi » s'affichait « cmuu5t8mx… » à l'étape
+        // Essences, et ce cuid était recopié dans `essenceLibre` de la campagne.
+        nom: true,
         nomLatin: true,
         // QA cmsnnu2q2 — Fraise et Framboise étaient badgées « Fruitier » :
         // la route écrasait arbre_fruitier et petit_fruit dans une seule
@@ -150,7 +157,7 @@ export async function GET(request: NextRequest) {
         besoinFroid: true,
         _count: { select: { portesGreffe: true } },
       },
-      orderBy: { id: "asc" },
+      orderBy: [{ nom: "asc" }, { id: "asc" }],
     })
     for (const f of fruitiers) {
       // Une espèce sans zone renseignée reste proposée (statut « inconnue ») :
@@ -164,9 +171,9 @@ export async function GET(request: NextRequest) {
       if (adequation.statut === "peu_adaptee") continue
       out.push({
         source: "fruitier",
-        sousType: f.type === "petit_fruit" ? "petit_fruit" : "arbre_fruitier",
+        sousType: estTypeVerger(f.type) ? f.type : "arbre_fruitier",
         id: `fruitier::${f.id}`,
-        nom: f.id,
+        nom: f.nom ?? f.id,
         nomLatin: f.nomLatin ?? "",
         porteGreffeRequis: f._count.portesGreffe > 0,
       })

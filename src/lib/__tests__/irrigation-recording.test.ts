@@ -10,6 +10,11 @@ vi.mock("@/lib/prisma", () => ({
       findMany: vi.fn(),
       updateMany: vi.fn(),
       createMany: vi.fn(),
+      update: vi.fn(),
+    },
+    intervention: {
+      create: vi.fn(),
+      deleteMany: vi.fn(),
     },
     $transaction: vi.fn(),
   },
@@ -23,7 +28,7 @@ vi.mock("@/lib/irrigation-cache", () => ({
 
 import prisma from "@/lib/prisma"
 import { irrigationCache } from "@/lib/irrigation-cache"
-import { enregistrerArrosageCultures } from "@/lib/irrigation-recording"
+import { annulerArrosageMesure, enregistrerArrosageCultures, enregistrerArrosageMesure } from "@/lib/irrigation-recording"
 
 const mockedPrisma = prisma as unknown as {
   culture: {
@@ -34,13 +39,13 @@ const mockedPrisma = prisma as unknown as {
     findMany: ReturnType<typeof vi.fn>
     updateMany: ReturnType<typeof vi.fn>
     createMany: ReturnType<typeof vi.fn>
+    update: ReturnType<typeof vi.fn>
   }
   $transaction: ReturnType<typeof vi.fn>
 }
 
 const DATE_EFFECTIVE = new Date("2026-07-29T10:00:00.000Z")
 const FIN_JOURNEE = new Date("2026-07-29T23:59:59.999Z")
-const DEBUT_JOURNEE = new Date("2026-07-29T00:00:00.000Z")
 
 /** Espèce gourmande : cycle d'arrosage de 2 jours. */
 const GOURMANDE = { espece: { besoinEau: 4 } }
@@ -57,7 +62,7 @@ function passage(
 /** Les deux lectures de la fonction : passages ouverts, puis clos du jour. */
 function mockLectures(
   ouvertes: ReturnType<typeof passage>[],
-  closesAujourdhui: Array<{ cultureId: number }> = [],
+  closesAujourdhui: Array<{ id?: number; cultureId: number; notes?: string | null }> = [],
 ) {
   mockedPrisma.irrigationPlanifiee.findMany
     .mockResolvedValueOnce(ouvertes)
@@ -113,7 +118,7 @@ describe("enregistrerArrosageCultures", () => {
           },
         ],
       },
-      select: { id: true },
+      select: { id: true, derniereIrrigation: true },
     })
     // Les passages ouverts sont lus avant d'être clos : seuls les
     // rattrapables sont ensuite estampillés de la date réelle.
@@ -225,9 +230,10 @@ describe("enregistrerArrosageCultures", () => {
         userId: "user-1",
         cultureId: { in: [10, 11] },
         fait: true,
-        dateEffective: { gte: DEBUT_JOURNEE, lte: FIN_JOURNEE },
+        // Fenêtre anti-doublon de 10 minutes (un second arrosage du soir a sa trace).
+        dateEffective: { gte: new Date(DATE_EFFECTIVE.getTime() - 10 * 60_000), lte: FIN_JOURNEE },
       },
-      select: { cultureId: true },
+      select: { id: true, cultureId: true, notes: true },
     })
     expect(mockedPrisma.irrigationPlanifiee.createMany).toHaveBeenCalledWith({
       data: [
@@ -237,7 +243,7 @@ describe("enregistrerArrosageCultures", () => {
           datePrevue: DATE_EFFECTIVE,
           fait: true,
           dateEffective: DATE_EFFECTIVE,
-          notes: "Arrosage noté depuis les conseils d’irrigation",
+          notes: "Arrosage noté",
         },
         {
           userId: "user-1",
@@ -245,9 +251,29 @@ describe("enregistrerArrosageCultures", () => {
           datePrevue: DATE_EFFECTIVE,
           fait: true,
           dateEffective: DATE_EFFECTIVE,
-          notes: "Arrosage noté depuis les conseils d’irrigation",
+          notes: "Arrosage noté",
         },
       ],
+    })
+  })
+
+  // Refonte de l'arrosage (2026-10-10) : l'observation saisie sur la page
+  // Tâches accompagne la trace, au lieu d'un passage planifié qu'on cochait.
+  it("garde l'observation saisie avec l'arrosage dans la trace", async () => {
+    mockedPrisma.culture.findMany
+      .mockResolvedValueOnce([{ id: 10, plancheId: "planche-a" }])
+      .mockResolvedValueOnce([{ id: 10 }])
+    mockLectures([])
+
+    await enregistrerArrosageCultures({
+      userId: "user-1",
+      cultureIds: [10],
+      dateEffective: DATE_EFFECTIVE,
+      notes: "  Sol sec en surface  ",
+    })
+
+    expect(mockedPrisma.irrigationPlanifiee.createMany).toHaveBeenCalledWith({
+      data: [expect.objectContaining({ cultureId: 10, notes: "Sol sec en surface" })],
     })
   })
 
@@ -265,6 +291,46 @@ describe("enregistrerArrosageCultures", () => {
 
     const [{ data }] = mockedPrisma.irrigationPlanifiee.createMany.mock.calls[0]
     expect(data.map((d: { cultureId: number }) => d.cultureId)).toEqual([11])
+  })
+
+  // Double geste (deux écrans, double tap) avec une observation : elle
+  // complète la trace du premier geste au lieu d'être perdue.
+  it("complète la trace d'un double geste avec la nouvelle observation", async () => {
+    mockedPrisma.culture.findMany
+      .mockResolvedValueOnce([{ id: 10, plancheId: "planche-a" }])
+      .mockResolvedValueOnce([{ id: 10 }, { id: 11 }])
+    mockLectures([], [
+      { id: 5, cultureId: 10, notes: "Arrosage noté" },
+      { id: 6, cultureId: 11, notes: "Paillage refait" },
+    ])
+
+    await enregistrerArrosageCultures({
+      userId: "user-1",
+      cultureIds: [10],
+      dateEffective: DATE_EFFECTIVE,
+      notes: "Feuilles flétries",
+    })
+
+    expect(mockedPrisma.irrigationPlanifiee.createMany.mock.calls[0][0].data).toEqual([])
+    expect(mockedPrisma.irrigationPlanifiee.update).toHaveBeenCalledWith({
+      where: { id: 5 },
+      data: { notes: "Feuilles flétries" },
+    })
+    expect(mockedPrisma.irrigationPlanifiee.update).toHaveBeenCalledWith({
+      where: { id: 6 },
+      data: { notes: "Paillage refait · Feuilles flétries" },
+    })
+  })
+
+  it("un double geste sans observation ne touche pas la trace", async () => {
+    mockedPrisma.culture.findMany
+      .mockResolvedValueOnce([{ id: 10, plancheId: "planche-a" }])
+      .mockResolvedValueOnce([{ id: 10 }])
+    mockLectures([], [{ id: 5, cultureId: 10, notes: "Paillage refait" }])
+
+    await enregistrerArrosageCultures({ userId: "user-1", cultureIds: [10], dateEffective: DATE_EFFECTIVE })
+
+    expect(mockedPrisma.irrigationPlanifiee.update).not.toHaveBeenCalled()
   })
 
   // Un passage abandonné n'est pas une trace : sans cela, l'arrosage réel du
@@ -300,5 +366,60 @@ describe("enregistrerArrosageCultures", () => {
     expect(result.culturesMisesAJour).toBe(0)
     expect(mockedPrisma.$transaction).not.toHaveBeenCalled()
     expect(irrigationCache.invalidateUser).not.toHaveBeenCalled()
+  })
+})
+
+// Ticket QA cmv3japsf : « Noter » avec la quantité versée.
+describe("enregistrerArrosageMesure", () => {
+  const p = prisma as unknown as {
+    culture: { findMany: ReturnType<typeof vi.fn>; updateMany: ReturnType<typeof vi.fn> }
+    intervention: { create: ReturnType<typeof vi.fn>; deleteMany: ReturnType<typeof vi.fn> }
+    irrigationPlanifiee: { createMany: ReturnType<typeof vi.fn> }
+  }
+  beforeEach(() => vi.clearAllMocks())
+
+  it("crée une intervention « arrosage » avec ses litres, sans remettre le sol plein", async () => {
+    p.culture.findMany.mockResolvedValue([{ id: 7, plancheId: "c3" }, { id: 8, plancheId: "c3" }])
+    p.intervention.create.mockResolvedValue({ id: 501 })
+    const r = await enregistrerArrosageMesure({ userId: "u1", cultureIds: [8, 7], litres: 193.04, dateEffective: DATE_EFFECTIVE })
+    expect(r).toEqual({ ok: true, interventionId: 501, cultureIds: [7, 8], plancheId: "c3" })
+    expect(p.intervention.create).toHaveBeenCalledWith({
+      data: {
+        userId: "u1",
+        date: DATE_EFFECTIVE,
+        type: "arrosage",
+        cultureId: 8,
+        plancheId: "c3",
+        fait: true,
+        intrantNom: "Eau",
+        intrantQuantite: 193,
+        intrantUnite: "L",
+        notes: null,
+      },
+      select: { id: true },
+    })
+    // Ni `derniereIrrigation` ni trace « Noter » : tous deux valent un plein.
+    expect(p.culture.updateMany).not.toHaveBeenCalled()
+    expect(p.irrigationPlanifiee.createMany).not.toHaveBeenCalled()
+    expect(irrigationCache.invalidateUser).toHaveBeenCalledWith("u1")
+  })
+
+  it("refuse une quantité nulle ou démesurée, des planches mêlées ou des cultures d'un autre compte", async () => {
+    expect(await enregistrerArrosageMesure({ userId: "u1", cultureIds: [7], litres: 0 })).toEqual({ ok: false, erreur: "Quantité versée invalide" })
+    expect((await enregistrerArrosageMesure({ userId: "u1", cultureIds: [7], litres: 250_000 })).ok).toBe(false)
+    p.culture.findMany.mockResolvedValueOnce([{ id: 7, plancheId: "c3" }, { id: 9, plancheId: "b5" }])
+    expect(await enregistrerArrosageMesure({ userId: "u1", cultureIds: [7, 9], litres: 50 })).toEqual({
+      ok: false,
+      erreur: "Une quantité se note planche par planche",
+    })
+    p.culture.findMany.mockResolvedValueOnce([])
+    expect(await enregistrerArrosageMesure({ userId: "u1", cultureIds: [7], litres: 50 })).toEqual({ ok: false, erreur: "Culture non trouvée" })
+    expect(p.intervention.create).not.toHaveBeenCalled()
+  })
+
+  it("s'annule en supprimant l'intervention du compte, et elle seule", async () => {
+    p.intervention.deleteMany.mockResolvedValue({ count: 1 })
+    expect(await annulerArrosageMesure({ userId: "u1", interventionId: 501 })).toEqual({ interventionsSupprimees: 1 })
+    expect(p.intervention.deleteMany).toHaveBeenCalledWith({ where: { id: 501, userId: "u1", type: "arrosage" } })
   })
 })

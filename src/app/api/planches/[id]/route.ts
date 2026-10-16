@@ -7,10 +7,12 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { irrigationCache } from '@/lib/irrigation-cache'
 import { updatePlancheSchema } from '@/lib/validations'
 import { requireAuthApi } from '@/lib/auth-utils'
 import { invalidateKpi } from '@/lib/kpi'
 import { resoudreIdPlanche } from '@/lib/planches/resolution'
+import { aDesTraces, compterTracesPlanches, messageSuppressionRefusee } from '@/lib/planches/traces'
 
 type RouteParams = { params: Promise<{ id: string }> }
 
@@ -154,6 +156,8 @@ export async function PUT(
     })
 
     invalidateKpi(session!.user.id)
+    // Sol et système d'arrosage de la planche nourrissent le conseil d'irrigation.
+    irrigationCache.invalidateUser(session!.user.id)
     return NextResponse.json(planche)
   } catch (error) {
     console.error('PUT /api/planches/[id] error:', error)
@@ -180,13 +184,7 @@ export async function DELETE(
     const plancheId = await resoudreIdPlanche(prisma, reference, session!.user.id)
     const planche = plancheId ? await prisma.planche.findUnique({
       where: { id: plancheId },
-      include: {
-        _count: {
-          select: {
-            cultures: true,
-          },
-        },
-      },
+      select: { id: true, nom: true },
     }) : null
 
     if (!planche) {
@@ -196,12 +194,15 @@ export async function DELETE(
       )
     }
 
-    // Vérifier si des cultures sont liées
-    if (planche._count.cultures > 0) {
+    // QA cmv29i9ad — cultures et interventions retiennent la planche, sinon
+    // l'intervention perd son emplacement (voir traces.ts pour ce qui ne la
+    // retient pas).
+    const traces = (await compterTracesPlanches(prisma, [planche], session!.user.id)).get(planche.id)!
+    if (aDesTraces(traces)) {
       return NextResponse.json(
         {
-          error: `Impossible de supprimer la planche "${planche.nom}" car elle a des cultures`,
-          details: { cultures: planche._count.cultures }
+          error: messageSuppressionRefusee(planche.nom, traces),
+          details: traces,
         },
         { status: 409 }
       )

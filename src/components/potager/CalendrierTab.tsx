@@ -7,8 +7,6 @@
 
 import * as React from "react"
 import {
-  CheckCircle2,
-  Circle,
   Sprout,
   Leaf,
   Package,
@@ -18,7 +16,6 @@ import {
   TrendingUp,
   TrendingDown,
   AlertTriangle,
-  CloudRain,
 } from "lucide-react"
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -36,7 +33,13 @@ import {
 } from "@/components/ui/tooltip"
 import { Info } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
-import { libelleIrrigationInutile } from "@/lib/irrigation-meteo-decision"
+import type { ArrosageDuJour } from "@/lib/irrigation/a-arroser"
+import { annulerArrosage, noterArrosage } from "@/lib/irrigation/noter-arrosage"
+import { detailArrosageNote } from "@/lib/irrigation/quantite-versee"
+import { notifierEnregistrement } from "@/lib/notifications-ecran"
+import { LigneArrosage, LigneTache } from "@/components/potager/LigneTache"
+import { SaisieArrosage } from "@/components/potager/SaisieArrosage"
+import { PastilleEtat } from "@/components/accueil/PastilleEtat"
 import { BulkActions } from "@/components/calendrier/BulkActions"
 import { CalendarView } from "@/components/dashboard/CalendarView"
 import { ItpCalendarView } from "@/components/dashboard/ItpCalendarView"
@@ -89,29 +92,11 @@ interface TacheItem {
   retardJours: number
 }
 
-interface IrrigationItem {
-  id: number
-  cultureId: number
-  cultureCount?: number
-  especeId: string
-  especeNom?: string | null
-  plancheId: string | null
-  ilot: string | null
-  datePrevue: string
-  fait: boolean
-  couleur: string | null
-  retardJours: number
-  pluiePrevue: number | null
-  pluieRecente?: number | null
-  probablementInutile: boolean
-  raisonInutile?: "pluie-recente" | "pluie-prevue" | null
-}
-
 interface TachesData {
   semis: TacheItem[]
   plantations: TacheItem[]
   recoltes: TacheItem[]
-  irrigation: IrrigationItem[]
+  irrigation: ArrosageDuJour[]
   stats: {
     semisPrevus: number
     semisFaits: number
@@ -145,6 +130,9 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
   } | null>(null)
   const [harvestQuantity, setHarvestQuantity] = React.useState("")
   const [harvestLoading, setHarvestLoading] = React.useState(false)
+  // Planche dont on note l'arrosage, avec la quantité versée (ticket QA cmv3japsf).
+  const [arrosageANoter, setArrosageANoter] = React.useState<ArrosageDuJour | null>(null)
+  const [arrosageEnCours, setArrosageEnCours] = React.useState(false)
   const { weekStart, weekEnd } = React.useMemo(() => {
     // Une saison passée/future conserve le mois et le jour courants, mais
     // dans l'année choisie. Sinon `year=2027` interrogeait encore une semaine
@@ -209,58 +197,6 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
     window.addEventListener("gleba:irrigation-updated", handleIrrigationUpdated)
     return () => window.removeEventListener("gleba:irrigation-updated", handleIrrigationUpdated)
   }, [fetchTaches])
-
-  /**
-   * Cultures cochées « à irriguer » mais encore sans plan d'arrosage.
-   *
-   * Le plan d'arrosage se PROPOSE, il ne s'impose plus. Jusqu'au 2026-09-02,
-   * cet onglet postait lui-même `/api/irrigations/generate` dès qu'un compte
-   * avait des cultures et zéro arrosage : un compte réel a ainsi reçu
-   * 86 passages à sa première ouverture du calendrier (29/07), n'en a coché
-   * aucun, et n'est revenu que pour trouver 51 périmés et des retards — trois
-   * visites, zéro saisie. La route GET du même endpoint disait déjà
-   * « proposer l'action sans jamais l'imposer » ; le bandeau ci-dessous est
-   * désormais le seul chemin, pour le premier plan comme pour les cultures
-   * cochées ensuite (friction du 2026-07-30 : après le premier lot, toute
-   * culture cochée restait sans plan et sans signal).
-   */
-  const [aPlanifier, setAPlanifier] = React.useState(0)
-  const [planificationEnCours, setPlanificationEnCours] = React.useState(false)
-
-  const rafraichirAPlanifier = React.useCallback(() => {
-    fetch('/api/irrigations/generate')
-      .then(r => (r.ok ? r.json() : null))
-      .then(d => setAPlanifier(d?.aPlanifier ?? 0))
-      .catch(() => {})
-  }, [])
-
-  React.useEffect(() => {
-    if (loadingTaches) return
-    rafraichirAPlanifier()
-  }, [taches, loadingTaches, rafraichirAPlanifier])
-
-  const planifierArrosage = async () => {
-    setPlanificationEnCours(true)
-    try {
-      const res = await fetch('/api/irrigations/generate', { method: 'POST' })
-      const result = await res.json().catch(() => null)
-      if (!res.ok) throw new Error(result?.error || 'Erreur de planification')
-      toast({
-        title: 'Arrosage planifié',
-        description: result?.message || 'Plan mis à jour.',
-      })
-      await fetchTaches()
-      rafraichirAPlanifier()
-    } catch (error) {
-      toast({
-        variant: 'destructive',
-        title: 'Erreur',
-        description: error instanceof Error ? error.message : 'Erreur inconnue',
-      })
-    } finally {
-      setPlanificationEnCours(false)
-    }
-  }
 
   // Toggle tâche
   const toggleTache = async (
@@ -371,35 +307,39 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
     }
   }
 
-  // Marquer irrigation
-  const marquerIrrigation = async (irrigationId: number) => {
-    try {
-      const res = await fetch(`/api/irrigations/${irrigationId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fait: true, dateEffective: new Date().toISOString() }),
-      })
-      if (!res.ok) {
-        const p = await res.json().catch(() => null)
-        toast({ variant: "destructive", title: "Erreur", description: p?.error || "Impossible de noter l'arrosage" })
-        fetchTaches()
-        return
-      }
+  // Noter l'arrosage d'une planche (besoin du jour, bilan hydrique). Avec la
+  // quantité versée, le bilan retranche ces litres et la planche peut rester
+  // à arroser (rechargement par « gleba:irrigation-updated ») ; sans, il
+  // compte comme complet.
+  const noterArrosagePlanche = async (arrosage: ArrosageDuJour, litres: number | null, notes: string | null) => {
+    setArrosageEnCours(true)
+    const resultat = await noterArrosage(arrosage.cultureIds, notes, litres, "calendrier")
+    setArrosageEnCours(false)
+    if (!resultat.ok) {
+      toast({ variant: "destructive", title: "Erreur", description: resultat.erreur })
+      return
+    }
+    setArrosageANoter(null)
+    if (!litres) {
       setTaches((prev) => {
         if (!prev) return prev
         return {
           ...prev,
-          irrigation: prev.irrigation.filter((i) => i.id !== irrigationId),
-          stats: { ...prev.stats, aIrriguer: prev.stats.aIrriguer - 1 },
+          irrigation: prev.irrigation.filter((a) => a.cle !== arrosage.cle),
+          stats: { ...prev.stats, aIrriguer: Math.max(0, prev.stats.aIrriguer - 1) },
         }
       })
-      toast({ title: "Arrosage note !" })
-      window.dispatchEvent(new CustomEvent("gleba:irrigation-updated", {
-        detail: { source: "calendar-tasks" },
-      }))
-    } catch {
-      toast({ variant: "destructive", title: "Erreur" })
     }
+    // Un tap de trop s'annule : inverse exact (revue du 2026-10-10).
+    notifierEnregistrement({
+      titre: "Arrosage noté",
+      detail: detailArrosageNote(arrosage.plancheNom ?? arrosage.especes, litres),
+      annuler: async () => {
+        const annule = await annulerArrosage(resultat.annulation)
+        if (!annule.ok) throw new Error(annule.erreur)
+        fetchTaches()
+      },
+    })
   }
 
   const yearDiff = stats ? stats.recoltesAnnee - stats.recoltesAnneePrecedente : 0
@@ -593,9 +533,10 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
                 <TooltipContent side="bottom" className="max-w-xs text-left">
                   <p className="font-semibold mb-1">Tâches de la semaine</p>
                   <p className="text-xs leading-relaxed">
-                    Total des semis, plantations, recoltes et arrosages à faire entre lundi
-                    et dimanche de la semaine en cours. Les tâches « en retard » correspondent
-                    à des actions prevues les semaines passées et toujours non cochées.
+                    Total des semis, plantations et récoltes à faire entre lundi et dimanche
+                    de la semaine en cours, plus les planches à arroser aujourd&apos;hui. Les
+                    tâches « en retard » sont des actions prévues les semaines passées et
+                    toujours non cochées ; un arrosage n&apos;est jamais en retard.
                   </p>
                 </TooltipContent>
               </Tooltip>
@@ -606,7 +547,7 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
                     ? (taches.stats.semisPrevus - taches.stats.semisFaits) +
                       (taches.stats.plantationsPrevues - taches.stats.plantationsFaites) +
                       (taches.stats.recoltesPrevues - taches.stats.recoltesFaites) +
-                      taches.irrigation.filter(i => !i.probablementInutile).length
+                      taches.irrigation.length
                     : 0}
               </CardTitle>
             </CardHeader>
@@ -746,15 +687,10 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
               <div className="bg-cyan-50 rounded-lg p-2 text-center">
                 <Droplets className="h-4 w-4 mx-auto text-cyan-600 mb-1" />
                 <p className="text-lg font-bold text-cyan-700">
-                  {taches.irrigation.filter(i => !i.probablementInutile).length}
+                  {taches.irrigation.length}
                 </p>
                 <p className="text-xs text-cyan-600">
                   Arrosage
-                  {taches.irrigation.filter(i => i.probablementInutile).length > 0 && (
-                    <span className="text-blue-500 ml-1">
-                      ({taches.irrigation.filter(i => i.probablementInutile).length} annulé{taches.irrigation.filter(i => i.probablementInutile).length > 1 ? "s" : ""} pluie)
-                    </span>
-                  )}
                 </p>
               </div>
             </div>
@@ -794,107 +730,38 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
                 <CardHeader className="pb-2">
                   <CardTitle className="flex flex-wrap items-center gap-2 text-base">
                     <Droplets className="h-5 w-5 text-cyan-600" />
-                    À irriguer
-                    <div className="flex items-center gap-1.5 ml-auto">
-                      {taches.irrigation.filter(i => i.retardJours > 0).length > 0 && (
-                        <Badge variant="destructive" className="text-[10px] px-1.5 py-0">
-                          {taches.irrigation.filter(i => i.retardJours > 0).length} en retard
-                        </Badge>
-                      )}
-                      {taches.irrigation.filter(i => i.probablementInutile).length > 0 && (
-                        <Badge className="text-[10px] px-1.5 py-0 bg-blue-100 text-blue-600 hover:bg-blue-100">
-                          <CloudRain className="h-3 w-3 mr-0.5" />
-                          {taches.irrigation.filter(i => i.probablementInutile).length}
-                        </Badge>
-                      )}
-                      {taches.irrigation.length > 0 && (
-                        <Badge variant="secondary">
-                          {taches.irrigation.filter(i => !i.probablementInutile).length}/{taches.irrigation.length}
-                        </Badge>
-                      )}
-                    </div>
+                    À arroser aujourd&apos;hui
+                    {taches.irrigation.length > 0 && (
+                      <Badge variant="secondary" className="ml-auto">
+                        {taches.irrigation.length} planche{taches.irrigation.length > 1 ? "s" : ""}
+                      </Badge>
+                    )}
                   </CardTitle>
                 </CardHeader>
                 <CardContent>
-                  {aPlanifier > 0 && (
-                    <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-cyan-200 bg-cyan-50 p-2">
-                      <Droplets className="h-4 w-4 shrink-0 text-cyan-600" />
-                      <span className="text-sm text-cyan-900">
-                        {aPlanifier} culture{aPlanifier > 1 ? "s" : ""} marquée{aPlanifier > 1 ? "s" : ""} « à irriguer » sans plan d&apos;arrosage.
-                      </span>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="ml-auto h-7 bg-white text-xs"
-                        onClick={planifierArrosage}
-                        disabled={planificationEnCours}
-                      >
-                        {planificationEnCours ? "Planification…" : "Planifier l'arrosage"}
-                      </Button>
-                    </div>
-                  )}
+                  {/* Refonte du 2026-10-10 : le besoin du jour vient du bilan
+                      hydrique (pluie, prévisions, ET0, dernier arrosage noté),
+                      plus d'un plan pré-généré à cadence fixe. */}
                   {taches.irrigation.length === 0 ? (
-                    <p className="text-sm text-muted-foreground py-2">Tout est arrosé !</p>
+                    <p className="text-sm text-muted-foreground py-2">
+                      Aucune planche à arroser aujourd&apos;hui. Le conseil d&apos;irrigation détaille chaque culture.
+                    </p>
                   ) : (
-                    <div className="space-y-2 max-h-[300px] overflow-y-auto">
-                      {taches.irrigation.map((item) => {
-                        const isRetard = item.retardJours > 0
-                        const inutile = item.probablementInutile && !isRetard
-                        return (
-                          <button
-                            key={item.id}
-                            onClick={() => marquerIrrigation(item.id)}
-                            className={`w-full flex flex-col gap-1 p-2 rounded-lg border transition-all text-left ${
-                              inutile
-                                ? "bg-blue-50/60 border-blue-200/60 opacity-70 hover:opacity-90 hover:shadow-sm"
-                                : isRetard
-                                  ? "bg-red-50 border-red-200 hover:border-red-300 hover:shadow-sm"
-                                  : "bg-white border-slate-200 hover:border-cyan-300 hover:shadow-sm"
-                            }`}
-                          >
-                            <div className="flex items-center gap-3">
-                              {inutile ? (
-                                <CloudRain className="h-4 w-4 text-blue-400 flex-shrink-0" />
-                              ) : isRetard ? (
-                                <AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" />
-                              ) : (
-                                <Droplets className="h-4 w-4 text-cyan-600 flex-shrink-0" />
-                              )}
-                              <div className="flex items-center gap-2 flex-1 min-w-0">
-                                {item.couleur && (
-                                  <div
-                                    className="w-2.5 h-2.5 rounded-full flex-shrink-0"
-                                    style={{ backgroundColor: item.couleur }}
-                                  />
-                                )}
-                                <span className={`font-medium truncate text-sm ${inutile ? "line-through text-muted-foreground" : ""}`}>
-                                  {item.especeNom ?? item.especeId}
-                                  {item.cultureCount && item.cultureCount > 1
-                                    ? ` · ${item.cultureCount} cultures`
-                                    : ""}
-                                </span>
-                              </div>
-                              <div className="flex items-center gap-1.5 flex-shrink-0">
-                                {isRetard && (
-                                  <span className="text-[10px] font-medium text-red-600 bg-red-100 px-1.5 py-0.5 rounded-full whitespace-nowrap">
-                                    {retardLabel(item.retardJours)}
-                                  </span>
-                                )}
-                                {item.plancheId && (
-                                  <Badge variant="outline" className={`text-xs ${inutile ? "opacity-60" : ""}`}>
-                                    {item.plancheId}
-                                  </Badge>
-                                )}
-                              </div>
-                            </div>
-                            {inutile && (
-                              <p className="text-[11px] text-blue-500 pl-7">
-                                {libelleIrrigationInutile(item)}
-                              </p>
-                            )}
-                          </button>
-                        )
-                      })}
+                    <div className="max-h-[300px] overflow-y-auto rounded-lg border border-lin-doux bg-craie">
+                      {taches.irrigation.map((arrosage) => (
+                        <LigneArrosage
+                          key={arrosage.cle}
+                          titre={arrosage.plancheNom ?? arrosage.especes}
+                          urgence={arrosage.urgence}
+                          details={[
+                            arrosage.plancheNom ? arrosage.especes : null,
+                            arrosage.cultureIds.length > 1 ? `${arrosage.cultureIds.length} cultures` : null,
+                            arrosage.raison,
+                            arrosage.sousAbri ? "sous abri" : null,
+                          ]}
+                          onAction={() => setArrosageANoter(arrosage)}
+                        />
+                      ))}
                     </div>
                   )}
                 </CardContent>
@@ -955,16 +822,24 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
           </div>
         </DialogContent>
       </Dialog>
+      <Dialog open={arrosageANoter !== null} onOpenChange={(nextOpen) => {
+        if (!nextOpen && !arrosageEnCours) setArrosageANoter(null)
+      }}>
+        <DialogContent className="max-h-[calc(100dvh-1rem)] overflow-y-auto sm:max-w-[430px]">
+          {arrosageANoter && (
+            <SaisieArrosage
+              key={arrosageANoter.cle}
+              arrosage={arrosageANoter}
+              libelle={[arrosageANoter.plancheNom, arrosageANoter.especes].filter(Boolean).join(" · ")}
+              enCours={arrosageEnCours}
+              onNoter={(litres, notes) => noterArrosagePlanche(arrosageANoter, litres, notes)}
+              onRetour={() => setArrosageANoter(null)}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
-}
-
-function retardLabel(jours: number): string {
-  if (jours <= 0) return ''
-  const semaines = Math.floor(jours / 7)
-  if (semaines < 1) return `${jours}j de retard`
-  if (semaines === 1) return '1 sem. de retard'
-  return `${semaines} sem. de retard`
 }
 
 // Composant réutilisable pour une section de tâches
@@ -1008,11 +883,7 @@ function TaskSection({
           <Icon className={`h-5 w-5 ${iconColor}`} />
           {title}
           <div className="flex items-center gap-1.5 ml-auto">
-            {enRetardCount > 0 && (
-              <Badge variant="destructive" className="text-[10px] px-1.5 py-0">
-                {enRetardCount} en retard
-              </Badge>
-            )}
+            {enRetardCount > 0 && <PastilleEtat etat="critique" libelle={`${enRetardCount} en retard`} />}
             {items.length > 0 && (
               <Badge variant="secondary" title="Tâches faites / total">
                 {faitCount}/{items.length}
@@ -1030,63 +901,23 @@ function TaskSection({
         {items.length === 0 ? (
           <p className="text-sm text-muted-foreground py-2">{emptyText}</p>
         ) : (
-          <div className="space-y-2 max-h-[300px] overflow-y-auto">
-            {items.map((item) => {
-              const isRetard = item.retardJours > 0 && !item.fait
-              return (
-                <button
-                  key={`${item.id}-${item.retardJours}`}
-                  onClick={() => onToggle(item.id, type, item.fait, item.especeId, undefined, item.unite)}
-                  className={`w-full p-2 rounded-lg border transition-all text-left ${
-                    item.fait
-                      ? "bg-green-50 border-green-200 opacity-60"
-                      : isRetard
-                        ? "bg-red-50 border-red-200 hover:border-red-300 hover:shadow-sm"
-                        : "bg-white border-slate-200 hover:border-slate-300 hover:shadow-sm"
-                  }`}
-                >
-                  <div className="flex items-center gap-2">
-                    {item.fait ? (
-                      <CheckCircle2 className="h-4 w-4 text-green-600 flex-shrink-0" />
-                    ) : isRetard ? (
-                      <AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" />
-                    ) : (
-                      <Circle className="h-4 w-4 text-slate-300 flex-shrink-0" />
-                    )}
-                    <div className="flex items-center gap-1.5 flex-1 min-w-0">
-                      {item.couleur && (
-                        <div
-                          className="w-2.5 h-2.5 rounded-full flex-shrink-0"
-                          style={{ backgroundColor: item.couleur }}
-                        />
-                      )}
-                      <span className={`font-medium truncate text-sm ${item.fait ? "line-through" : ""}`}>
-                        {item.especeNom ?? item.especeId}
-                      </span>
-                      {item.varieteId && (
-                        <span className="text-xs text-muted-foreground truncate hidden sm:inline">{item.varieteNom ?? item.varieteId}</span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-1 flex-shrink-0">
-                      {isRetard && (
-                        <span className="text-[10px] font-medium text-red-600 bg-red-100 px-1.5 py-0.5 rounded-full whitespace-nowrap">
-                          {retardLabel(item.retardJours)}
-                        </span>
-                      )}
-                      {item.plancheId && (
-                        <Badge variant="outline" className="text-[10px] sm:text-xs max-w-[80px] sm:max-w-none truncate">
-                          {item.plancheId}
-                        </Badge>
-                      )}
-                    </div>
-                  </div>
-                  {/* Variété visible sur mobile sous le nom */}
-                  {item.varieteId && (
-                    <p className="text-[11px] text-muted-foreground truncate pl-6 mt-0.5 sm:hidden">{item.varieteNom ?? item.varieteId}</p>
-                  )}
-                </button>
-              )
-            })}
+          // P4 « une liste est un registre » (2026-10-09) : liseré d'état,
+          // verbe en pastille, une action ; plus de fond rouge.
+          <div className="max-h-[300px] overflow-y-auto rounded-lg border border-lin-doux bg-craie">
+            {items.map((item) => (
+              <LigneTache
+                key={`${item.id}-${item.retardJours}`}
+                type={type}
+                especeNom={item.especeNom ?? item.especeId}
+                varieteNom={item.varieteId ? item.varieteNom ?? item.varieteId : null}
+                plancheNom={item.plancheId}
+                couleur={item.couleur}
+                date={item.date}
+                fait={item.fait}
+                retardJours={item.retardJours}
+                onAction={() => onToggle(item.id, type, item.fait, item.especeId, undefined, item.unite)}
+              />
+            ))}
           </div>
         )}
       </CardContent>

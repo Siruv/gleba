@@ -30,6 +30,7 @@ import { Wand2, Bot } from "lucide-react"
 import { ChatPanel } from "@/components/chat/ChatPanel"
 import { CalendrierTab } from "@/components/potager/CalendrierTab"
 import { PremiersPasBanner } from "@/components/premiers-pas-banner"
+import { BandeauNouvelAccueil } from "@/components/accueil/BandeauNouvelAccueil"
 import { TourMaraichage } from "@/components/tours/tour-maraichage"
 import { CulturesTab } from "@/components/potager/CulturesTab"
 import { TerrainTab } from "@/components/potager/TerrainTab"
@@ -41,7 +42,7 @@ const TABS = [
   { id: "cultures", label: "Cultures", icon: Sprout, shortLabel: "Cultures" },
   { id: "terrain", label: "Terrain", icon: LayoutGrid, shortLabel: "Terrain" },
   { id: "planification", label: "Planification", icon: BarChart3, shortLabel: "Planif." },
-  { id: "referentiel", label: "Référentiel", icon: Leaf, shortLabel: "Ref." },
+  { id: "referentiel", label: "Référentiel", icon: Leaf, shortLabel: "Réf." },
 ] as const
 
 type TabId = (typeof TABS)[number]["id"]
@@ -167,7 +168,7 @@ function HomeContent() {
       {/* Assistant IA */}
       {showChat && (
         <div
-          className={`fixed rounded-xl border bg-background shadow-2xl flex flex-col overflow-hidden transition-[width,height,inset] duration-200 ${
+          className={`fixed flex flex-col overflow-hidden rounded-2xl border border-lin bg-craie shadow-fiche transition-[width,height,inset] duration-base motion-reduce:transition-none ${
             isChatExpanded
               ? 'z-[70] inset-2 sm:inset-5 lg:inset-y-8 lg:left-1/2 lg:right-auto lg:w-[min(1100px,calc(100vw-4rem))] lg:-translate-x-1/2'
               : 'z-50 bottom-2 left-4 right-4 h-[45vh] max-w-sm mx-auto sm:mx-0 sm:left-auto sm:bottom-4 sm:right-4 sm:h-[540px] sm:w-[400px] sm:max-w-none'
@@ -198,8 +199,8 @@ function HomeContent() {
         actions={
           <>
             <Link href="/jardin?usage=culture">
-              <Button variant="outline" size="sm" className="text-teal-700 border-teal-300 hover:bg-teal-50">
-                <MapIcon className="h-4 w-4 mr-1" />
+              <Button variant="outline" size="sm" className="border-lin bg-craie text-encre hover:bg-papier hover:text-encre">
+                <MapIcon className="mr-1 h-4 w-4 text-ardoise" />
                 <span className="hidden sm:inline">Plan</span>
               </Button>
             </Link>
@@ -207,25 +208,25 @@ function HomeContent() {
               variant="outline"
               size="sm"
               onClick={handleSemer}
-              className="text-emerald-700 border-emerald-300 hover:bg-emerald-50"
+              className="border-lin bg-craie text-encre hover:bg-papier hover:text-encre"
               title="Assistant culture"
             >
-              <Wand2 className="h-4 w-4 mr-1" />
+              <Wand2 className="mr-1 h-4 w-4 text-ardoise" />
               <span className="hidden sm:inline">Semer</span>
             </Button>
             <Button
               variant="outline"
               size="sm"
               onClick={() => setShowChat((v) => !v)}
-              className={showChat ? "text-white bg-emerald-600 hover:bg-emerald-700 border-emerald-600" : "text-emerald-700 border-emerald-300 hover:bg-emerald-50"}
+              className={showChat ? "border-sauge bg-sauge text-craie hover:border-foret hover:bg-foret hover:text-craie" : "border-lin bg-craie text-encre hover:bg-papier hover:text-encre"}
               title="Assistant IA"
             >
-              <Bot className="h-4 w-4 mr-1" />
+              <Bot className={`mr-1 h-4 w-4 ${showChat ? "text-craie" : "text-ardoise"}`} />
               <span className="hidden sm:inline">IA</span>
             </Button>
             <Link href="/parcelles">
-              <Button variant="outline" size="sm" className="text-purple-700 border-purple-300 hover:bg-purple-50">
-                <MapPin className="h-4 w-4 mr-1" />
+              <Button variant="outline" size="sm" className="border-lin bg-craie text-encre hover:bg-papier hover:text-encre">
+                <MapPin className="mr-1 h-4 w-4 text-ardoise" />
                 <span className="hidden sm:inline">Parcelles</span>
               </Button>
             </Link>
@@ -249,17 +250,20 @@ function HomeContent() {
         }
       />
 
+      {/* Accueil v2 en opt-in (L2, 2026-10-09) : invitation, masquable */}
+      {session?.user && <BandeauNouvelAccueil />}
+
       {/* Bannière nouveauté - pluviométrie */}
       {showPluieBanner && session?.user && (
-        <div className="border-b bg-emerald-50/80 backdrop-blur-sm">
+        <div className="border-b border-lin bg-sauge-doux backdrop-blur-sm">
           <div className="container mx-auto px-4 py-2 max-w-[1600px] flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2 text-sm text-emerald-700">
+            <div className="flex items-center gap-2 text-sm text-foret">
               <CloudRain className="h-4 w-4 flex-shrink-0" />
               <span>
                 <strong>Nouveau —</strong> Pluviométrie par planche disponible : cliquez sur une planche dans le{" "}
                 <button
                   onClick={() => { dismissPluieBanner(); window.location.href = "/jardin" }}
-                  className="underline underline-offset-2 hover:text-emerald-900 font-medium"
+                  className="font-medium underline underline-offset-2 hover:text-encre"
                 >
                   Plan du jardin
                 </button>{" "}
@@ -268,7 +272,7 @@ function HomeContent() {
             </div>
             <button
               onClick={dismissPluieBanner}
-              className="flex-shrink-0 text-emerald-400 hover:text-emerald-700 transition-colors"
+              className="flex-shrink-0 text-foret/60 transition-colors hover:text-foret"
               aria-label="Fermer"
             >
               <X className="h-4 w-4" />

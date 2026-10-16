@@ -55,7 +55,13 @@ import { calibrerFond, distance, formatDistance } from "@/lib/plan-fond-utils"
 import { croissanceCulture, envergureArbreADate } from "@/lib/plan-croissance"
 import { projeterGpsSurPlan, projeterPlanSurGps } from "@/lib/gps-plan-utils"
 import { partitionnerArbresPourSauvegarde } from "@/lib/plan-sauvegarde"
+import {
+  confirmerEtatSauve,
+  entitesModifiees,
+  indexerEtatSauve,
+} from "@/lib/jardin/sauvegarde-differentielle"
 import { nomsCopiesEnLot } from "@/lib/jardin/noms-copie"
+import { parcelleParDefautArbre } from "@/lib/verger/espece-arbre"
 import {
   TYPES_CONVERSION_PLANCHE,
   TYPES_OBJETS_PAR_GROUPE,
@@ -98,6 +104,7 @@ interface PlancheWithCulture {
   rotation2D: number | null
   ilot: string | null
   type: string | null
+  parcelleGeoId?: string | null
   cultures: {
     id: number
     nbRangs: number | null
@@ -236,6 +243,59 @@ interface ParcelleOption {
   arbreCount: number
 }
 
+// L'empreinte porte exactement sur les champs envoyés par handleSave. Les
+// relations et valeurs calculées chargées pour l'affichage ne doivent pas
+// transformer un geste unique en une réécriture de tout le plan.
+const empreintePlanche = (planche: PlancheWithCulture) => JSON.stringify([
+  planche.posX,
+  planche.posY,
+  planche.rotation2D,
+  planche.largeur,
+  planche.longueur,
+])
+
+const empreinteObjet = (objet: ObjetJardin) => JSON.stringify([
+  objet.nom,
+  objet.type,
+  objet.largeur,
+  objet.longueur,
+  objet.posX,
+  objet.posY,
+  objet.rotation2D,
+  objet.couleur,
+])
+
+const empreinteArbre = (arbre: Arbre) => JSON.stringify([
+  arbre.nom,
+  arbre.type,
+  arbre.espece,
+  arbre.variete,
+  arbre.portGreffe,
+  arbre.porteGreffeId,
+  arbre.formeTaille,
+  arbre.circonferenceCm,
+  arbre.fournisseur,
+  arbre.datePlantation,
+  arbre.age,
+  arbre.dateAchat,
+  arbre.prixAchat,
+  arbre.posX,
+  arbre.posY,
+  arbre.envergure,
+  arbre.envergureAdulte,
+  arbre.hauteur,
+  arbre.etat,
+  arbre.productif,
+  arbre.anneeProduction,
+  arbre.rendementMoyen,
+  arbre.pollinisateur,
+  arbre.couleur,
+  arbre.notes,
+  arbre.gpsLat,
+  arbre.gpsLng,
+  arbre.parcelleGeoId,
+])
+
 export default function JardinPage() {
   return (
     <React.Suspense fallback={<div className="flex items-center justify-center h-screen">Chargement...</div>}>
@@ -253,6 +313,9 @@ function JardinContent() {
   const [planches, setPlanches] = React.useState<PlancheWithCulture[]>([])
   const [objets, setObjets] = React.useState<ObjetJardin[]>([])
   const [arbres, setArbres] = React.useState<Arbre[]>([])
+  const planchesSauveesRef = React.useRef<Map<string | number, string>>(new Map())
+  const objetsSauvesRef = React.useRef<Map<string | number, string>>(new Map())
+  const arbresSauvesRef = React.useRef<Map<string | number, string>>(new Map())
   const [especes, setEspeces] = React.useState<Espece[]>([])
   const [isLoading, setIsLoading] = React.useState(true)
   const [scale, setScale] = React.useState(16)
@@ -353,7 +416,12 @@ function JardinContent() {
   const [showNewObjetDialog, setShowNewObjetDialog] = React.useState(false)
   const [showNewArbreDialog, setShowNewArbreDialog] = React.useState(false)
   const [showNewCultureDialog, setShowNewCultureDialog] = React.useState(false)
-  const [newPlanche, setNewPlanche] = React.useState({ nom: "", largeur: settings.defaultPlancheLargeur, longueur: settings.defaultPlancheLongueur })
+  // QA cmv29ae8p — la parcelle de la nouvelle planche est un choix explicite du
+  // formulaire (pré-rempli par le filtre du plan), plus un effet de bord du
+  // filtre : en « Toutes les parcelles » la planche naissait sans parcelle, et
+  // sa position (sous TOUTES les planches du compte) sortait de la limite du
+  // plan (posY ≤ 100 m), d'où un « Données invalides » muet.
+  const [newPlanche, setNewPlanche] = React.useState({ nom: "", largeur: settings.defaultPlancheLargeur, longueur: settings.defaultPlancheLongueur, parcelleGeoId: "" })
   const [newObjet, setNewObjet] = React.useState({ nom: "", type: "allee", largeur: 0.5, longueur: 5 })
   const [newArbre, setNewArbre] = React.useState({ nom: "", type: "fruitier", espece: "", variete: "", fournisseur: "", envergure: 2, envergureAdulte: "" })
 
@@ -377,6 +445,10 @@ function JardinContent() {
       const response = await fetch(`/api/jardin${params}`)
       if (!response.ok) throw new Error("Erreur chargement")
       let data: PlancheWithCulture[] = await response.json()
+
+      // Capturé avant l'auto-positionnement local : les anciennes planches
+      // sans coordonnées seront persistées au prochain vrai geste.
+      planchesSauveesRef.current = indexerEtatSauve(data, empreintePlanche)
 
       // Auto-positionner les planches sans position
       let needsPositioning = false
@@ -425,7 +497,9 @@ function JardinContent() {
       const response = await fetch(`/api/objets-jardin${params}`)
       if (!response.ok) return
       const data = await response.json()
-      setObjets(data || [])
+      const rows: ObjetJardin[] = data || []
+      objetsSauvesRef.current = indexerEtatSauve(rows, empreinteObjet)
+      setObjets(rows)
     } catch (error) {
       // Ignorer
     }
@@ -483,6 +557,7 @@ function JardinContent() {
         : selectedParcelleId === 'none'
           ? rows.filter((a: { parcelleGeoId?: string | null }) => !a.parcelleGeoId)
           : rows.filter((a: { parcelleGeoId?: string | null }) => a.parcelleGeoId === selectedParcelleId)
+      arbresSauvesRef.current = indexerEtatSauve(filtered, empreinteArbre)
       setArbres(filtered)
     } catch (error) {
       // Ignorer
@@ -571,6 +646,65 @@ function JardinContent() {
     }
   }
 
+  /**
+   * Arbres rattachés à aucune parcelle (friction 2026-10-05 : 52 arbres d'un
+   * compte nés orphelins, créés depuis la vue « toutes les parcelles »). Même
+   * logique que les planches : on dit ce qui manque et on rattache d'un geste,
+   * à la parcelle affichée, ou à la seule parcelle possible depuis la vue
+   * d'ensemble.
+   */
+  const [arbresSansParcelle, setArbresSansParcelle] = React.useState<number[]>([])
+  const [rattachementArbresEnCours, setRattachementArbresEnCours] = React.useState(false)
+  const fetchArbresSansParcelle = React.useCallback(async () => {
+    try {
+      const response = await fetch("/api/arbres?parcelle=none")
+      if (!response.ok) return
+      const data = await response.json()
+      setArbresSansParcelle(Array.isArray(data) ? data.map((a: { id: number }) => a.id) : [])
+    } catch {
+      // Silencieux, comme pour les planches.
+    }
+  }, [])
+  const parcelleCibleArbres = React.useMemo(() => {
+    if (selectedParcelleId && selectedParcelleId !== "none") {
+      return parcelles.find((p) => p.id === selectedParcelleId) ?? null
+    }
+    if (selectedParcelleId === "none") return null
+    const id = parcelleParDefautArbre(parcelles)
+    return id ? parcelles.find((p) => p.id === id) ?? null : null
+  }, [parcelles, selectedParcelleId])
+  const rattacherArbresSansParcelle = async () => {
+    if (!parcelleCibleArbres || arbresSansParcelle.length === 0) return
+    setRattachementArbresEnCours(true)
+    try {
+      const response = await fetch("/api/arbres/bulk-parcelle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ arbreIds: arbresSansParcelle, parcelleGeoId: parcelleCibleArbres.id }),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(data?.error || "Rattachement impossible")
+      const refuses = Array.isArray(data?.refusedIds) ? data.refusedIds.length : 0
+      toast({
+        variant: refuses > 0 ? "destructive" : undefined,
+        title: `${data?.updated ?? 0} arbre(s) rattaché(s) à ${parcelleCibleArbres.nom}`,
+        description: [
+          refuses > 0 ? `${refuses} refusé(s) : espèce déjà suivie en lot agrégé sur cette parcelle.` : null,
+          data?.avertissement ?? null,
+        ].filter(Boolean).join(" ") || undefined,
+      })
+      await Promise.all([fetchArbres(), fetchParcelles(), fetchArbresSansParcelle()])
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Erreur",
+        description: error instanceof Error ? error.message : "Erreur inconnue",
+      })
+    } finally {
+      setRattachementArbresEnCours(false)
+    }
+  }
+
   const [arbreEspecesRef, setArbreEspecesRef] = React.useState<string[]>([])
   const [arbreVarietesRef, setArbreVarietesRef] = React.useState<string[]>([])
   const [arbreFournisseursRef, setArbreFournisseursRef] = React.useState<string[]>([])
@@ -628,8 +762,8 @@ function JardinContent() {
 
   // Charger arbres et données de reference une seule fois
   React.useEffect(() => {
-    Promise.all([fetchArbres(), fetchEspeces(), fetchParcelles(), fetchPlanchesSansParcelle()])
-  }, [fetchArbres, fetchEspeces, fetchParcelles, fetchPlanchesSansParcelle])
+    Promise.all([fetchArbres(), fetchEspeces(), fetchParcelles(), fetchPlanchesSansParcelle(), fetchArbresSansParcelle()])
+  }, [fetchArbres, fetchEspeces, fetchParcelles, fetchPlanchesSansParcelle, fetchArbresSansParcelle])
 
   // Le GPS et le plan utilisent deux repères indépendants : WGS84 pour le
   // relevé terrain, mètres SVG pour l'éditeur. Une capture issue de la
@@ -1100,9 +1234,20 @@ function JardinContent() {
     // pas de bouton « Enregistrer » manuel). Cf. src/lib/plan-sauvegarde.ts.
     const { aEcrire: arbresAEcrire, differes: arbresDifferes } =
       partitionnerArbresPourSauvegarde(arbres, pendingGpsMovesRef.current.keys())
+    const planchesAEcrire = entitesModifiees(
+      planches,
+      planchesSauveesRef.current,
+      empreintePlanche
+    )
+    const objetsAEcrire = entitesModifiees(objets, objetsSauvesRef.current, empreinteObjet)
+    const arbresModifies = entitesModifiees(
+      arbresAEcrire,
+      arbresSauvesRef.current,
+      empreinteArbre
+    )
     setSaving(true)
     try {
-      const planchePromises = planches.map(p =>
+      const planchePromises = planchesAEcrire.map(p =>
         fetch(`/api/planches/${encodeURIComponent(p.id)}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
@@ -1116,7 +1261,7 @@ function JardinContent() {
         })
       )
 
-      const objetPromises = objets.map(o =>
+      const objetPromises = objetsAEcrire.map(o =>
         fetch(`/api/objets-jardin/${o.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
@@ -1133,7 +1278,7 @@ function JardinContent() {
         })
       )
 
-      const arbrePromises = arbresAEcrire.map(a =>
+      const arbrePromises = arbresModifies.map(a =>
         fetch(`/api/arbres/${a.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
@@ -1175,6 +1320,9 @@ function JardinContent() {
       const results = await Promise.all([...planchePromises, ...objetPromises, ...arbrePromises])
 
       if (results.every(r => r.ok)) {
+        confirmerEtatSauve(planchesSauveesRef.current, planchesAEcrire, empreintePlanche)
+        confirmerEtatSauve(objetsSauvesRef.current, objetsAEcrire, empreinteObjet)
+        confirmerEtatSauve(arbresSauvesRef.current, arbresModifies, empreinteArbre)
         if (versionPlanRef.current === versionAuDepart) setHasChanges(false)
         toast({
           title: "Plan sauvegardé",
@@ -1250,19 +1398,56 @@ function JardinContent() {
   }
 
   // Créer une nouvelle planche
+  // Parcelle proposée par défaut dans « Nouvelle planche » : celle du filtre
+  // (« Non assigné » → « Sans parcelle », même sentinelle « none »).
+  const parcelleFiltreCourante = selectedParcelleId ?? ""
+  const ouvrirNouvellePlanche = () => {
+    setNewPlanche(p => ({ ...p, parcelleGeoId: parcelleFiltreCourante }))
+    setShowNewPlancheDialog(true)
+  }
+
+  // Limite de position acceptée par l'API (schéma planche : posX/posY ≤ 100 m).
+  const POS_MAX = 100
+
+  // Planches de la parcelle cible, pour y trouver une position libre. L'état
+  // `planches` ne porte que le filtre courant : si la cible est une autre
+  // parcelle, on la lit à part, sinon la nouvelle planche se posait sur la
+  // première planche de la cible.
+  const planchesDeLaParcelle = async (parcelleGeoId: string | null): Promise<PlancheWithCulture[]> => {
+    const filtreCourant = selectedParcelleId === "none" ? null : selectedParcelleId
+    if (selectedParcelleId === null || filtreCourant === parcelleGeoId) {
+      return planches.filter(p => (p.parcelleGeoId ?? null) === parcelleGeoId)
+    }
+    const response = await fetch(`/api/jardin?parcelle=${parcelleGeoId ?? "none"}`)
+    if (!response.ok) return []
+    const data: PlancheWithCulture[] = await response.json()
+    return data
+  }
+
   const handleCreatePlanche = async () => {
     if (!newPlanche.nom.trim()) {
       toast({ variant: "destructive", title: "Nom requis" })
       return
     }
+    if (parcelles.length > 0 && newPlanche.parcelleGeoId === "") {
+      toast({
+        variant: "destructive",
+        title: "Parcelle à choisir",
+        description: "Indiquez la parcelle de la planche, ou « Sans parcelle ».",
+      })
+      return
+    }
+    const parcelleGeoId = newPlanche.parcelleGeoId === "none" ? null : newPlanche.parcelleGeoId || null
 
     try {
-      // Trouver une position libre
+      // Position libre : sous les planches de la MÊME parcelle (le plan se lit
+      // par parcelle), bornée à la limite du plan.
       let maxY = 0
-      planches.forEach(p => {
+      for (const p of await planchesDeLaParcelle(parcelleGeoId)) {
         const bottom = (p.posY || 0) + (p.longueur || 2)
         if (bottom > maxY) maxY = bottom
-      })
+      }
+      const posY = Math.max(0, Math.min(maxY + 0.5, POS_MAX - newPlanche.longueur))
 
       const response = await fetch("/api/planches", {
         method: "POST",
@@ -1273,19 +1458,26 @@ function JardinContent() {
           longueur: newPlanche.longueur,
           surface: newPlanche.largeur * newPlanche.longueur,
           posX: 0,
-          posY: maxY + 0.5,
-          parcelleGeoId: selectedParcelleId || undefined,
+          posY,
+          parcelleGeoId: parcelleGeoId ?? undefined,
         })
       })
 
       if (!response.ok) {
         const err = await response.json()
-        throw new Error(err.error || "Erreur création")
+        // Un 400 de validation nomme son champ : « Données invalides » seul ne
+        // disait rien de ce qu'il fallait corriger.
+        const champs = err?.details?.fieldErrors
+          ? Object.entries(err.details.fieldErrors as Record<string, string[]>)
+              .map(([champ, msgs]) => `${champ} : ${msgs.join(", ")}`)
+              .join(" ; ")
+          : ""
+        throw new Error(champs ? `${err.error || "Données invalides"} (${champs})` : err.error || "Erreur création")
       }
 
       toast({ title: "Planche créée", description: newPlanche.nom })
       setShowNewPlancheDialog(false)
-      setNewPlanche({ nom: "", largeur: settings.defaultPlancheLargeur, longueur: settings.defaultPlancheLongueur })
+      setNewPlanche({ nom: "", largeur: settings.defaultPlancheLargeur, longueur: settings.defaultPlancheLongueur, parcelleGeoId: "" })
       fetchPlanches()
     } catch (error) {
       toast({
@@ -1676,22 +1868,64 @@ function JardinContent() {
       // Avertissement d'adéquation géographique (ex. fruitier à besoin de froid
       // en zone tropicale) renvoyé par l'API — non bloquant.
       const created = await response.json().catch(() => null)
+      const precisions = [
+        created?.especeHorsCatalogue
+          ? `« ${created.espece} » n'est pas au catalogue : pas de calendrier d'entretien ni de contrôle climatique automatiques.`
+          : null,
+        created?.parcelleAttribueeAuto && created?.parcelleGeoId
+          ? `Rattaché à ${parcelles.find(p => p.id === created.parcelleGeoId)?.nom ?? "votre parcelle"}.`
+          : null,
+      ].filter(Boolean).join(" ")
       if (created?.avertissementZone) {
         toast({
           title: "Arbre créé — attention à votre climat",
-          description: `${newArbre.espece} : ${created.avertissementZone}.`,
+          description: `${created.espece ?? newArbre.espece} : ${created.avertissementZone}.${precisions ? ` ${precisions}` : ""}`,
         })
       } else {
-        toast({ title: "Arbre créé", description: newArbre.nom })
+        toast({ title: "Arbre créé", description: [newArbre.nom, precisions].filter(Boolean).join(" — ") })
       }
       setShowNewArbreDialog(false)
       setNewArbre({ nom: "", type: "fruitier", espece: "", variete: "", fournisseur: "", envergure: 2, envergureAdulte: "" })
       fetchArbres()
+      fetchArbresSansParcelle()
     } catch (error) {
       toast({
         variant: "destructive",
         title: "Erreur",
         description: error instanceof Error ? error.message : "Erreur inconnue"
+      })
+    }
+  }
+
+  // Dupliquer l'arbre sélectionné (friction 2026-10-05 : 52 arbres saisis un
+  // par un, et un visiteur de la démo qui demandait comment faire). Les
+  // positions et noms sont calculés côté serveur, la sauvegarde en attente est
+  // d'abord écrite pour que la copie parte de la position affichée.
+  const handleDuplicateArbre = async (nombre = 1) => {
+    if (!selectedArbre) return
+    try {
+      if (hasChanges) await handleSave()
+      const response = await fetch(`/api/arbres/${selectedArbre}/dupliquer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nombre }),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(data?.error || "Erreur duplication")
+      const noms: string[] = (data?.arbres ?? []).map((a: { nom: string }) => a.nom)
+      toast({
+        title: noms.length > 1 ? `${noms.length} arbres créés` : "Arbre dupliqué",
+        description: noms.join(", "),
+      })
+      await Promise.all([fetchArbres(), fetchArbresSansParcelle()])
+      const dernier = data?.arbres?.[data.arbres.length - 1]
+      if (dernier) setSelection([{ type: 'arbre', id: dernier.id }])
+    } catch (error) {
+      await fetchArbres()
+      toast({
+        variant: "destructive",
+        title: "Erreur",
+        description: error instanceof Error ? error.message : "Erreur inconnue",
       })
     }
   }
@@ -2095,7 +2329,7 @@ function JardinContent() {
 
             <div className="w-px h-6 bg-slate-300 mx-1" />
 
-            <Button variant="outline" size="sm" onClick={() => setShowNewPlancheDialog(true)}>
+            <Button variant="outline" size="sm" onClick={ouvrirNouvellePlanche}>
               <Plus className="h-4 w-4 mr-2" />
               Planche
             </Button>
@@ -2211,7 +2445,7 @@ function JardinContent() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-52">
-                <DropdownMenuItem onSelect={() => setShowNewPlancheDialog(true)}>
+                <DropdownMenuItem onSelect={ouvrirNouvellePlanche}>
                   <Plus /> Nouvelle planche
                 </DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => setShowNewObjetDialog(true)}>
@@ -2322,7 +2556,7 @@ function JardinContent() {
                   <MapIcon className="h-12 w-12 mb-4 opacity-50" />
                   <p>Aucun élément sur cette parcelle</p>
                   <div className="flex flex-wrap items-center justify-center gap-1">
-                    <Button variant="link" onClick={() => setShowNewPlancheDialog(true)}>
+                    <Button variant="link" onClick={ouvrirNouvellePlanche}>
                       Créer une planche
                     </Button>
                     <Button variant="link" onClick={() => setShowFondDialog(true)}>
@@ -2367,6 +2601,12 @@ function JardinContent() {
                 </div>
               )}
 
+              {/* Bandeaux « non rattachés » : une seule colonne absolue qui les
+                  empile. QA cmv2999p5 — le second bandeau était calé à `top-40`
+                  (10 rem) sous le premier ; à 375 px le texte du premier se
+                  replie, dépasse 10 rem et le second le recouvrait, boutons
+                  compris. Empilés en flux, chacun prend sa hauteur. */}
+              <div className="pointer-events-none absolute left-1/2 top-3 z-20 flex w-[min(30rem,calc(100%-1.5rem))] -translate-x-1/2 flex-col gap-2 [&>*]:pointer-events-auto">
               {/* Planches invisibles parce que non rattachées. Le plan filtré par
                   parcelle ne peut pas les montrer ; sans ce bandeau l'écran est
                   vide et muet — c'est ce qu'a vu un compte réel le 2026-08-17,
@@ -2377,7 +2617,7 @@ function JardinContent() {
                 && selectedParcelleId !== "none"
                 && planches.length === 0
                 && planchesSansParcelle.length > 0 && (
-                <div className="absolute left-1/2 top-3 z-20 w-[min(30rem,calc(100%-1.5rem))] -translate-x-1/2 rounded-lg border border-amber-300 bg-amber-50/95 p-3 shadow-lg backdrop-blur">
+                <div className="rounded-lg border border-amber-300 bg-amber-50/95 p-3 shadow-lg backdrop-blur">
                   <p className="text-sm font-medium text-amber-900">
                     {planchesSansParcelle.length > 1
                       ? `${planchesSansParcelle.length} planches ne sont rattachées à aucune parcelle`
@@ -2408,6 +2648,25 @@ function JardinContent() {
                   </div>
                 </div>
               )}
+
+              {!isLoading && arbresSansParcelle.length > 0 && parcelleCibleArbres && (
+                  <div className="rounded-lg border border-amber-300 bg-amber-50/95 p-3 shadow-lg backdrop-blur">
+                    <p className="text-sm font-medium text-amber-900">
+                      {arbresSansParcelle.length > 1
+                        ? `${arbresSansParcelle.length} arbres ne sont rattachés à aucune parcelle`
+                        : "1 arbre n'est rattaché à aucune parcelle"}
+                    </p>
+                    <p className="mt-1 text-xs text-amber-800">
+                      Sans parcelle, ils n&apos;apparaissent sur le plan d&apos;aucune parcelle et leurs lots de récolte sont numérotés sans parcelle.
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <Button size="sm" onClick={rattacherArbresSansParcelle} disabled={rattachementArbresEnCours}>
+                        {rattachementArbresEnCours ? "Rattachement…" : `Rattacher à ${parcelleCibleArbres.nom}`}
+                      </Button>
+                    </div>
+                  </div>
+              )}
+              </div>
 
               {/* Plan vivant : curseur temporel (masqué en plein écran) */}
               {!isPlanFullscreen && !isLoading && (planches.length > 0 || arbres.length > 0) && (
@@ -3287,11 +3546,27 @@ function JardinContent() {
                         </Link>
                       </Button>
 
-                      {/* Bouton supprimer */}
-                    <Button variant="destructive" size="sm" onClick={handleDeleteArbre} className="w-full">
-                      <Trash2 className="h-4 w-4 mr-2" />
-                      Supprimer
-                    </Button>
+                      <div className="flex gap-2">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button variant="outline" size="sm" className="flex-1">
+                              <Copy className="h-4 w-4 mr-2" />
+                              Dupliquer
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="start">
+                            {[1, 2, 3, 5, 10].map(n => (
+                              <DropdownMenuItem key={n} onClick={() => handleDuplicateArbre(n)}>
+                                {n === 1 ? "Dupliquer" : `Dupliquer ×${n}`}
+                              </DropdownMenuItem>
+                            ))}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                        <Button variant="destructive" size="sm" onClick={handleDeleteArbre} className="flex-1">
+                          <Trash2 className="h-4 w-4 mr-2" />
+                          Supprimer
+                        </Button>
+                      </div>
                   </div>
                 </CardContent>
               </Card>
@@ -3498,6 +3773,32 @@ function JardinContent() {
             <div className="text-sm text-muted-foreground">
               Surface: {(newPlanche.largeur * newPlanche.longueur).toFixed(1)} m²
             </div>
+            {parcelles.length > 0 && (
+              <div>
+                <Label htmlFor="planche-parcelle">Parcelle</Label>
+                <Select
+                  value={newPlanche.parcelleGeoId || undefined}
+                  onValueChange={(v) => setNewPlanche(p => ({ ...p, parcelleGeoId: v }))}
+                >
+                  <SelectTrigger id="planche-parcelle">
+                    <SelectValue placeholder="Choisir une parcelle…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {parcelles.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.nom}{p.usage ? ` (${p.usage})` : ""}
+                      </SelectItem>
+                    ))}
+                    <SelectItem value="none">Sans parcelle</SelectItem>
+                  </SelectContent>
+                </Select>
+                {newPlanche.parcelleGeoId === "none" && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Une planche sans parcelle n&apos;apparaît que dans « Toutes les parcelles » et « Non assigné ».
+                  </p>
+                )}
+              </div>
+            )}
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowNewPlancheDialog(false)}>Annuler</Button>

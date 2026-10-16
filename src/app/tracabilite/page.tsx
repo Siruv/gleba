@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { UserMenu } from "@/components/auth/UserMenu"
+import { libelleTypeIntervention } from "@/lib/interventions/types"
 import {
   Sprout,
   TreeDeciduous,
@@ -109,6 +110,8 @@ interface CultureEntry {
     notes: string | null
   }[]
   totalRecolte: number
+  /** « 12 kg + 360 tiges » : total ventilé par unité, à afficher tel quel. */
+  totalRecolteTexte?: string
   interventions: {
     id: number
     date: string
@@ -154,6 +157,7 @@ interface CultureData {
     totalCultures: number
     nbEspeces: number
     totalRecoltes: number
+    totalRecoltesTexte?: string
     totalInterventions: number
   }
 }
@@ -278,20 +282,6 @@ function getTypeStyle(type: string) {
   return TYPE_COLORS[type] || { bg: "bg-slate-50", border: "border-slate-300", text: "text-slate-700", dot: "bg-slate-500" }
 }
 
-const TYPE_LABELS: Record<string, string> = {
-  semis: "Semis",
-  plantation: "Plantation",
-  recolte: "Récolte",
-  fertilisation: "Fertilisation",
-  traitement_phyto: "Traitement phyto",
-  desherbage: "Désherbage",
-  binage: "Binage",
-  paillage: "Paillage",
-  arrosage: "Arrosage",
-  taille: "Taille",
-  tuteurage: "Tuteurage",
-  autre: "Autre",
-}
 
 // ============================================================
 // MAIN PAGE
@@ -573,9 +563,9 @@ function TraçabilitéContent() {
         description={
           <span>
             {phytoData?.stats.nbIncomplets ?? 0} traitement(s) ont des champs obligatoires
-            manquants (N° AMM, dose ou DAR). Un registre incomplet n'est{" "}
-            <strong>pas opposable</strong> lors d'un contrôle (HVE, AB, DDPP). Complétez les
-            fiches signalées « Non conforme » avant l'export, ou exportez quand même pour un
+            manquants (N° AMM, dose ou DAR). Un registre incomplet n&apos;est{" "}
+            <strong>pas opposable</strong> lors d&apos;un contrôle (HVE, AB, DDPP). Complétez les
+            fiches signalées « Non conforme » avant l&apos;export, ou exportez quand même pour un
             usage interne.
           </span>
         }
@@ -728,7 +718,7 @@ function PhytoTab({
                     {!entry.complet && (
                       <span
                         className="mt-0.5 flex items-center gap-0.5 text-[10px] font-bold uppercase tracking-wide text-red-600"
-                        title={`Non conforme — champs obligatoires manquants : ${entry.champsManquants.join(", ")}`}
+                        title={`Non conforme — champs obligatoires manquants ou invalides : ${entry.champsManquants.join(", ")}`}
                       >
                         <AlertCircle className="h-3 w-3" />
                         Non conforme
@@ -904,7 +894,7 @@ function CultureTab({
             <CardTitle className="text-sm text-muted-foreground">Récolte totale</CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold">{data.stats.totalRecoltes.toFixed(1)} kg</p>
+            <p className="text-2xl font-bold">{data.stats.totalRecoltesTexte ?? `${data.stats.totalRecoltes.toFixed(1)} kg`}</p>
           </CardContent>
         </Card>
         <Card>
@@ -974,9 +964,9 @@ function CultureTab({
                         <span>{culture.dates.semis ? formatDateShort(culture.dates.semis) : "-"}</span>
                         <span className="text-slate-300">&rarr;</span>
                         <span>{culture.dates.premiereRecolte ? formatDateShort(culture.dates.premiereRecolte) : "-"}</span>
-                        {culture.totalRecolte > 0 && (
+                        {(culture.totalRecolteTexte ?? (culture.totalRecolte > 0 ? `${culture.totalRecolte.toFixed(1)} kg` : '')) !== '' && culture.totalRecolteTexte !== '0 kg' && (
                           <span className="font-medium text-emerald-600">
-                            {culture.totalRecolte.toFixed(1)} kg
+                            {culture.totalRecolteTexte ?? `${culture.totalRecolte.toFixed(1)} kg`}
                           </span>
                         )}
                       </div>
@@ -1005,7 +995,7 @@ function CultureTab({
                                     <div className={`flex-1 rounded-md px-3 py-1.5 text-sm ${style.bg} border ${style.border}`}>
                                       <div className="flex items-center justify-between">
                                         <span className={`font-medium ${style.text}`}>
-                                          {TYPE_LABELS[event.type] || event.type}
+                                          {libelleTypeIntervention(event.type)}
                                         </span>
                                         <span className="text-xs text-slate-500">
                                           {formatDate(event.date)}

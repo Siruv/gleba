@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { libelleCulture } from "../label"
+import { libelleCulture, libelleEspeceVariete } from "../label"
 
 describe("libelleCulture", () => {
   it("résout les relations Prisma au lieu d'afficher [object Object]", () => {
@@ -42,5 +42,30 @@ describe("libelleCulture", () => {
     const libelle = libelleCulture({ espece: "Blette" })
     expect(libelle).toBe("Blette")
     expect(libelle).not.toContain("—")
+  })
+})
+
+describe("libelleEspeceVariete (QA cmv2ex2vq)", () => {
+  it("tait la variété de repli « Non spécifiée »", () => {
+    expect(libelleEspeceVariete("Radis", "Radis — Non spécifiée")).toBe("Radis")
+    expect(libelleEspeceVariete("Radis", null)).toBe("Radis")
+  })
+
+  it("ne répète pas l'espèce que le nom de variété contient déjà", () => {
+    expect(libelleEspeceVariete("Courge butternut", "Courge butternut-Waltham")).toBe("Courge butternut-Waltham")
+    expect(libelleEspeceVariete("Pêcher", "pecher de vigne")).toBe("pecher de vigne")
+    expect(libelleEspeceVariete("Radis", "Radis")).toBe("Radis")
+  })
+
+  it("joint espèce et variété sinon", () => {
+    expect(libelleEspeceVariete("Aubergine", "Violette longue")).toBe("Aubergine · Violette longue")
+  })
+})
+
+describe("libelleEspeceVariete — préfixe en mot entier (revue)", () => {
+  it("ne prend pas une variété qui commence par l'espèce au milieu d'un mot", () => {
+    expect(libelleEspeceVariete("Courge", "Courgette ronde")).toBe("Courge · Courgette ronde")
+    expect(libelleEspeceVariete("Ail", "Ailette")).toBe("Ail · Ailette")
+    expect(libelleEspeceVariete("Courge", "Courge musquée")).toBe("Courge musquée")
   })
 })
