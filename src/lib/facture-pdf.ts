@@ -1,0 +1,473 @@
+import PDFDocument from "pdfkit"
+
+import type { EmetteurSnapshot } from "@/lib/facture-utils"
+import { noteLibreDeFacture, type FacturePourExport } from "@/lib/facture-structuree"
+import { attacherFacturX, creerDocumentPdfA3, terminerPdf, type ProfilFacturX } from "@/lib/facturx/pdfa"
+import { LABELS_CATEGORIE_OPERATION, MENTION_OPTION_DEBITS, mentionsCodifiees, type CategorieOperation } from "@/lib/facture-regles"
+import { formatPrixUnitaire, mentionPrixUnitaireTTC } from "@/lib/comptabilite/prix-unitaire"
+import { symboleDevise } from "@/lib/format-utils"
+import { formatSiren, formatSiret } from "@/lib/siret"
+import { labelMentionAB, mentionABFacture } from "@/lib/statut-bio"
+import { getTerritoire, identifiantLegalAffichage } from "@/lib/territoires"
+
+/**
+ * Dessin PDF d'une facture / avoir / acompte (PROMPT 14C), sorti de la route
+ * `GET /api/comptabilite/factures/[id]/pdf` le 2026-10-12 pour servir aussi le
+ * Factur-X (même dessin dans un PDF/A-3, polices incorporées).
+ *
+ * Mentions légales émises (art. 242 nonies A CGI, art. L441-10 C. com.) :
+ *  - SIRET & raison sociale émetteur
+ *  - Adresse et coordonnées contact
+ *  - N° TVA intracom le cas échéant
+ *  - Régime de TVA (293 B si franchise)
+ *  - Numéro de facture, date d'émission, date d'échéance
+ *  - Total HT, ventilation TVA par taux, total TTC
+ *  - Pénalités de retard, indemnité forfaitaire 40 €, escompte
+ *  - IBAN/BIC si disponibles
+ *  - Mention AB si lignes certifiées
+ */
+export const TYPE_LABELS: Record<string, string> = {
+  facture: "FACTURE",
+  avoir: "AVOIR",
+  acompte: "ACOMPTE",
+}
+
+/**
+ * Bloc « Conditions et notes » du pied (ticket cmvflhyyu, 2026-10-19) : le
+ * texte saisi dans « Notes / Conditions » du formulaire (champ `notes`) n'était
+ * imprimé nulle part ; seul `conditionsPaiement`, qu'aucun formulaire ne
+ * remplit, l'était. Un avoir y porte son motif. Retours à la ligne conservés.
+ */
+export function blocNotesFacture(facture: Pick<FacturePourExport, "type" | "notes" | "objet">): { titre: string; texte: string } | null {
+  // Même texte que la note libre du Factur-X et de l'UBL (BT-22).
+  const texte = noteLibreDeFacture(facture)
+  if (!texte) return null
+  return { titre: facture.type === "avoir" ? "Motif de l'avoir" : "Conditions et notes", texte }
+}
+
+export function dessinerFacture(doc: PDFKit.PDFDocument, facture: FacturePourExport, emetteur: EmetteurSnapshot | null): void {
+  const typeLabel = TYPE_LABELS[facture.type] || facture.type.toUpperCase()
+  // Bas utile de la page : un texte posé plus bas ferait ouvrir une page à
+  // pdfkit (cf. le pied « Document généré le… » plus bas).
+  const basUtile = () => doc.page.height - doc.page.margins.bottom
+
+  // Outre-mer : devise, identifiant légal et libellé de taxe dépendent du
+  // territoire de l'émetteur (cf src/lib/territoires.ts). Anciennes factures
+  // sans ces champs : repli métropole (€, SIRET, TVA).
+  const devise = emetteur?.devise || "EUR"
+  const sym = symboleDevise(devise as "EUR" | "XPF")
+  const identEmetteur = emetteur ? identifiantLegalAffichage(emetteur) : null
+  const libelleTaxe = getTerritoire(emetteur?.territoire).libelleTaxe || "TVA"
+
+  // ============================================================
+  // EN-TÊTE : émetteur (gauche) + bloc facture (droite)
+  // ============================================================
+  doc.fillColor("#1e293b").font("Helvetica-Bold").fontSize(16)
+  doc.text(emetteur?.raisonSociale || "—", 50, 50, { width: 280 })
+
+  doc.font("Helvetica").fontSize(9).fillColor("#475569")
+  let y = 72
+  if (emetteur) {
+    const formeLabel = emetteur.formeJuridique === "EI" ? "EI" : emetteur.formeJuridique
+    doc.text(`${formeLabel}${emetteur.capitalSocial ? ` au capital de ${formatMontant(emetteur.capitalSocial, devise)} ${sym}` : ""}`, 50, y, { width: 280 })
+    y += 12
+    doc.text(emetteur.adresseSiege, 50, y, { width: 280 })
+    y += 12
+    doc.text(`${emetteur.codePostal} ${emetteur.ville}, ${emetteur.pays}`, 50, y, { width: 280 })
+    y += 12
+    if (identEmetteur) {
+      doc.text(`${identEmetteur.label} : ${identEmetteur.valeur}`, 50, y, { width: 280 })
+      y += 12
+    }
+    if (emetteur.numeroTvaIntracom) {
+      doc.text(`TVA intra : ${emetteur.numeroTvaIntracom}`, 50, y, { width: 280 })
+      y += 12
+    }
+    if (emetteur.emailContact) {
+      doc.text(emetteur.emailContact, 50, y, { width: 280 })
+      y += 12
+    }
+    if (emetteur.telContact) {
+      doc.text(emetteur.telContact, 50, y, { width: 280 })
+      y += 12
+    }
+  } else {
+    doc.fillColor("#dc2626").text("⚠ Identité légale non configurée — /parametres/exploitation", 50, y, { width: 280 })
+    y += 24
+  }
+
+  // Bloc facture (droite)
+  doc
+    .fontSize(24)
+    .fillColor("#0d9488")
+    .font("Helvetica-Bold")
+    .text(typeLabel, 350, 50, { width: 200, align: "right" })
+  doc.fontSize(10).fillColor("#1e293b").font("Helvetica-Bold")
+  doc.text(`N° ${facture.numero}`, 350, 82, { width: 200, align: "right" })
+  doc.font("Helvetica").fillColor("#475569").fontSize(9)
+  doc.text(`Émise le ${formatDate(facture.date)}`, 350, 100, { width: 200, align: "right" })
+  if (facture.dateEcheance) {
+    doc.text(`Échéance ${formatDate(facture.dateEcheance)}`, 350, 113, { width: 200, align: "right" })
+  }
+
+  // Trait de séparation
+  const headerEndY = Math.max(y, 145)
+  doc
+    .moveTo(50, headerEndY + 8)
+    .lineTo(545, headerEndY + 8)
+    .strokeColor("#e2e8f0")
+    .lineWidth(1)
+    .stroke()
+
+  // ============================================================
+  // DESTINATAIRE
+  // ============================================================
+  y = headerEndY + 22
+  doc.font("Helvetica-Bold").fontSize(10).fillColor("#64748b").text("FACTURÉ À", 50, y)
+  y += 14
+  doc.font("Helvetica-Bold").fontSize(11).fillColor("#1e293b")
+  doc.text(facture.clientNom || "—", 50, y, { width: 250 })
+  y += 14
+  doc.font("Helvetica").fontSize(9).fillColor("#475569")
+  if (facture.clientAdresse) {
+    doc.text(facture.clientAdresse, 50, y, { width: 250 })
+    y += 12
+  }
+  if (facture.client?.email) {
+    doc.text(facture.client.email, 50, y, { width: 250 })
+    y += 12
+  }
+  // Identité de l'acheteur figée sur la facture (lot 1), sinon la fiche client.
+  const clientSiret = facture.clientSiret || facture.client?.siret
+  const clientSiren = facture.clientSiren || facture.client?.siren
+  const clientTva = facture.clientTvaIntra || facture.client?.tvaIntra
+  if (clientSiret) {
+    doc.text(`SIRET : ${formatSiret(clientSiret)}`, 50, y, { width: 250 })
+    y += 12
+  } else if (clientSiren) {
+    doc.text(`SIREN : ${formatSiren(clientSiren)}`, 50, y, { width: 250 })
+    y += 12
+  }
+  if (clientTva) {
+    doc.text(`TVA intra : ${clientTva}`, 50, y, { width: 250 })
+    y += 12
+  }
+  // Adresse de livraison si différente de celle du client (mention obligatoire, BG-15).
+  if (facture.adresseLivraison) {
+    y += 4
+    doc.font("Helvetica-Bold").fontSize(9).fillColor("#64748b").text("LIVRÉ À", 50, y)
+    y += 12
+    doc.font("Helvetica").fontSize(9).fillColor("#475569")
+    doc.text(facture.adresseLivraison, 50, y, { width: 250 })
+    y += 12
+    const localite = [facture.codePostalLivraison, facture.villeLivraison, facture.paysLivraison].filter(Boolean).join(" ")
+    if (localite) {
+      doc.text(localite, 50, y, { width: 250 })
+      y += 12
+    }
+  }
+
+  if (facture.objet) {
+    doc.font("Helvetica-Bold").fontSize(10).fillColor("#64748b").text("OBJET", 320, headerEndY + 22)
+    doc.font("Helvetica").fontSize(10).fillColor("#1e293b").text(facture.objet, 320, headerEndY + 36, { width: 225 })
+  }
+
+  // ============================================================
+  // TABLEAU LIGNES
+  // ============================================================
+  const tableTop = Math.max(y + 12, 270)
+  // Colonnes : Désignation (50) | Qté (290) | PU HT (340) | TVA% (400) | HT (445) | TTC (505)
+  const cols = {
+    desc: 50,
+    qte: 290,
+    pu: 340,
+    tva: 400,
+    ht: 445,
+    ttc: 505,
+  }
+
+  doc.rect(50, tableTop, 495, 22).fillColor("#0d9488").fill()
+  doc.fillColor("#ffffff").fontSize(9).font("Helvetica-Bold")
+  doc.text("Désignation", cols.desc + 6, tableTop + 7)
+  doc.text("Qté", cols.qte, tableTop + 7, { width: 45, align: "right" })
+  doc.text("PU HT", cols.pu, tableTop + 7, { width: 55, align: "right" })
+  doc.text("TVA", cols.tva, tableTop + 7, { width: 40, align: "right" })
+  doc.text("Total HT", cols.ht, tableTop + 7, { width: 55, align: "right" })
+  doc.text("Total TTC", cols.ttc, tableTop + 7, { width: 45, align: "right" })
+
+  let ly = tableTop + 26
+  doc.font("Helvetica").fontSize(9)
+
+  for (const ligne of facture.lignes) {
+    const desc = ligne.description + (ligne.statutBio ? `\n  ${ligne.statutBio}` : "")
+    const descHeight = doc.heightOfString(desc, { width: 230 })
+    // Ticket cmvnuxvax — vente saisie TTC : le PU HT exact (1,20 / 1,055)
+    // est suivi du PU TTC saisi, sur une seconde ligne de la colonne.
+    const mentionTtc = mentionPrixUnitaireTTC(ligne, devise)
+    const rowH = Math.max(mentionTtc ? 22 : 18, descHeight + 4)
+
+    if (ly + rowH > 720) {
+      doc.addPage()
+      ly = 50
+    }
+
+    doc.fillColor("#1e293b").text(desc, cols.desc + 6, ly, { width: 230 })
+    doc.fillColor("#475569")
+    doc.text(
+      `${formatNumber(ligne.quantite)} ${ligne.unite || ""}`.trim(),
+      cols.qte,
+      ly,
+      { width: 45, align: "right" }
+    )
+    // Ticket cmvnuxvax — PU HT jusqu'à 4 décimales (« 1,1374 » et non
+    // « 1,14 ») : toujours un arrondi, la référence exacte d'une vente saisie
+    // TTC est la mention TTC (quantité × PU TTC = total TTC). Les totaux
+    // restent ceux stockés, calculés sur la valeur exacte.
+    doc.text(formatPrixUnitaire(ligne.prixUnitaire, devise), cols.pu, ly, { width: 55, align: "right" })
+    doc.text(`${ligne.tauxTVA}%`, cols.tva, ly, { width: 40, align: "right" })
+    doc.fillColor("#1e293b")
+    doc.text(formatMontant(ligne.montantHT, devise), cols.ht, ly, { width: 55, align: "right" })
+    doc.text(formatMontant(ligne.montantTTC, devise), cols.ttc, ly, { width: 45, align: "right" })
+    if (mentionTtc) {
+      doc.fillColor("#64748b").fontSize(7)
+      doc.text(mentionTtc, cols.pu - 15, ly + 11, { width: 70, align: "right" })
+      doc.fontSize(9)
+    }
+
+    ly += rowH + 4
+    doc.moveTo(50, ly - 2).lineTo(545, ly - 2).strokeColor("#f1f5f9").lineWidth(0.5).stroke()
+  }
+
+  // ============================================================
+  // VENTILATION TVA PAR TAUX
+  // ============================================================
+  if (ly > 600) {
+    doc.addPage()
+    ly = 50
+  }
+  ly += 12
+  const totaux = (facture.totauxParTauxTva || {}) as Record<string, { ht: number; tva: number; ttc: number }>
+
+  // Bloc gauche : récap TVA par taux
+  if (Object.keys(totaux).length > 0) {
+    doc.font("Helvetica-Bold").fontSize(9).fillColor("#475569").text(`Récapitulatif ${libelleTaxe}`, 50, ly)
+    doc.font("Helvetica").fontSize(9).fillColor("#475569")
+    doc.text("Taux", 50, ly + 14, { width: 50, align: "left" })
+    doc.text("Base HT", 100, ly + 14, { width: 70, align: "right" })
+    doc.text(libelleTaxe, 170, ly + 14, { width: 70, align: "right" })
+    let yt = ly + 26
+    const sortedTaux = Object.keys(totaux).sort((a, b) => Number(a) - Number(b))
+    for (const k of sortedTaux) {
+      const t = totaux[k]
+      doc.text(`${k} %`, 50, yt, { width: 50, align: "left" })
+      doc.text(formatMontant(t.ht, devise), 100, yt, { width: 70, align: "right" })
+      doc.text(formatMontant(t.tva, devise), 170, yt, { width: 70, align: "right" })
+      yt += 12
+    }
+  }
+
+  // Bloc droite : totaux
+  doc.font("Helvetica").fontSize(10).fillColor("#475569")
+  doc.text("Total HT", 350, ly, { width: 100, align: "right" })
+  doc.fillColor("#1e293b").text(`${formatMontant(facture.totalHT, devise)} ${sym}`, 460, ly, { width: 85, align: "right" })
+
+  ly += 16
+  doc.fillColor("#475569").text(libelleTaxe, 350, ly, { width: 100, align: "right" })
+  doc.fillColor("#1e293b").text(`${formatMontant(facture.totalTVA, devise)} ${sym}`, 460, ly, { width: 85, align: "right" })
+
+  ly += 18
+  doc.rect(350, ly - 4, 195, 26).fillColor("#0d9488").fill()
+  doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(11)
+  doc.text("Net à payer TTC", 350, ly + 4, { width: 100, align: "right" })
+  doc.text(`${formatMontant(facture.totalTTC, devise)} ${sym}`, 460, ly + 4, { width: 85, align: "right" })
+
+  ly += 38
+  doc.font("Helvetica").fontSize(9).fillColor("#475569")
+
+  // Catégorie de l'opération et livraison (décret 2022-1299), échéance, conditions
+  doc.text(`Catégorie de l'opération : ${LABELS_CATEGORIE_OPERATION[facture.categorieOperation as CategorieOperation] || LABELS_CATEGORIE_OPERATION.biens}`, 50, ly, { width: 495 })
+  ly += 12
+  if (facture.dateLivraison) {
+    doc.text(`Livraison ou fin d'exécution le ${formatDate(facture.dateLivraison)}`, 50, ly, { width: 495 })
+    ly += 12
+  }
+  if (facture.dateEcheance) {
+    doc.text(`Date d'échéance : ${formatDate(facture.dateEcheance)}`, 50, ly, { width: 495 })
+    ly += 12
+  }
+  if (facture.conditionsPaiement) {
+    doc.text(`Conditions de paiement : ${facture.conditionsPaiement}`, 50, ly, { width: 495 })
+    ly += 12
+  }
+
+  // Un bloc qui ne tient plus sur la page part en tête de la suivante : posé
+  // sous la marge basse, pdfkit ouvrirait une page à chaque appel suivant.
+  const reserver = (hauteur: number) => {
+    if (ly + hauteur > basUtile()) {
+      doc.addPage()
+      ly = 50
+    }
+  }
+
+  // Conditions et notes saisies (ticket cmvflhyyu), hauteur mesurée.
+  const notes = blocNotesFacture(facture)
+  if (notes) {
+    doc.font("Helvetica").fontSize(9)
+    ly += 4
+    reserver(12 + doc.heightOfString(notes.texte, { width: 495 }))
+    doc.font("Helvetica-Bold").fontSize(9).fillColor("#475569").text(notes.titre, 50, ly, { width: 495 })
+    ly += 12
+    doc.font("Helvetica").fontSize(9).fillColor("#1e293b").text(notes.texte, 50, ly, { width: 495 })
+    ly += doc.heightOfString(notes.texte, { width: 495 }) + 6
+    doc.fillColor("#475569")
+  }
+
+  // Statut payée / annulée
+  if (facture.statut === "payee") {
+    reserver(16)
+    doc.fontSize(10).fillColor("#059669").font("Helvetica-Bold")
+    doc.text(
+      `✓ Payée le ${facture.datePaiement ? formatDate(facture.datePaiement) : ""}${
+        facture.modePaiement ? ` — ${labelModePaiement(facture.modePaiement)}` : ""
+      }`,
+      50,
+      ly,
+      { width: 495 }
+    )
+    ly += 16
+  } else if (facture.statut === "annulee") {
+    reserver(16)
+    doc.fontSize(11).fillColor("#dc2626").font("Helvetica-Bold").text("✗ FACTURE ANNULÉE", 50, ly)
+    ly += 16
+  }
+
+  // ============================================================
+  // MENTION AB (PROMPT 12)
+  // ============================================================
+  const mention = mentionABFacture(facture.lignes.map((l) => l.statutBio))
+  const mentionLabel = labelMentionAB(mention)
+  if (mentionLabel) {
+    reserver(30)
+    const isBio = mention.mode === "ab"
+    const couleur = isBio ? "#16a34a" : mention.mode === "conversion" ? "#65a30d" : "#475569"
+    doc.fontSize(9).fillColor(couleur).font(isBio ? "Helvetica-Bold" : "Helvetica")
+    doc.text(mentionLabel, 50, ly, { width: 495 })
+    if (isBio && emetteur?.certifBioOrganisme) {
+      ly += 12
+      doc.font("Helvetica").fontSize(9).fillColor("#475569")
+      doc.text(`Certifié par ${emetteur.certifBioOrganisme}`, 50, ly, { width: 495 })
+    }
+    ly += 18
+  }
+
+  // ============================================================
+  // MENTIONS LÉGALES OBLIGATOIRES — pied de page
+  // ============================================================
+  const mentions = facture.mentionsSpecifiques || []
+  const lignesMentions: string[] = []
+  if (mentions.includes("293b")) lignesMentions.push("• TVA non applicable, art. 293 B du CGI.")
+  if (mentions.includes("rfa")) lignesMentions.push("• TVA non applicable : exploitant agricole placé sous le régime du remboursement forfaitaire (art. 298 quater du CGI).")
+  if (mentions.includes("exoneration")) lignesMentions.push("• TVA non applicable.")
+  if (emetteur?.optionTvaDebits) lignesMentions.push(`• ${MENTION_OPTION_DEBITS}`)
+  // Mentions codifiées (AAB escompte, PMD pénalités, PMT indemnité) : mêmes
+  // textes que dans le XML Factur-X / UBL (src/lib/facture-regles.ts).
+  const codifiees = mentionsCodifiees(emetteur, devise)
+  const cles: Record<string, string> = { AAB: "escompte", PMD: "penalites", PMT: "indemnite-40" }
+  for (const m of codifiees) {
+    if (mentions.includes(cles[m.code])) lignesMentions.push(`• ${m.texte}`)
+  }
+  if (facture.mentionsLegales) lignesMentions.push(facture.mentionsLegales)
+  const ibanLine = emetteur?.rib
+    ? [emetteur.banqueNom, `IBAN ${emetteur.rib}`, emetteur.bic ? `BIC ${emetteur.bic}` : null].filter(Boolean).join(" — ")
+    : null
+
+  // Hauteur du pied mesurée avant de le poser : une ligne qui passe à la ligne
+  // ne chevauche plus la suivante, et un pied repoussé par un long bloc de
+  // notes part sur une nouvelle page au lieu d'être coupé par pdfkit.
+  doc.font("Helvetica").fontSize(8)
+  const hauteurLigne = (t: string) => Math.max(10, doc.heightOfString(t, { width: 495 }))
+  const hauteurPied =
+    12 + lignesMentions.reduce((h, t) => h + hauteurLigne(t), 0) + (ibanLine ? 4 + 10 + hauteurLigne(ibanLine) + 2 : 0)
+  // Un pied haut remonte au-dessus de 660 tant qu'il reste de la place sous le
+  // contenu, plutôt que de partir seul sur une nouvelle page.
+  let footerY = Math.max(ly, Math.min(660, basUtile() - hauteurPied))
+  if (footerY + hauteurPied > basUtile()) {
+    doc.addPage()
+    footerY = 50
+  }
+
+  doc.font("Helvetica-Bold").fontSize(8).fillColor("#64748b").text("Mentions légales", 50, footerY, { width: 495 })
+  let fy = footerY + 12
+  doc.font("Helvetica").fontSize(8).fillColor("#64748b")
+  for (const ligne of lignesMentions) {
+    doc.text(ligne, 50, fy, { width: 495 })
+    fy += hauteurLigne(ligne)
+  }
+
+  // Coordonnées bancaires
+  if (ibanLine) {
+    fy += 4
+    doc.font("Helvetica-Bold").fontSize(8).fillColor("#475569").text("Règlement par virement", 50, fy, { width: 495 })
+    fy += 10
+    doc.font("Helvetica").fontSize(8).fillColor("#475569")
+    doc.text(ibanLine, 50, fy, { width: 495 })
+    fy += hauteurLigne(ibanLine) + 2
+  }
+
+  // Footer minimal. À 810 pt il est sous la marge basse (792 pt) : pdfkit
+  // ouvrait une seconde page, vide, pour y poser cette seule ligne (toutes les
+  // factures PDF avaient deux pages, constaté le 2026-10-12). La marge basse est
+  // levée le temps d'écrire le pied, puis rétablie.
+  const margeBasse = doc.page.margins.bottom
+  doc.page.margins.bottom = 0
+  doc
+    .fontSize(7)
+    .fillColor("#cbd5e1")
+    .text(
+      `Document généré le ${new Date().toLocaleDateString("fr-FR")} via Gleba — gleba.fr`,
+      50,
+      810,
+      { width: 495, align: "center", lineBreak: false }
+    )
+  doc.page.margins.bottom = margeBasse
+}
+
+export interface OptionsPdfFacture {
+  /** XML CII à incorporer : le PDF devient un PDF/A-3 Factur-X. */
+  facturX?: { xml: string; profil: ProfilFacturX } | null
+}
+
+export function genererPdfFacture(facture: FacturePourExport, emetteur: EmetteurSnapshot | null, options: OptionsPdfFacture = {}): Promise<Buffer> {
+  const titre = `${TYPE_LABELS[facture.type] || facture.type.toUpperCase()} ${facture.numero}`
+  const doc = options.facturX
+    ? creerDocumentPdfA3({ titre, auteur: emetteur?.raisonSociale, sujet: `${titre} — ${facture.clientNom}` })
+    : new PDFDocument({ size: "A4", margin: 50 })
+  return terminerPdf(doc, () => {
+    dessinerFacture(doc, facture, emetteur)
+    if (options.facturX) attacherFacturX(doc, options.facturX.xml, options.facturX.profil)
+  })
+}
+
+function formatDate(d: Date | string): string {
+  return new Date(d).toLocaleDateString("fr-FR", { day: "2-digit", month: "2-digit", year: "numeric" })
+}
+
+function formatMontant(n: number, devise: string = "EUR"): string {
+  const decimals = devise === "XPF" ? 0 : 2
+  return n.toLocaleString("fr-FR", { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
+}
+
+function formatNumber(n: number): string {
+  return n.toLocaleString("fr-FR", { maximumFractionDigits: 3 })
+}
+
+function labelModePaiement(m: string): string {
+  const labels: Record<string, string> = {
+    especes: "Espèces",
+    cheque: "Chèque",
+    cb: "Carte bancaire",
+    virement: "Virement",
+    prelevement: "Prélèvement",
+  }
+  return labels[m] || m
+}

@@ -25,8 +25,8 @@ export async function GET(request: NextRequest) {
     }
     const annee = parsedYear.data
     const userId = session.user.id
-    const startOfYear = new Date(Date.UTC(annee, 0, 1))
-    const endOfYear = new Date(Date.UTC(annee + 1, 0, 1))
+    const startOfYear = new Date(annee, 0, 1)
+    const endOfYear = new Date(annee + 1, 0, 1)
 
     // Animaux morts cette annee
     const mortalites = await prisma.animal.findMany({
@@ -71,7 +71,9 @@ export async function GET(request: NextRequest) {
       parEspece[id].count++
     })
 
-    // Taux de mortalite global
+    // Taux de mortalite des fiches, même règle que le tableau de bord
+    // (/api/elevage/stats) : les pertes d'un lot ne sont enregistrées nulle
+    // part comme des morts datées, ses têtes n'entrent donc pas au dénominateur.
     const totalActifs = await prisma.animal.count({
       where: { userId, statut: 'actif' },
     })
@@ -96,7 +98,7 @@ export async function GET(request: NextRequest) {
   } catch (error) {
     console.error('GET /api/elevage/mortalites error:', error)
     return NextResponse.json(
-      { error: 'Erreur lors de la recuperation des mortalites', details: "Erreur interne du serveur" },
+      { error: 'Erreur lors de la récupération des mortalités', details: "Erreur interne du serveur" },
       { status: 500 }
     )
   }

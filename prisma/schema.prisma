@@ -108,6 +108,16 @@ model User {
   accounts Account[]
   pushSubscriptions PushSubscription[]
 
+  dossiersReglement DossierReglement[]
+  ciblesReglement CibleReglement[]
+  reglements Reglement[]
+  comptesBancaires CompteBancaire[]
+  operationsBancaires OperationBancaire[]
+  tentativesImportReleve TentativeImportReleve[]
+  virementsBancaires VirementBancaire[]
+  connexionsStripe ConnexionStripe[]
+  etatsConnexionStripe EtatConnexionStripe[]
+
   // Relations avec données utilisateur
   planches              Planche[]
   cultures              Culture[]
@@ -124,6 +134,7 @@ model User {
 
   // Relations module arbres
   recoltesArbres   RecolteArbre[]
+  sequencesLotVerger SequenceLotVerger[]
   productionsBois  ProductionBois[]
   operationsArbres OperationArbre[]
 
@@ -165,6 +176,8 @@ model User {
   depensesManuelles DepenseManuelle[]
   clients           Client[]
   facturesEmises    Facture[]
+  documentsCommerciaux DocumentCommercial[]
+  envoisCommerciaux EnvoiCommercial[]
 
   // Relations stocks per-user (multi-tenancy)
   userStockVarietes     UserStockVariete[]
@@ -196,6 +209,8 @@ model User {
 
   // Relations module météo
   stationsMeteo StationMeteo[]
+  connecteursCapteurs ConnecteurCapteurs[]
+  capteurs            Capteur[]
 
   // Logs de connexion
   loginLogs LoginLog[]
@@ -248,9 +263,18 @@ model User {
   mediasReferentiel        MediaReferentiel[] @relation("MediaReferentielContributeur")
   mediasReferentielValides MediaReferentiel[] @relation("MediaReferentielValidateur")
 
+  // Encyclopédie : contributions personnelles et révisions documentaires.
+  contributionsEncyclopedie       ContributionEncyclopedie[] @relation("ContributionEncyclopedieAuteur")
+  revisionsEncyclopedie           RevisionEncyclopedie[]     @relation("RevisionEncyclopedieAuteur")
+  revisionsEncyclopedieValidees   RevisionEncyclopedie[]     @relation("RevisionEncyclopedieValidateur")
+  discussionsEncyclopedie         DiscussionEncyclopedie[]   @relation("DiscussionEncyclopedieAuteur")
+  reponsesEncyclopedie            ReponseEncyclopedie[]      @relation("ReponseEncyclopedieAuteur")
+
   // Community Voice — demandes d'évolution & votes
   evolutions                       Evolution[]                         @relation("EvolutionAuthor")
   evolutionVotes                   EvolutionVote[]                     @relation("EvolutionVoter")
+  // Salon de discussion de la page Communauté
+  messagesSalon                    MessageSalon[]                      @relation("MessageSalonAuteur")
   declarationsReglementaires       DeclarationReglementaireSuivi[]
   preparationsDocumentsCirculation PreparationDocumentCirculation[]
   evenementsReglementaires         DeclarationReglementaireEvenement[]
@@ -268,6 +292,9 @@ model User {
   adhesionExploitation MembreExploitation? @relation("AdhesionDeMonCompte")
 
   @@map("users")
+  mouvementsStockCommerciaux MouvementStockCommercial[]
+  lotsTransformes       LotTransforme[]
+
 }
 
 /// Adhésion d'un compte à l'exploitation d'un AUTRE compte (chantier P1
@@ -735,6 +762,9 @@ model Espece {
   portesGreffe        PorteGreffeEspece[]
   bioagresseurs       BioagresseurEspece[]
   medias              MediaReferentiel[]
+  contributionsEncyclopedie ContributionEncyclopedie[]
+  revisionsEncyclopedie     RevisionEncyclopedie[]
+  discussionsEncyclopedie   DiscussionEncyclopedie[]
 
   @@index([userId])
   @@map("especes")
@@ -998,6 +1028,9 @@ model Avis {
   @@index([refType, refId])
   @@index([userId])
   @@map("avis")
+  photos PhotoAvis[] @relation("PhotosAvisDirectes")
+  temoignages TemoignageRecolte[]
+
 }
 
 /// Signalement d'une entrée communautaire (décision produit #3 : publication
@@ -1179,6 +1212,8 @@ model Planche {
   fertilisations Fertilisation[]
   analyses       AnalyseSol[]
 
+
+  capteurs Capteur[]
   @@unique([nom, userId])
   @@index([userId])
   @@index([userId, ilot])
@@ -1272,6 +1307,8 @@ model ParcelleGeo {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
+
+  capteurs Capteur[]
   @@index([userId])
   @@map("parcelles_geo")
 }
@@ -1437,6 +1474,11 @@ model Recolte {
   @@index([statut])
   @@index([statutBioSnapshot])
   @@map("recoltes")
+  temoignagesAvis TemoignageRecolte[]
+
+  stockDisponibleCommercial Float? @map("stock_disponible_commercial")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
 }
 
 /// Irrigations planifiées
@@ -1475,7 +1517,7 @@ model Consommation {
   destinationId String?      @map("destination")
   destination   Destination? @relation(fields: [destinationId], references: [id], onDelete: SetNull)
   date          DateTime     @default(now()) @map("date")
-  quantite      Float        @map("quantite") // kg
+  quantite      Float        @map("quantite") // dans l'unité du stock de l'espèce (kg, tiges, pièces, bottes) : src/lib/stocks/sortie-stock.ts
   prix          Float?       @map("prix") // € total
   notes         String?      @map("notes")
   createdAt     DateTime     @default(now()) @map("created_at")
@@ -1552,6 +1594,8 @@ model ObjetJardin {
   notes         String?      @map("notes")
   createdAt     DateTime     @default(now()) @map("created_at")
 
+
+  capteurs Capteur[]
   @@index([userId])
   @@map("objets_jardin")
 }
@@ -1630,6 +1674,8 @@ model Arbre {
   pollinisateurDe      PollinisationArbre[] @relation("ArbrePollinisateur")
   observationsSante    ObservationSante[]
 
+
+  capteurs Capteur[]
   @@index([userId])
   @@index([type])
   @@index([especeId])
@@ -1705,6 +1751,9 @@ model RecolteArbre {
   @@index([parcelleId])
   @@index([numLot])
   @@map("recoltes_arbres")
+  stockDisponibleCommercial Float? @map("stock_disponible_commercial")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
 }
 
 /// Production de bois (élagage, abattage, branchage)
@@ -1749,6 +1798,9 @@ model ProductionBois {
   @@index([parcelleId])
   @@index([numLot])
   @@map("production_bois")
+  stockDisponibleCommercial Float? @map("stock_disponible_commercial")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
 }
 
 /// Opérations sur arbres (taille, greffe, traitement, fertilisation)
@@ -2298,6 +2350,8 @@ model Animal {
   ficheNaissance              PetitNaissance?                  @relation("PetitFiche")
   statutsSanitairesStructures StatutSanitaireElevage[]
 
+
+  capteurs Capteur[]
   @@index([userId])
   @@index([especeAnimaleId])
   @@index([statut])
@@ -2347,6 +2401,8 @@ model LotAnimaux {
   naissances                  NaissanceAnimale[]       @relation("LotNaissances")
   statutsSanitairesStructures StatutSanitaireElevage[]
 
+
+  capteurs Capteur[]
   @@index([userId])
   @@index([especeAnimaleId])
   @@index([statut])
@@ -2376,6 +2432,8 @@ model ProductionOeuf {
   @@index([animalId])
   @@index([date])
   @@map("production_oeufs")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
 }
 
 /// Sortie typée d'un lot de ponte. Une production quotidienne constitue le
@@ -2395,6 +2453,8 @@ model MouvementStockOeuf {
   @@index([userId, date])
   @@index([productionId])
   @@map("mouvements_stock_oeufs")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
 }
 
 /// Récoltes des produits de la ruche.
@@ -2424,6 +2484,8 @@ model ProductionRuche {
   @@index([lotId])
   @@index([animalId])
   @@map("productions_ruche")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
 }
 
 /// Sortie physique d'une récolte de la ruche. Les ventes sont liées à leur
@@ -2448,6 +2510,8 @@ model MouvementStockRuche {
   @@index([venteProduitId])
   @@index([userId, operationId])
   @@map("mouvements_stock_ruche")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
 }
 
 /// Ventes de produits (œufs, viande, animaux vivants)
@@ -3223,6 +3287,8 @@ model LotFromage {
   @@unique([userId, numeroLot])
   @@index([userId, dateFabrication])
   @@map("lots_fromage")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
 }
 
 // ============================================================
@@ -3340,6 +3406,8 @@ model MouvementFromage {
   @@index([lotFromageId])
   @@index([venteProduitId])
   @@map("mouvements_fromage")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
 }
 
 // ============================================================
@@ -3445,6 +3513,7 @@ model Client {
   // Relations
   ventesManuelles VenteManuelle[]
   factures        Facture[]
+  documentsCommerciaux DocumentCommercial[]
 
   @@index([userId])
   @@index([nom])
@@ -3462,9 +3531,25 @@ model Facture {
   client              Client?   @relation(fields: [clientId], references: [id], onDelete: SetNull)
   clientNom           String    @map("client_nom") // Copie pour archivage
   clientAdresse       String?   @map("client_adresse")
+  // Facturation électronique, lot 1 (2026-10-13) : identité du client figée à
+  // l'émission (SIREN de l'acheteur obligatoire en B2B, BT-47). La fiche
+  // `client` reste modifiable, la facture émise non.
+  clientSiret         String?   @map("client_siret")
+  clientSiren         String?   @map("client_siren")
+  clientTvaIntra      String?   @map("client_tva_intra")
   date                DateTime  @default(now()) @map("date")
   dateEcheance        DateTime? @map("date_echeance")
   objet               String?   @map("objet")
+  // Catégorie de l'opération (art. 242 nonies A ann. II CGI, décret 2022-1299),
+  // premier caractère du cadre de facturation BT-23 : "biens", "services", "mixte".
+  categorieOperation  String    @default("biens") @map("categorie_operation")
+  // Livraison : date (BT-72, si différente de la date de facture) et adresse
+  // (BG-15, si différente de l'adresse du client).
+  dateLivraison       DateTime? @map("date_livraison")
+  adresseLivraison    String?   @map("adresse_livraison")
+  codePostalLivraison String?   @map("code_postal_livraison")
+  villeLivraison      String?   @map("ville_livraison")
+  paysLivraison       String?   @map("pays_livraison")
   // Montants
   totalHT             Float     @map("total_ht")
   totalTVA            Float     @default(0) @map("total_tva")
@@ -3494,6 +3579,8 @@ model Facture {
   recoltesArbres    RecolteArbre[]     @relation("RecolteArbreFacture")
   productionsBois   ProductionBois[]   @relation("ProductionBoisFacture")
   commandesBoutique CommandeBoutique[] @relation("CommandeFacture")
+  documentsCommerciaux DocumentCommercial[]
+  envoisCommerciaux EnvoiCommercial[]
 
   @@unique([userId, numero])
   @@index([userId])
@@ -3501,6 +3588,10 @@ model Facture {
   @@index([date])
   @@index([statut])
   @@map("factures")
+  cleCreationStock String? @map("cle_creation_stock")
+  mouvementsStock MouvementStockCommercial[]
+  @@unique([userId, cleCreationStock])
+
 }
 
 /// Lignes de facture
@@ -3523,6 +3614,105 @@ model LigneFacture {
   @@index([factureId])
   @@index([statutBio])
   @@map("lignes_factures")
+  articleStockType String? @map("article_stock_type")
+  articleStockId String? @map("article_stock_id")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
+}
+
+/// Devis et BL restent hors des écritures comptables jusqu'à la facturation.
+model DocumentCommercial {
+  id                 String   @id @default(cuid())
+  userId             String   @map("user_id")
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type               String // devis | livraison
+  numero             String
+  cleCreation        String   @map("cle_creation")
+  statut             String   @default("brouillon")
+  date               DateTime @default(now())
+  dateValidite       DateTime? @map("date_validite")
+  dateLivraison      DateTime? @map("date_livraison")
+  dateAcceptation    DateTime? @map("date_acceptation")
+  clientId           Int?     @map("client_id")
+  client             Client?  @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  clientNom          String   @map("client_nom")
+  clientAdresse      String?  @map("client_adresse")
+  clientEmail        String?  @map("client_email")
+  clientSiret        String?  @map("client_siret")
+  clientSiren        String?  @map("client_siren")
+  clientTvaIntra     String?  @map("client_tva_intra")
+  clientExonere      Boolean  @default(false) @map("client_exonere")
+  objet              String
+  notes              String?
+  categorieOperation String   @default("biens") @map("categorie_operation")
+  adresseLivraison   String?  @map("adresse_livraison")
+  emetteurSnapshot   Json     @map("emetteur_snapshot")
+  totalHT            Float    @map("total_ht")
+  totalTVA           Float    @map("total_tva")
+  totalTTC           Float    @map("total_ttc")
+  // Une conversion complète au plus ; plusieurs BL peuvent porter la même facture.
+  devisOrigineId     String?  @unique @map("devis_origine_id")
+  devisOrigine       DocumentCommercial? @relation("DevisLivraison", fields: [devisOrigineId], references: [id], onDelete: Restrict)
+  bonLivraison       DocumentCommercial? @relation("DevisLivraison")
+  factureId          Int?     @map("facture_id")
+  facture            Facture? @relation(fields: [factureId], references: [id], onDelete: Restrict)
+  lignes             LigneDocumentCommercial[]
+  envois             EnvoiCommercial[]
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, numero])
+  @@index([userId, type, date])
+  @@unique([userId, cleCreation])
+  @@index([clientId])
+  @@index([factureId])
+  @@map("documents_commerciaux")
+  mouvementsStock MouvementStockCommercial[]
+
+}
+
+model LigneDocumentCommercial {
+  id           String @id @default(cuid())
+  documentId   String @map("document_id")
+  document     DocumentCommercial @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  ordre        Int
+  description  String
+  quantite     Float
+  unite        String
+  prixUnitaire Float @map("prix_unitaire")
+  tauxTVA      Float @map("taux_tva")
+  montantHT    Float @map("montant_ht")
+  montantTVA   Float @map("montant_tva")
+  montantTTC   Float @map("montant_ttc")
+  statutBio    String? @map("statut_bio")
+
+  @@index([documentId])
+  @@map("lignes_documents_commerciaux")
+  articleStockType String? @map("article_stock_type")
+  articleStockId String? @map("article_stock_id")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
+}
+
+/// Trace d'une tentative SMTP ; une tentative incertaine ne se rejoue jamais automatiquement.
+model EnvoiCommercial {
+  id           String @id @default(cuid())
+  userId       String @map("user_id")
+  user         User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  cle          String
+  documentId   String? @map("document_id")
+  document     DocumentCommercial? @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  factureId    Int? @map("facture_id")
+  facture      Facture? @relation(fields: [factureId], references: [id], onDelete: Cascade)
+  destinataire String
+  statut       String @default("en_cours")
+  messageId    String? @map("message_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+  envoyeAt     DateTime? @map("envoye_at")
+
+  @@unique([userId, cle])
+  @@index([userId, documentId, factureId])
+  @@map("envois_commerciaux")
 }
 
 // ============================================================
@@ -3891,6 +4081,18 @@ model ChatMessage {
 /// Sert pour les caches externes type SoilGrids ou Hubeau : la clé inclut
 /// le préfixe (ex: 'soilgrids:lat,lng') et la valeur est un JSON arbitraire.
 /// expiresAt est utilisée par `getOrFetch()` pour décider de re-fetcher.
+/// Numéro automatique non réutilisable après suppression ou correction d'un lot du verger.
+model SequenceLotVerger {
+  userId        String   @map("user_id")
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  prefixe       String
+  dernierNumero Int      @map("dernier_numero")
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@id([userId, prefixe])
+  @@map("sequences_lot_verger")
+}
+
 model GenericCache {
   key       String   @id @map("key")
   data      Json     @map("data")
@@ -3952,6 +4154,134 @@ model StationMeteo {
 
   @@index([userId])
   @@map("stations_meteo")
+}
+
+// ============================================================
+// CAPTEURS CONNECTÉS (LoRaWAN, Meshtastic, JSON générique)
+// Plan : vault Projets/gleba/Gleba-capteurs-LoRa.md (2026-10-23)
+// ============================================================
+
+/// Source d'envoi de mesures : serveur de réseau LoRaWAN (TTN, ChirpStack),
+/// pont Meshtastic ou script. Une seule porte d'entrée,
+/// POST /api/capteurs/ingestion, authentifiée par le jeton du connecteur :
+/// montré une seule fois, stocké haché (SHA-256), jamais en clair.
+model ConnecteurCapteurs {
+  id                 String    @id @default(cuid())
+  /// Tenant (propriétaire de l'exploitation), comme toutes les tables métier.
+  userId             String    @map("user_id")
+  user               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nom                String    @map("nom")
+  /// Format attendu des envois (src/lib/capteurs/connecteurs.ts) : ttn, chirpstack, generique.
+  type               String    @map("type")
+  jetonHash          String    @unique @map("jeton_hash")
+  /// Début du jeton, pour le reconnaître à l'écran (« glc_3f9a1c02… »).
+  jetonPrefixe       String    @map("jeton_prefixe")
+  /// Fuseau IANA du lieu : les agrégats journaliers sont comptés en jours du lieu.
+  fuseau             String    @default("Europe/Paris") @map("fuseau")
+  actif              Boolean   @default(true) @map("actif")
+  derniereReceptionA DateTime? @map("derniere_reception_a")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  capteurs Capteur[]
+
+  @@index([userId])
+  @@map("connecteurs_capteurs")
+}
+
+/// Capteur vu par un connecteur. Créé « à rattacher » à sa première mesure,
+/// identifié par son identifiant externe normalisé (DevEUI, nœud Meshtastic),
+/// jamais par son nom. Rattaché au plus à UNE cible, par id.
+model Capteur {
+  id                 String             @id @default(cuid())
+  userId             String             @map("user_id")
+  user               User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connecteurId       String             @map("connecteur_id")
+  connecteur         ConnecteurCapteurs @relation(fields: [connecteurId], references: [id], onDelete: Cascade)
+  identifiantExterne String             @map("identifiant_externe")
+  nom                String?            @map("nom")
+  /// Profil de décodage, par id `marque/modèle` (« dragino/lht65n »,
+  /// src/lib/capteurs/decodage.ts) : annoncé par TTN à la création, sinon
+  /// choisi à l'écran ; jamais tiré d'un libellé.
+  modele             String?            @map("modele")
+  plancheId          String?            @map("planche_id")
+  planche            Planche?           @relation(fields: [plancheId], references: [id], onDelete: SetNull)
+  parcelleGeoId      String?            @map("parcelle_geo_id")
+  parcelleGeo        ParcelleGeo?       @relation(fields: [parcelleGeoId], references: [id], onDelete: SetNull)
+  arbreId            Int?               @map("arbre_id")
+  arbre              Arbre?             @relation(fields: [arbreId], references: [id], onDelete: SetNull)
+  lotAnimauxId       Int?               @map("lot_animaux_id")
+  lotAnimaux         LotAnimaux?        @relation(fields: [lotAnimauxId], references: [id], onDelete: SetNull)
+  animalId           Int?               @map("animal_id")
+  animal             Animal?            @relation(fields: [animalId], references: [id], onDelete: SetNull)
+  objetJardinId      Int?               @map("objet_jardin_id")
+  objetJardin        ObjetJardin?       @relation(fields: [objetJardinId], references: [id], onDelete: SetNull)
+  /// Surcharges saisies par l'utilisateur : { "clé reçue": "grandeur" | null }.
+  /// Priment sur le profil du modèle et sur le dictionnaire commun.
+  correspondances    Json?              @map("correspondances")
+  /// Clés numériques reçues qu'aucune règle ne reconnaît : affichées pour
+  /// être rattachées à la main, jamais devinées.
+  clesInconnues      String[]           @default([]) @map("cles_inconnues")
+  /// Toutes les clés numériques déjà reçues : l'écran montre la règle de
+  /// chacune et permet de la corriger (64 au plus).
+  clesRecues         String[]           @default([]) @map("cles_recues")
+  /// Dernier avertissement de réception (trame non décodée, uplink simulé…),
+  /// effacé par la première trame qui produit des mesures.
+  avertissement      String?            @map("avertissement")
+  /// Dernières valeurs refusées (hors bornes, date impossible) : [{ cle, valeur, raison, a }].
+  refus              Json?              @map("refus")
+  lat                Float?             @map("lat")
+  lng                Float?             @map("lng")
+  derniereVueA       DateTime?          @map("derniere_vue_a")
+  batterie           Float?             @map("batterie") // %
+  rssi               Float?             @map("rssi") // dBm, meilleure passerelle de la dernière trame
+  snr                Float?             @map("snr") // dB
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  mesures      MesureCapteur[]
+  mesuresJours MesureCapteurJour[]
+
+  @@unique([connecteurId, identifiantExterne])
+  @@index([userId])
+  @@map("capteurs")
+}
+
+/// Mesure brute, en unité canonique de sa grandeur (src/lib/capteurs/grandeurs.ts).
+/// Purgée après la durée de rétention ; les agrégats journaliers restent.
+/// Rejouer une trame déjà reçue ne crée pas de doublon (clé unique).
+model MesureCapteur {
+  id        BigInt   @id @default(autoincrement())
+  capteurId String   @map("capteur_id")
+  capteur   Capteur  @relation(fields: [capteurId], references: [id], onDelete: Cascade)
+  grandeur  String   @map("grandeur")
+  valeur    Float    @map("valeur")
+  unite     String   @map("unite")
+  mesureeA  DateTime @map("mesuree_a")
+  recueA    DateTime @default(now()) @map("recue_a")
+
+  @@unique([capteurId, grandeur, mesureeA])
+  @@index([mesureeA])
+  @@map("mesures_capteurs")
+}
+
+/// Agrégat d'un jour civil DU LIEU (fuseau du connecteur), recalculé la nuit
+/// sur tout le brut disponible, avant purge de journées complètes. Pas de somme : une pluie « sur 1 h » glissante
+/// ne s'additionne pas, le cumul de pluie se calculera grandeur par grandeur.
+model MesureCapteurJour {
+  id        Int      @id @default(autoincrement())
+  capteurId String   @map("capteur_id")
+  capteur   Capteur  @relation(fields: [capteurId], references: [id], onDelete: Cascade)
+  grandeur  String   @map("grandeur")
+  jour      DateTime @map("jour") @db.Date
+  min       Float    @map("min")
+  max       Float    @map("max")
+  moyenne   Float    @map("moyenne")
+  nombre    Int      @map("nombre")
+  unite     String   @map("unite")
+
+  @@unique([capteurId, grandeur, jour])
+  @@map("mesures_capteurs_jours")
 }
 
 // ============================================================
@@ -4035,6 +4365,8 @@ model ProduitBoutique {
   @@index([statutBio])
   @@index([recolteId])
   @@map("produits_boutique")
+  mouvementsCommerciaux MouvementStockCommercial[]
+
 }
 
 /// Commande passée par un client via la boutique en ligne
@@ -4148,7 +4480,10 @@ model Exploitation {
   numeroTvaIntracom      String?  @map("numero_tva_intracom") // FR + clé + SIREN
   // Fiscalité
   regimeFiscal           String   @map("regime_fiscal") // 'micro-BA','reel-simplifie','reel-normal'
-  regimeTva              String   @map("regime_tva") // 'franchise-293b','reel-simplifie','reel-normal'
+  regimeTva              String   @map("regime_tva") // 'franchise-293b','reel-simplifie','reel-normal','rfa' (cf src/lib/territoires.ts)
+  // Option pour le paiement de la TVA d'après les débits (art. 269-2-c CGI) :
+  // mention obligatoire sur les factures depuis la réforme, BT-8 = 5.
+  optionTvaDebits        Boolean  @default(false) @map("option_tva_debits")
   // Adresse siège
   adresseSiege           String   @map("adresse_siege")
   codePostal             String   @map("code_postal")
@@ -4415,4 +4750,465 @@ model EvolutionVote {
   @@unique([evolutionId, userId])
   @@index([userId])
   @@map("evolution_votes")
+}
+
+/// Message du salon de discussion de la page Communauté. Lisible et écrit par
+/// les seuls comptes personnels connectés : jamais par un visiteur anonyme ni
+/// par le compte de démonstration partagé (garde dans la route). `userId` est
+/// la PERSONNE (acteur), pas l'exploitation : un membre invité parle en son nom.
+model MessageSalon {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  user      User     @relation("MessageSalonAuteur", fields: [userId], references: [id], onDelete: Cascade)
+  contenu   String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@index([userId])
+  @@map("messages_salon")
+}
+
+
+// Connaissances documentaires : aucun de ces modèles ne remplace les
+// paramètres agronomiques de Espece ou les itinéraires techniques.
+enum StatutContributionEncyclopedie {
+  EN_ATTENTE
+  PUBLIEE
+  A_REPRENDRE
+  REFUSEE
+}
+
+model ContributionEncyclopedie {
+  id             String @id @default(cuid())
+  especeId       String @map("espece_id")
+  espece         Espece @relation(fields: [especeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  userId         String @map("user_id")
+  user           User   @relation("ContributionEncyclopedieAuteur", fields: [userId], references: [id], onDelete: Cascade)
+  signature      String
+  section        String
+  cibleType      String @default("SECTION") @map("cible_type")
+  refId          String @default("") @map("ref_id")
+  snapshot       Json?
+  changements    Json?
+  contenu        String @db.Text
+  source         String @db.Text
+  motif          String @db.Text
+  revisionBaseId String? @map("revision_base_id")
+  licence        String @default("CC BY 4.0")
+  statut         StatutContributionEncyclopedie @default(EN_ATTENTE)
+  decisionMotif  String? @map("decision_motif") @db.Text
+  decisionAt     DateTime? @map("decision_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  revision       RevisionEncyclopedie?
+
+  @@index([userId, createdAt])
+  @@index([statut, createdAt])
+  @@index([especeId, section])
+  @@map("contributions_encyclopedie")
+  @@index([cibleType, refId])
+}
+
+model RevisionEncyclopedie {
+  id             String @id @default(cuid())
+  especeId       String @map("espece_id")
+  espece         Espece @relation(fields: [especeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  section        String
+  cibleType      String @default("SECTION") @map("cible_type")
+  refId          String @default("") @map("ref_id")
+  snapshot       Json?
+  changements    Json?
+  version        Int
+  contenu        String @db.Text
+  source         String @db.Text
+  signature      String
+  licence        String @default("CC BY 4.0")
+  authorId       String? @map("author_id")
+  author         User? @relation("RevisionEncyclopedieAuteur", fields: [authorId], references: [id], onDelete: SetNull)
+  reviewedById   String? @map("reviewed_by_id")
+  reviewedBy     User? @relation("RevisionEncyclopedieValidateur", fields: [reviewedById], references: [id], onDelete: SetNull)
+  contributionId String? @unique @map("contribution_id")
+  contribution   ContributionEncyclopedie? @relation(fields: [contributionId], references: [id], onDelete: SetNull)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@unique([especeId, section, cibleType, refId, version], map: "revisions_encyclopedie_cible_version_key")
+  @@index([authorId])
+  @@index([createdAt])
+  @@map("revisions_encyclopedie")
+  @@index([cibleType, refId, createdAt])
+}
+
+model DiscussionEncyclopedie {
+  id        String @id @default(cuid())
+  especeId  String? @map("espece_id")
+  espece    Espece? @relation(fields: [especeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  userId    String @map("user_id")
+  user      User @relation("DiscussionEncyclopedieAuteur", fields: [userId], references: [id], onDelete: Cascade)
+  signature String
+  titre     String
+  contenu   String @db.Text
+  categorie String @default("GENERAL")
+  epingle   Boolean @default(false)
+  resolu    Boolean @default(false)
+  derniereActiviteAt DateTime @default(now()) @map("derniere_activite_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  reponses  ReponseEncyclopedie[]
+
+  @@index([especeId, createdAt])
+  @@index([categorie, derniereActiviteAt])
+  @@index([userId])
+  @@map("discussions_encyclopedie")
+}
+
+model ReponseEncyclopedie {
+  id           String @id @default(cuid())
+  discussionId String @map("discussion_id")
+  discussion   DiscussionEncyclopedie @relation(fields: [discussionId], references: [id], onDelete: Cascade)
+  userId       String @map("user_id")
+  user         User @relation("ReponseEncyclopedieAuteur", fields: [userId], references: [id], onDelete: Cascade)
+  signature    String
+  contenu      String @db.Text
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([discussionId, createdAt])
+  @@index([userId])
+  @@map("reponses_encyclopedie")
+}
+
+
+/// Illustrations des avis : octets privés en base, jamais un fichier public.
+/// Le CHECK SQL garantit un seul parent et trois emplacements par parent.
+model PhotoAvis {
+  id String @id @default(uuid())
+  avisId String? @map("avis_id")
+  avis Avis? @relation("PhotosAvisDirectes", fields: [avisId], references: [id], onDelete: Cascade)
+  temoignageId String? @map("temoignage_id")
+  temoignage TemoignageRecolte? @relation(fields: [temoignageId], references: [id], onDelete: Cascade)
+  position Int
+  donnees Bytes @db.ByteA
+  width Int
+  height Int
+  legende String? @db.VarChar(300)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([avisId, position])
+  @@unique([temoignageId, position])
+  @@map("photos_avis")
+}
+
+/// Publication volontaire d'une récolte ; aucune référence économique copiée.
+/// Le témoignage et ses photos disparaissent avec l'avis ou la récolte source.
+model TemoignageRecolte {
+  id String @id @default(cuid())
+  avisId String @map("avis_id")
+  avis Avis @relation(fields: [avisId], references: [id], onDelete: Cascade)
+  recolteId Int @map("recolte_id")
+  recolte Recolte @relation(fields: [recolteId], references: [id], onDelete: Cascade)
+  dateRecolte DateTime @map("date_recolte")
+  quantite Float?
+  unite String?
+  commentaire String? @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+  photos PhotoAvis[]
+
+  @@unique([avisId, recolteId])
+  @@index([recolteId])
+  @@index([avisId, createdAt])
+  @@map("temoignages_recolte")
+}
+
+/// Sorties commerciales et retours, liés au stock réel et à la pièce déclenchante.
+model MouvementStockCommercial {
+  id String @id @default(cuid())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documentId String? @map("document_id")
+  document DocumentCommercial? @relation(fields: [documentId], references: [id], onDelete: NoAction)
+  factureId Int? @map("facture_id")
+  facture Facture? @relation(fields: [factureId], references: [id], onDelete: NoAction)
+  ligneDocumentId String? @map("ligne_document_id")
+  ligneDocument LigneDocumentCommercial? @relation(fields: [ligneDocumentId], references: [id], onDelete: NoAction)
+  ligneFactureId Int? @map("ligne_facture_id")
+  ligneFacture LigneFacture? @relation(fields: [ligneFactureId], references: [id], onDelete: NoAction)
+  origineRetourId String? @unique @map("origine_retour_id")
+  origineRetour MouvementStockCommercial? @relation("RetourStockCommercial", fields: [origineRetourId], references: [id], onDelete: NoAction)
+  retour MouvementStockCommercial? @relation("RetourStockCommercial")
+  articleStockType String @map("article_stock_type")
+  articleStockId String @map("article_stock_id")
+  // Les pertes et usages internes débitent le reliquat sans modifier la production.
+  nature String @default("livraison")
+  cleIdempotence String? @map("cle_idempotence")
+  notes String?
+  sourceNom String @map("source_nom")
+  unite String
+  quantite Float // positive = sortie ; négative = retour
+  poidsKg Float? @map("poids_kg")
+  stockSuivi Boolean @default(true) @map("stock_suivi")
+  date DateTime @default(now())
+  createdAt DateTime @default(now()) @map("created_at")
+  recolteId Int? @map("recolte_id")
+  recolte Recolte? @relation(fields: [recolteId], references: [id], onDelete: NoAction)
+  fruitId Int? @map("fruit_id")
+  fruit RecolteArbre? @relation(fields: [fruitId], references: [id], onDelete: NoAction)
+  boisId Int? @map("bois_id")
+  bois ProductionBois? @relation(fields: [boisId], references: [id], onDelete: NoAction)
+  produitBoutiqueId Int? @map("produit_boutique_id")
+  produitBoutique ProduitBoutique? @relation(fields: [produitBoutiqueId], references: [id], onDelete: NoAction)
+  ponteId Int? @map("ponte_id")
+  ponte ProductionOeuf? @relation(fields: [ponteId], references: [id], onDelete: NoAction)
+  rucheId Int? @map("ruche_id")
+  ruche ProductionRuche? @relation(fields: [rucheId], references: [id], onDelete: NoAction)
+  fromageId String? @map("fromage_id")
+  fromage LotFromage? @relation(fields: [fromageId], references: [id], onDelete: NoAction)
+  mouvementOeufId String? @map("mouvement_oeuf_id")
+  mouvementOeuf MouvementStockOeuf? @relation(fields: [mouvementOeufId], references: [id], onDelete: NoAction)
+  mouvementRucheId String? @map("mouvement_ruche_id")
+  mouvementRuche MouvementStockRuche? @relation(fields: [mouvementRucheId], references: [id], onDelete: NoAction)
+  mouvementFromageId String? @map("mouvement_fromage_id")
+  mouvementFromage MouvementFromage? @relation(fields: [mouvementFromageId], references: [id], onDelete: NoAction)
+  // Fruits utilisés (nature « transforme ») : lot transformé qu'ils ont produit.
+  transformationId Int? @map("transformation_id")
+  transformation LotTransforme? @relation("SourcesLotTransforme", fields: [transformationId], references: [id], onDelete: NoAction)
+  // Livraison ou retour d'un lot transformé.
+  lotTransformeId Int? @map("lot_transforme_id")
+  lotTransforme LotTransforme? @relation("MouvementsLotTransforme", fields: [lotTransformeId], references: [id], onDelete: NoAction)
+  @@unique([userId, cleIdempotence])
+  @@index([userId, date])
+  @@index([documentId])
+  @@index([factureId])
+  @@index([recolteId])
+  @@index([fruitId])
+  @@index([boisId])
+  @@index([produitBoutiqueId])
+  @@index([ponteId])
+  @@index([rucheId])
+  @@index([fromageId])
+  @@index([transformationId])
+  @@index([lotTransformeId])
+  @@map("mouvements_stock_commerciaux")
+}
+
+/// Produit transformé à la ferme (jus, compote, confiture…) à partir de lots
+/// de fruits du verger (2026-10-30, retour FB-8CXUUN). Les fruits utilisés
+/// sortent de leur lot par un mouvement « transforme » ; le produit obtenu entre
+/// en stock commercial (BL, facture) comme un fromage prêt.
+model LotTransforme {
+  id Int @id @default(autoincrement())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  produit String
+  numLot String @map("num_lot")
+  date DateTime
+  quantite Float
+  unite String
+  stockDisponibleCommercial Float @map("stock_disponible_commercial")
+  datePeremption DateTime? @map("date_peremption")
+  prixUnitaire Float? @map("prix_unitaire") // TTC, proposé sur le BL ou la facture
+  tauxTVA Float @default(5.5) @map("taux_tva")
+  statutBioSnapshot String? @map("statut_bio_snapshot") // le plus bas de ses sources
+  notes String?
+  cleIdempotence String @map("cle_idempotence")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  sources MouvementStockCommercial[] @relation("SourcesLotTransforme")
+  mouvements MouvementStockCommercial[] @relation("MouvementsLotTransforme")
+
+  @@unique([userId, numLot])
+  @@unique([userId, cleIdempotence])
+  @@index([userId, date])
+  @@map("lots_transformes")
+}
+
+// Journal de règlements : les cibles utilisent une identité stable, même si
+// un miroir comptable est régénéré ou si la vente devient une facture.
+model DossierReglement {
+  id String @id @default(cuid())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sens String
+  devise String @default("EUR")
+  libelle String
+  tiers String?
+  referencePiece String @map("reference_piece")
+  datePiece DateTime @map("date_piece")
+  montantReferenceCentimes BigInt @map("montant_reference_centimes")
+  historiqueDeclarePaye Boolean @default(false) @map("historique_declare_paye")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  cibles CibleReglement[]
+  reglements Reglement[]
+  @@unique([id, userId])
+  @@index([userId])
+  @@map("dossiers_reglement")
+}
+
+model CibleReglement {
+  id String @id @default(cuid())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  cle String
+  type String
+  reference String
+  dossierId String @map("dossier_id")
+  dossier DossierReglement @relation(fields: [dossierId, userId], references: [id, userId], onDelete: Cascade)
+  @@unique([userId, cle])
+  @@index([dossierId])
+  @@map("cibles_reglement")
+}
+
+model Reglement {
+  id String @id @default(cuid())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dossierId String @map("dossier_id")
+  dossier DossierReglement @relation(fields: [dossierId, userId], references: [id, userId], onDelete: Cascade)
+  montantCentimes BigInt @map("montant_centimes")
+  date DateTime
+  modeReglement String @map("mode_reglement")
+  reference String?
+  notes String?
+  acteurId String @map("acteur_id")
+  cleIdempotence String @map("cle_idempotence")
+  operationBancaireId String? @map("operation_bancaire_id")
+  operationBancaire OperationBancaire? @relation(fields: [operationBancaireId, userId], references: [id, userId], onDelete: NoAction)
+  partieBancaire String @default("principal") @map("partie_bancaire")
+  annuleLe DateTime? @map("annule_le")
+  annulePar String? @map("annule_par")
+  motifAnnulation String? @map("motif_annulation")
+  createdAt DateTime @default(now()) @map("created_at")
+  @@unique([userId, cleIdempotence])
+  @@index([dossierId, annuleLe])
+  @@index([userId, date])
+  @@index([operationBancaireId])
+  @@map("reglements")
+}
+
+model ConnexionStripe {
+  id String @id @default(cuid())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  compteStripeId String @map("compte_stripe_id")
+  jetonChiffre String @map("jeton_chiffre")
+  modeTest Boolean @map("mode_test")
+  actif Boolean @default(true)
+  derniereSynchro DateTime? @map("derniere_synchro")
+  curseurHistorique String? @map("curseur_historique")
+  historiqueComplet Boolean @default(false) @map("historique_complet")
+  dernierTransactionId String? @map("dernier_transaction_id")
+  curseurNouveaux String? @map("curseur_nouveaux")
+  teteNouveaux String? @map("tete_nouveaux")
+  verrouSynchroJusqua DateTime? @map("verrou_synchro_jusqua")
+  createdAt DateTime @default(now()) @map("created_at")
+  comptes CompteBancaire[]
+  // Unicité par exploitation (revue du 2026-10-30) : une connexion déconnectée
+  // d'une exploitation ne bloque plus le même compte Stripe ailleurs.
+  // Une seule connexion ACTIVE par compte Stripe sur toute l'instance : index
+  // unique PARTIEL SQL, que Prisma 5 ne sait pas modéliser (migration
+  // 20261030140000_stripe_connexion_unique_active) :
+  //   connexions_stripe_compte_stripe_id_mode_test_actif_key
+  //     UNIQUE (compte_stripe_id, mode_test) WHERE actif
+  // Ne pas le laisser supprimer par une migration générée (`migrate dev`).
+  @@unique([userId, compteStripeId, modeTest])
+  @@unique([id, userId])
+  @@index([userId])
+  @@map("connexions_stripe")
+}
+
+model EtatConnexionStripe {
+  id String @id @default(cuid())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  acteurId String @map("acteur_id")
+  empreinte String @unique
+  expireLe DateTime @map("expire_le")
+  utiliseLe DateTime? @map("utilise_le")
+  @@index([userId])
+  @@map("etats_connexion_stripe")
+}
+
+model CompteBancaire {
+  id String @id @default(cuid())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nom String
+  devise String @default("EUR")
+  connexionStripeId String? @map("connexion_stripe_id")
+  connexionStripe ConnexionStripe? @relation(fields: [connexionStripeId, userId], references: [id, userId], onDelete: NoAction)
+  soldeCentimes BigInt? @map("solde_centimes")
+  soldeAu DateTime? @map("solde_au")
+  archive Boolean @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+  operations OperationBancaire[]
+  @@unique([id, userId])
+  @@unique([connexionStripeId, devise])
+  @@index([userId])
+  @@map("comptes_bancaires")
+}
+
+/// Fichier soumis à l'import CSV d'un relevé, réussi ou non, avec ses octets
+/// d'origine : assistance et rejeu d'un lecteur corrigé. Purgé après 30 jours
+/// (src/lib/comptabilite/banque/tentatives.ts), effacé avec le compte.
+model TentativeImportReleve {
+  id String @id @default(cuid())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Compte de relevés visé, sans clé étrangère : la trace survit à un compte archivé.
+  compteId String? @map("compte_id")
+  nomFichier String? @map("nom_fichier")
+  /// Octets reçus ; null quand le plafond quotidien de conservation est atteint.
+  contenu Bytes?
+  tailleOctets Int @map("taille_octets")
+  empreinte String
+  /// « fichier » : octets d'origine ; « texte » : texte déjà décodé par un ancien client.
+  source String
+  /// « importe », « refuse » (relevé illisible ou incohérent) ou « erreur » (panne).
+  statut String
+  message String?
+  importees Int?
+  dejaPresentes Int? @map("deja_presentes")
+  createdAt DateTime @default(now()) @map("created_at")
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@map("tentatives_import_releve")
+}
+
+model OperationBancaire {
+  id String @id @default(cuid())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  compteId String @map("compte_id")
+  compte CompteBancaire @relation(fields: [compteId, userId], references: [id, userId], onDelete: NoAction)
+  referenceExterne String @map("reference_externe")
+  date DateTime
+  libelle String
+  montantCentimes BigInt @map("montant_centimes")
+  brutCentimes BigInt @map("brut_centimes")
+  fraisCentimes BigInt @default(0) @map("frais_centimes")
+  famille String @default("releve")
+  statut String @default("comptabilisee")
+  aVerifier Boolean @default(false) @map("a_verifier")
+  motifExclusion String? @map("motif_exclusion")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  reglements Reglement[]
+  virementsSortants VirementBancaire[] @relation("VirementSortie")
+  virementsEntrants VirementBancaire[] @relation("VirementEntree")
+  @@unique([id, userId])
+  @@unique([compteId, referenceExterne])
+  @@index([userId, date])
+  @@map("operations_bancaires")
+}
+
+model VirementBancaire {
+  id String @id @default(cuid())
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  operationSortieId String @unique @map("operation_sortie_id")
+  operationSortie OperationBancaire @relation("VirementSortie", fields: [operationSortieId, userId], references: [id, userId], onDelete: NoAction)
+  operationEntreeId String @unique @map("operation_entree_id")
+  operationEntree OperationBancaire @relation("VirementEntree", fields: [operationEntreeId, userId], references: [id, userId], onDelete: NoAction)
+  acteurId String @map("acteur_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  @@index([userId])
+  @@map("virements_bancaires")
 }

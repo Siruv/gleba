@@ -1,3 +1,5 @@
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
 /**
  * API Soins des animaux (PROMPT 19B).
  *
@@ -12,7 +14,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { Prisma } from '@prisma/client'
+import { Prisma, type SoinAnimal } from '@prisma/client'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
 import { createDepenseFromSoinAnimal } from '@/lib/auto-compta'
@@ -20,6 +22,7 @@ import { invalidateKpi } from '@/lib/kpi'
 import { soinPatchSchema, soinSchema } from '@/lib/validations/elevage-soin'
 import { calendrierInjections } from '@/lib/elevage/injections'
 import { lireInjections, synchroniserInjections, fenetresAttenteDepuisInjections } from '@/lib/elevage/injections-protocole'
+import { dateSoinRetenue } from '@/lib/elevage/date-soin'
 import { randomUUID } from 'node:crypto'
 // Review caprin 2026-07-22 — écartement du lait recalculé depuis la vérité
 // (recompute-from-truth), cross-granularité individu↔lot et symétrique
@@ -75,7 +78,7 @@ export async function GET(request: NextRequest) {
     // tous les soins planifiés non réalisés, y compris un retard de l'année
     // précédente ou une échéance de l'année suivante. Le GET historique garde
     // son filtre annuel et sa pagination existants.
-    const where: any = rappels
+    const where: Prisma.SoinAnimalWhereInput = rappels
       ? { userId: session.user.id, fait: false, datePrevue: { not: null } }
       : toutesAnnees
         ? { userId: session.user.id }
@@ -147,6 +150,7 @@ export async function GET(request: NextRequest) {
       meta: { year: annee, total: soins.length },
     })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('GET /api/elevage/soins error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la récupération', details: 'Erreur interne du serveur' },
@@ -322,6 +326,7 @@ export async function POST(request: NextRequest) {
     const finOeufs = d.fait && tempsOeufs > 0 ? addDays(derniereInjection, tempsOeufs) : null
 
     const result = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
       const quantitePrelevee = d.fait && stockMedicament ? d.quantite ?? 0 : 0
       if (quantitePrelevee > 0) {
         const decremente = await tx.stockMedicamentElevage.updateMany({
@@ -479,6 +484,7 @@ export async function POST(request: NextRequest) {
       { status: 201 }
     )
   } catch (err) {
+    if (err instanceof ErreurReglement) return NextResponse.json({ error: err.message }, { status: err.status })
     console.error('POST /api/elevage/soins error:', err)
     if (err instanceof Error && err.message.startsWith('STOCK_MEDICAMENT_INSUFFISANT:')) {
       const disponible = err.message.split(':')[1]
@@ -496,7 +502,8 @@ export async function PATCH(request: NextRequest) {
   if (error) return error
 
   try {
-    const parsed = soinPatchSchema.safeParse(await request.json())
+    const corps = await request.json()
+    const parsed = soinPatchSchema.safeParse(corps)
     if (!parsed.success) {
       return NextResponse.json({ error: 'Données invalides', details: parsed.error.flatten() }, { status: 400 })
     }
@@ -507,7 +514,9 @@ export async function PATCH(request: NextRequest) {
     })
     if (!existing) return NextResponse.json({ error: 'Soin non trouvé' }, { status: 404 })
 
-    const updateData: any = {}
+    // Les champs sont relus (dates, délais, injections) : valeurs scalaires du
+    // modèle, pas des opérations Prisma.
+    const updateData: Partial<SoinAnimal> = {}
     // Bug cmp8rwths (Marc 2026-05-16) — valider un soin "en retard" écrasait
     // sa date prévue par la date du jour, on perdait l'historique du retard
     // d'application (critique en élevage AB). Désormais, à la validation
@@ -515,7 +524,14 @@ export async function PATCH(request: NextRequest) {
     // l'ancienne date dans datePrevue, et `date` reçoit la date d'effet.
     if (fait !== undefined) updateData.fait = fait
     if (date !== undefined) {
-      const newDate = new Date(date)
+      // Ticket cmvnp6s3z : un jour seul (« AAAA-MM-JJ », décidé sur la chaîne
+      // brute, avant la coercition zod en minuit UTC) égal au jour du soin ne
+      // change pas sa date : la 1re injection datée garde son heure réelle.
+      const dateBrute = typeof corps?.date === 'string' ? corps.date : date
+      const newDate = dateSoinRetenue(existing.date, dateBrute)
+      if (Number.isNaN(newDate.getTime())) {
+        return NextResponse.json({ error: 'Date du soin invalide.' }, { status: 400 })
+      }
       if (fait === true && existing.datePrevue == null) {
         updateData.datePrevue = existing.date
       }
@@ -634,6 +650,7 @@ export async function PATCH(request: NextRequest) {
     }
 
     const soin = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
       const devientRealise = fait === true && !existing.fait && existing.quantitePreleveeStock <= 0
       const devientPlanifie = fait === false && existing.fait && existing.quantitePreleveeStock > 0
       if (devientRealise && stockEffectif) {
@@ -680,10 +697,10 @@ export async function PATCH(request: NextRequest) {
         const premiereRealisee = injectionsExistantes.some((i) => i.numero === 1 && i.statut === 'realisee')
         // Tickets vigie2cc83585 / cmupz9djj (2026-10-01) : le calendrier est
         // recalculé pour TOUTES les injections, réalisées comprises, et un
-        // changement de protocole (date de départ, nombre, intervalle) recale
+        // changement de calendrier (date de départ, nombre, intervalle) recale
         // aussi leurs dates réelles. Cf. src/lib/elevage/injections-protocole.ts.
         await synchroniserInjections(tx, session.user.id, id, { debut, nombre, intervalleHeures: intervalle }, {
-          protocoleChange: dateChangee || injectionsChangees,
+          calendrierChange: dateChangee || injectionsChangees,
           marquerPremiereFaite: fait === true && !premiereRealisee,
           rouvrirPremiere: fait === false && premiereRealisee,
           dateRealiseePremiere: (updateData.date as Date | undefined) ?? new Date(),
@@ -730,6 +747,7 @@ export async function PATCH(request: NextRequest) {
 
     return NextResponse.json({ data: soin })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('PATCH /api/elevage/soins error:', error)
     if (error instanceof Error && error.message.startsWith('STOCK_MEDICAMENT_INSUFFISANT:')) {
       return NextResponse.json(
@@ -769,6 +787,7 @@ export async function DELETE(request: NextRequest) {
 
     return NextResponse.json({ success: true })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('DELETE /api/elevage/soins error:', error)
     return NextResponse.json({ error: 'Erreur interne du serveur' }, { status: 500 })
   }

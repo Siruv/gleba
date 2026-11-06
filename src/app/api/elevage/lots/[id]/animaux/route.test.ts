@@ -17,11 +17,15 @@ vi.mock('@/lib/elevage/animal-lot', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/elevage/animal-lot')>()),
   enregistrerChangementLot: mocks.enregistrerChangementLot,
 }))
+// `composerLot` prend le verrou des règlements puis relit le lot et les
+// animaux DANS la transaction : toutes ses lectures passent par `tx`.
 vi.mock('@/lib/prisma', () => ({
   default: {
-    lotAnimaux: { findFirst: mocks.lotFindFirst },
-    animal: { findMany: mocks.animalFindMany },
-    $transaction: (callback: (tx: unknown) => unknown) => callback({ animal: { update: mocks.animalUpdate } }),
+    $transaction: (callback: (tx: unknown) => unknown) => callback({
+      $executeRaw: vi.fn(),
+      lotAnimaux: { findFirst: mocks.lotFindFirst },
+      animal: { findMany: mocks.animalFindMany, update: mocks.animalUpdate },
+    }),
   },
 }))
 
@@ -93,6 +97,20 @@ describe('POST /api/elevage/lots/[id]/animaux — composer un lot en une fois', 
     const payload = await res.json()
     expect(payload.details.map((d: { animalId: number }) => d.animalId)).toEqual([2, 3])
     expect(payload.error).toContain('espèce différente')
+    expect(mocks.animalUpdate).not.toHaveBeenCalled()
+  })
+
+  it('refuse un lot hétérogène issu de deux profils personnels au même préfixe', async () => {
+    mocks.lotFindFirst.mockResolvedValue({
+      id: 81, nom: 'Lot témoin', statut: 'actif', especeAnimaleId: 'ferme_canard', prixAchatTotal: null,
+    })
+    mocks.animalFindMany.mockResolvedValue([
+      chevre(1, { especeAnimaleId: 'ferme_canard' }),
+      chevre(2, { especeAnimaleId: 'ferme_poule' }),
+    ])
+    const response = await post({ ajouter: [1, 2] })
+    expect(response.status).toBe(400)
+    expect((await response.json()).details.map((d: { animalId: number }) => d.animalId)).toEqual([2])
     expect(mocks.animalUpdate).not.toHaveBeenCalled()
   })
 

@@ -29,6 +29,22 @@ export async function register() {
   } catch (error) {
     console.error("[notifications] Échec d'initialisation du scheduler:", error)
   }
+
+  try {
+    const { initBanqueScheduler } = await import('@/lib/comptabilite/banque/scheduler')
+    initBanqueScheduler()
+  } catch {
+    console.warn('[banque] Synchronisation automatique indisponible.')
+  }
+
+  // Indépendante de STRIPE_SYNC_ENABLED : les fichiers de relevés importés ne
+  // doivent pas survivre à leurs 30 jours de conservation.
+  try {
+    const { initPurgeTentativesImport } = await import('@/lib/comptabilite/banque/tentatives')
+    initPurgeTentativesImport()
+  } catch {
+    console.warn('[banque] Purge des tentatives d’import indisponible.')
+  }
 }
 
 export async function onRequestError(

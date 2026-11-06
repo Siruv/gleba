@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   animalFindMany: vi.fn(),
   enregistrerChangementLot: vi.fn(),
   soinFindMany: vi.fn(),
+  especeFindFirst: vi.fn(),
 }))
 
 vi.mock('@/lib/auth-utils', () => ({ requireAuthApi: mocks.requireAuthApi }))
@@ -19,10 +20,12 @@ vi.mock('@/lib/elevage/animal-lot', () => ({
 vi.mock('@/lib/auto-compta', () => ({ createDepenseFromAchatAnimal: vi.fn(), deleteAutoEntry: vi.fn() }))
 vi.mock('@/lib/prisma', () => ({
   default: {
-    $transaction: (callback: (tx: unknown) => unknown) => callback({ animal: { update: mocks.animalUpdate } }),
+    $transaction: (callback: (tx: unknown) => unknown) => callback({ $executeRaw: vi.fn(), animal: { update: mocks.animalUpdate } }),
     animal: { findFirst: mocks.animalFindFirst, update: mocks.animalUpdate, findMany: mocks.animalFindMany },
     // Ticket cmsoglwee — le GET fusionne les soins du lot de l'animal.
     soinAnimal: { findMany: mocks.soinFindMany },
+    // Audit 2026-10-19 — le PUT vérifie que la nouvelle espèce est visible.
+    especeAnimale: { findFirst: mocks.especeFindFirst },
   },
 }))
 
@@ -126,6 +129,7 @@ describe('affectation d’un lot via PUT /api/elevage/animaux/[id]', () => {
     mocks.requireAuthApi.mockResolvedValue({ error: null, session: { user: { id: 'user-1' } } })
     mocks.animalFindFirst.mockResolvedValue({ id: 7, especeAnimaleId: 'ovin' })
     mocks.animalUpdate.mockImplementation(async ({ data }) => ({ id: 7, lotId: data.lotId ?? 42, prixAchat: null }))
+    mocks.especeFindFirst.mockResolvedValue({ id: 'caprin' })
   })
 
   it('refuse un lot non assignable avant écriture', async () => {
@@ -143,8 +147,56 @@ describe('affectation d’un lot via PUT /api/elevage/animaux/[id]', () => {
 
     await callPut({ lotId: 42, especeAnimaleId: 'caprin' })
 
-    expect(mocks.isAssignableAnimalLot).toHaveBeenCalledWith('user-1', 42, 'caprin')
+    // Nouveau rattachement : le lot doit être actif.
+    expect(mocks.isAssignableAnimalLot).toHaveBeenCalledWith('user-1', 42, 'caprin', { lotConserve: false })
     expect(mocks.animalUpdate).toHaveBeenCalled()
+  })
+
+  it.each([{}, { lotId: 42 }])('revalide le lot conservé quand seule l’espèce change (%j)', async (extra) => {
+    mocks.animalFindFirst.mockResolvedValue({ id: 7, lotId: 42, especeAnimaleId: 'ovin', prixAchat: null })
+    mocks.isAssignableAnimalLot.mockResolvedValue(false)
+    const response = await callPut({ especeAnimaleId: 'caprin', ...extra })
+    expect(response.status).toBe(400)
+    expect(mocks.isAssignableAnimalLot).toHaveBeenCalledWith('user-1', 42, 'caprin', { lotConserve: true })
+    expect(mocks.animalUpdate).not.toHaveBeenCalled()
+  })
+
+  it('corrige l’espèce d’un animal resté dans son lot, même réformé, si l’espèce reste compatible (relecture PR #47)', async () => {
+    mocks.animalFindFirst.mockResolvedValue({ id: 7, lotId: 42, especeAnimaleId: 'chevres_alpines', prixAchat: null })
+    mocks.especeFindFirst.mockResolvedValue({ id: 'chevre_saanen' })
+    mocks.isAssignableAnimalLot.mockResolvedValue(true)
+    const response = await callPut({ especeAnimaleId: 'chevre_saanen' })
+    expect(response.status).toBe(200)
+    expect(mocks.isAssignableAnimalLot).toHaveBeenCalledWith('user-1', 42, 'chevre_saanen', { lotConserve: true })
+    expect(mocks.animalUpdate).toHaveBeenCalled()
+  })
+
+  it('permet de corriger une note sans revalider le lot et le profil inchangés', async () => {
+    mocks.animalFindFirst.mockResolvedValue({ id: 7, lotId: 42, especeAnimaleId: 'ovin', prixAchat: null })
+    const response = await callPut({ lotId: 42, especeAnimaleId: 'ovin', notes: 'Observation corrigée' })
+    expect(response.status).toBe(200)
+    expect(mocks.isAssignableAnimalLot).not.toHaveBeenCalled()
+  })
+
+  it('refuse une espèce privée d’un autre compte en nommant le champ', async () => {
+    mocks.especeFindFirst.mockResolvedValueOnce(null)
+
+    const response = await callPut({ especeAnimaleId: 'espece-privee-autre' })
+
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({ error: 'Espèce animale invalide', champ: 'especeAnimaleId' })
+    expect(mocks.animalUpdate).not.toHaveBeenCalled()
+  })
+
+  // Le contrôle convertit avec `Number`, l'écriture convertissait avec
+  // `parseInt` : « 1e3 » passait pour le lot inchangé 1000 et s'écrivait 1.
+  it('écrit le lot validé, jamais une seconde conversion', async () => {
+    mocks.animalFindFirst.mockResolvedValue({ id: 7, especeAnimaleId: 'ovin', lotId: 1000 })
+
+    const response = await callPut({ lotId: '1e3' })
+
+    expect(response.status).toBe(200)
+    expect(mocks.animalUpdate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ lotId: 1000 }) }))
   })
 
   it('permet le détachement sans rechercher de lot', async () => {

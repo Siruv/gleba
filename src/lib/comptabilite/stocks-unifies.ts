@@ -11,6 +11,7 @@
  */
 
 import prisma from '@/lib/prisma'
+import { disponibleCommercial, quantiteBois } from '@/lib/commercial/stock-types'
 import { calculerStockOeufs, OEUFS_PAR_UNITE } from '@/lib/stocks-helpers'
 import { arrondiQuantiteStock, computeStocksTotaux, moyennePrix } from '@/lib/stocks/agregation'
 import { surfaceCultureM2 } from '@/lib/culture-surface'
@@ -23,6 +24,13 @@ import {
 import { ajouterQuantite, partKg, formatQuantiteParUnite, type QuantiteParUnite } from '@/lib/recolte/quantites'
 import { prixReferenceKg, PRIX_REF_OEUF_UNITAIRE } from '@/lib/stocks/prix-reference'
 import {
+  chargerPrixVentesMoyens,
+  libelleMethodesValorisation,
+  uniteDuLot,
+  valoriserLot,
+  type ValorisationLot,
+} from '@/lib/recolte/valorisation'
+import {
   calculerStocksRuche,
   convertirQuantiteProduitRuche,
 } from '@/lib/elevage/stock-ruche'
@@ -33,6 +41,8 @@ import {
   type UniteProduitRuche,
   typeVenteVersProduitRuche,
 } from '@/lib/elevage/produits-ruche'
+import { TYPES_ARBRE } from '@/lib/verger/types-arbre'
+import { chargerCheptelEnStock } from '@/lib/elevage/stock-cheptel'
 
 export interface StockUnifieItem {
   id: string
@@ -44,6 +54,12 @@ export interface StockUnifieItem {
   stockMin: number | null
   alerteBas: boolean
   valeur: number | null
+  /**
+   * Méthode de la valeur, en quelques mots (« au prix de vente moyen
+   * (90 jours) »), quand l'écran doit la dire. Récoltes en stock et cultures
+   * en cours : `src/lib/recolte/valorisation.ts`, la même règle que Récoltes.
+   */
+  valeurMethode?: string | null
 }
 
 export type StocksUnifies = Awaited<ReturnType<typeof computeStocksUnifies>>
@@ -61,8 +77,7 @@ export async function computeStocksUnifies(userId: string) {
     culturesActives,
     // Élevage (per-user)
     userAliments,
-    animauxActifs,
-    lotsActifs,
+    cheptel,
     // Élevage oeufs
     stockOeufs,
     // Produits de la ruche : récoltes moins sorties
@@ -103,9 +118,11 @@ export async function computeStocksUnifies(userId: string) {
 
     // Récoltes potager en stock
     prisma.recolte.findMany({
-      where: { userId, statut: 'en_stock' },
+      where: { userId, statut: 'en_stock', produitsBoutique: { none: {} } },
       include: {
-        espece: { select: { id: true, nom: true, prixKg: true } },
+        // userId + uniteRendement : la règle de valorisation distingue la
+        // fiche d'une espèce personnelle (dans son unité) du catalogue (€/kg).
+        espece: { select: { id: true, nom: true, prixKg: true, userId: true, uniteRendement: true } },
       },
     }),
 
@@ -131,7 +148,7 @@ export async function computeStocksUnifies(userId: string) {
         plancheId: true,
         quantite: true,
         longueur: true,
-        espece: { select: { id: true, nom: true, rendement: true, uniteRendement: true, prixKg: true } },
+        espece: { select: { id: true, nom: true, rendement: true, uniteRendement: true, prixKg: true, userId: true } },
         variete: { select: { id: true } },
         planche: { select: { surface: true, largeur: true, longueur: true, nom: true } },
       },
@@ -149,20 +166,9 @@ export async function computeStocksUnifies(userId: string) {
       orderBy: { aliment: { nom: 'asc' } },
     }),
 
-    // Animaux actifs
-    prisma.animal.groupBy({
-      by: ['especeAnimaleId'],
-      where: { userId, statut: 'actif' },
-      _count: true,
-    }),
-
-    // Lots actifs avec quantité
-    prisma.lotAnimaux.findMany({
-      where: { userId, statut: 'actif' },
-      include: {
-        especeAnimale: { select: { nom: true } },
-      },
-    }),
+    // Animaux hors lot actif et lots actifs à leur effectif reconstitué, le
+    // même que celui d'Élevage > Lots (QA cmvgdo90z, `stock-cheptel.ts`).
+    chargerCheptelEnStock(userId),
 
     // Stock œufs calculé
     calculerStockOeufs(userId),
@@ -206,11 +212,11 @@ export async function computeStocksUnifies(userId: string) {
   // la card « Valeur estimée » restait à 0 dès qu'un utilisateur n'avait
   // pas pris la peine de remplir le prix unitaire sur chaque saisie.
   const ilYAQuatreVingtDixJours = new Date(Date.now() - 90 * 24 * 3600 * 1000)
-  const [ventesRecoltes, ventesFruits, ventesOeufs, ventesRuche] = await Promise.all([
-    prisma.recolte.findMany({
-      where: { userId, statut: 'vendu', dateVente: { gte: ilYAQuatreVingtDixJours }, prixKg: { not: null, gt: 0 } },
-      select: { especeId: true, prixKg: true },
-    }),
+  const [prixVentesRecoltes, ventesFruits, ventesOeufs, ventesRuche] = await Promise.all([
+    // Ticket cmvnvaal2 — prix de vente moyen par (espèce, UNITÉ), pondéré par
+    // les quantités : la règle unique de `valorisation.ts`, lue aussi par
+    // Récoltes > Stock. L'ancienne moyenne mêlait tiges et kilos.
+    chargerPrixVentesMoyens(prisma, userId),
     prisma.recolteArbre.findMany({
       where: { userId, statut: 'vendu', dateVente: { gte: ilYAQuatreVingtDixJours }, prixKg: { not: null, gt: 0 } },
       select: { arbreId: true, prixKg: true },
@@ -231,14 +237,6 @@ export async function computeStocksUnifies(userId: string) {
     }),
   ])
 
-  // Map especeId → prix moyen €/kg (récoltes potager)
-  const prixParEspece = new Map<string, number[]>()
-  for (const v of ventesRecoltes) {
-    if (!v.prixKg) continue
-    const list = prixParEspece.get(v.especeId) ?? []
-    list.push(v.prixKg)
-    prixParEspece.set(v.especeId, list)
-  }
   // Map arbreId → prix moyen €/kg (fruits arbres)
   const prixParArbre = new Map<number, number[]>()
   for (const v of ventesFruits) {
@@ -288,7 +286,7 @@ export async function computeStocksUnifies(userId: string) {
   }
 
   // Récupérer les noms des especes animales
-  const especeAnimaleIds = animauxActifs.map(a => a.especeAnimaleId)
+  const especeAnimaleIds = cheptel.individuels.map(a => a.especeAnimaleId)
   const especesAnimales = await prisma.especeAnimale.findMany({
     where: { id: { in: especeAnimaleIds } },
     select: { id: true, nom: true },
@@ -345,39 +343,49 @@ export async function computeStocksUnifies(userId: string) {
     })
   })
 
-  // Récoltes potager en stock (agrégées par espece)
-  // BUG #7 : fallback prix moyen des ventes récentes si pas de prixKg.
-  // QA 2026-05-15 — Bug #12 : ajout d'un 3e niveau de fallback sur
-  // le barème de référence (lib prix-reference.ts) pour ne plus
-  // afficher 0 € sur les stocks d'espèces sans historique de vente.
+  // Récoltes potager en stock (agrégées par espèce et par unité)
   // Une ligne par (espèce, UNITÉ) : la récolte fige son unité à la saisie
   // (kg, tige, pièce, botte), et 12 kg de carottes plus 360 tiges de dahlia ne
   // font pas 372 de quoi que ce soit. L'ancien cumul « totalKg » affichait les
-  // tiges en kilos. Le prix (`prixKg`) est « € par unité de l'espèce ».
-  const recoltesParEspeceUnite = new Map<string, { nom: string; unite: UniteQuantite; total: number; valeur: number; hasPrix: boolean }>()
+  // tiges en kilos.
+  // Ticket cmvnvaal2 (2026-10-25) — la valeur de chaque lot vient de la règle
+  // UNIQUE `valoriserLot` (lot, fiche d'une espèce personnelle dans son unité,
+  // vente moyenne dans la même unité, catalogue et barème en kilos seulement),
+  // celle de Récoltes > Stock : 21 tiges de dahlia valaient 630 € là-bas et
+  // 30,87 € ici.
+  const recoltesParEspeceUnite = new Map<string, {
+    nom: string
+    unite: UniteQuantite
+    total: number
+    valeur: number
+    hasPrix: boolean
+    valorisations: ValorisationLot[]
+  }>()
   recoltesEnStock.forEach(r => {
-    const unite = (r.unite ?? 'kg') as UniteQuantite
+    const quantite = disponibleCommercial(r)
+    if (quantite <= 0) return
+    const unite = uniteDuLot(r.unite)
     const key = `${r.especeId}::${unite}`
     const existing = recoltesParEspeceUnite.get(key)
-    const prixFallback =
-      r.prixKg
-      ?? moyennePrix(prixParEspece.get(r.especeId) ?? [])
-      ?? r.espece?.prixKg
-      ?? (unite === 'kg' ? prixReferenceKg(r.especeId) : null)
-      ?? 0
-    const val = r.quantite * prixFallback
-    const hasPrix = prixFallback > 0
+    const valorisation = valoriserLot(
+      { acteurId: userId, especeId: r.especeId, unite, quantite, prixLot: r.prixKg, espece: r.espece },
+      prixVentesRecoltes,
+    )
+    const val = valorisation.valeur ?? 0
+    const aUnPrix = valorisation.source !== 'aucune'
     if (existing) {
-      existing.total += r.quantite
+      existing.total += quantite
       existing.valeur += val
-      existing.hasPrix = existing.hasPrix || hasPrix
+      existing.hasPrix = existing.hasPrix || aUnPrix
+      existing.valorisations.push(valorisation)
     } else {
       recoltesParEspeceUnite.set(key, {
         nom: r.espece?.nom ?? r.espece?.id ?? r.especeId,
         unite,
-        total: r.quantite,
+        total: quantite,
         valeur: val,
-        hasPrix,
+        hasPrix: aUnPrix,
+        valorisations: [valorisation],
       })
     }
   })
@@ -391,7 +399,10 @@ export async function computeStocksUnifies(userId: string) {
       unite: libelleUniteQuantite(data.unite, data.total),
       stockMin: null,
       alerteBas: false,
-      valeur: data.hasPrix ? data.valeur : null,
+      valeur: data.hasPrix ? Math.round(data.valeur * 100) / 100 : null,
+      valeurMethode: data.hasPrix
+        ? libelleMethodesValorisation(data.valorisations)
+        : `sans prix de vente en ${libelleUniteQuantite(data.unite, 2)}`,
     })
   })
 
@@ -408,6 +419,7 @@ export async function computeStocksUnifies(userId: string) {
     unite: UniteQuantite
     valeurEstimee: number
     hasPrix: boolean
+    valorisations: ValorisationLot[]
   }
   // Rendement effectif de la ferme (bloc « Chez moi », sinon catalogue) et
   // projection dans SON unité via le SSOT `projectionRecolte` : l'ancien
@@ -429,25 +441,23 @@ export async function computeStocksUnifies(userId: string) {
     const projection = projectionRecolte(surface, effectif.rendement, effectif.uniteRendement)
     const estimeKg = projection.quantite
     const uniteEstimee = projection.unite
-    // QA 2026-05-15 — Bug #12 : 3 niveaux de fallback (ventes
-    // observées → barème de référence) pour éviter "0 €" parasite.
-    // Feedback cmpkyfjyx — Ajout du prix_kg saisi sur l'espèce comme
-    // 1er fallback (avant le barème générique) car des espèces composées
-    // comme "Courge butternut" ont leur prix en base mais ne matchent
-    // pas le barème ("Courge"/"Butternut" sont des entrées séparées).
-    const prixMoyen =
-      moyennePrix(prixParEspece.get(key) ?? [])
-      ?? c.espece.prixKg
-      ?? (uniteEstimee === 'kg' ? prixReferenceKg(key) : null)
-      ?? 0
-    const valeur = estimeKg * prixMoyen
+    // Même règle que les lots en stock (`valoriserLot`, ticket cmvnvaal2),
+    // appliquée à la quantité projetée dans SON unité : un dahlia projeté en
+    // tiges n'est plus valorisé au prix de catalogue en €/kg.
+    const valorisation = valoriserLot(
+      { acteurId: userId, especeId: key, unite: uniteEstimee, quantite: estimeKg, espece: c.espece },
+      prixVentesRecoltes,
+    )
+    const valeur = valorisation.valeur ?? 0
+    const aUnPrix = valorisation.source !== 'aucune'
     const existing = culturesParEspece.get(key)
     if (existing) {
       existing.nbCultures += 1
       if (c.plancheId) existing.planches.add(c.plancheId)
       existing.stockEstime += estimeKg
       existing.valeurEstimee += valeur
-      existing.hasPrix = existing.hasPrix || prixMoyen > 0
+      existing.hasPrix = existing.hasPrix || aUnPrix
+      existing.valorisations.push(valorisation)
     } else {
       culturesParEspece.set(key, {
         nom: c.espece.nom ?? c.espece.id,
@@ -456,7 +466,8 @@ export async function computeStocksUnifies(userId: string) {
         stockEstime: estimeKg,
         unite: uniteEstimee,
         valeurEstimee: valeur,
-        hasPrix: prixMoyen > 0,
+        hasPrix: aUnPrix,
+        valorisations: [valorisation],
       })
     }
   }
@@ -476,6 +487,10 @@ export async function computeStocksUnifies(userId: string) {
       stockMin: null,
       alerteBas: false,
       valeur: acc.hasPrix ? Math.round(acc.valeurEstimee * 100) / 100 : null,
+      // Comme les récoltes : la méthode, ou l'absence de prix dans l'unité.
+      valeurMethode: acc.hasPrix
+        ? libelleMethodesValorisation(acc.valorisations.filter((v) => v.source !== 'aucune'))
+        : `sans prix de vente en ${libelleUniteQuantite(acc.unite, 2)}`,
     })
   })
 
@@ -498,13 +513,13 @@ export async function computeStocksUnifies(userId: string) {
   })
 
   // Animaux individuels par espece
-  animauxActifs.forEach(a => {
+  cheptel.individuels.forEach(a => {
     stocks.push({
       id: `animaux-${a.especeAnimaleId}`,
       module: 'elevage',
       categorie: 'Animaux individuels',
       nom: especeAnimaleMap.get(a.especeAnimaleId) || a.especeAnimaleId,
-      stock: a._count,
+      stock: a.tetes,
       unite: 'têtes',
       stockMin: null,
       alerteBas: false,
@@ -513,13 +528,13 @@ export async function computeStocksUnifies(userId: string) {
   })
 
   // Lots d'animaux
-  lotsActifs.forEach(l => {
+  cheptel.lots.forEach(l => {
     stocks.push({
       id: `lot-${l.id}`,
       module: 'elevage',
       categorie: 'Lots animaux',
-      nom: l.nom || l.especeAnimale.nom,
-      stock: l.quantiteActuelle,
+      nom: l.nom,
+      stock: l.tetes,
       unite: 'têtes',
       stockMin: null,
       alerteBas: false,
@@ -567,20 +582,14 @@ export async function computeStocksUnifies(userId: string) {
 
   // === VERGER ===
 
-  // Arbres par type
-  const typeLabels: Record<string, string> = {
-    fruitier: 'Fruitiers',
-    petit_fruit: 'Petits fruits',
-    forestier: 'Forestiers',
-    ornement: 'Ornementaux',
-    haie: 'Haies',
-  }
+  // Arbres par type : libellés de la liste unique des types d'arbre
+  // (src/lib/verger/types-arbre.ts, lianes fruitières comprises).
   arbresActifs.forEach(a => {
     stocks.push({
       id: `arbres-${a.type}`,
       module: 'verger',
       categorie: 'Arbres',
-      nom: typeLabels[a.type] || a.type,
+      nom: TYPES_ARBRE.find((t) => t.value === a.type)?.labelPluriel ?? a.type,
       stock: a._count,
       unite: 'arbres',
       stockMin: null,
@@ -593,6 +602,8 @@ export async function computeStocksUnifies(userId: string) {
   // BUG #7 : fallback sur prix moyen €/kg des ventes récentes par arbre.
   const fruitsParArbre = new Map<number, { nom: string; totalKg: number; valeur: number; hasPrix: boolean }>()
   fruitsEnStock.forEach(r => {
+    const quantite = disponibleCommercial(r)
+    if (quantite <= 0) return
     const key = r.arbreId
     const existing = fruitsParArbre.get(key)
     // QA 2026-05-15 — Bug #12 : fallback barème par espèce d'arbre
@@ -602,16 +613,16 @@ export async function computeStocksUnifies(userId: string) {
       ?? moyennePrix(prixParArbre.get(r.arbreId) ?? [])
       ?? prixReferenceKg(r.arbre?.espece ?? null)
       ?? 0
-    const val = r.quantite * prixFallback
+    const val = quantite * prixFallback
     const hasPrix = prixFallback > 0
     if (existing) {
-      existing.totalKg += r.quantite
+      existing.totalKg += quantite
       existing.valeur += val
       existing.hasPrix = existing.hasPrix || hasPrix
     } else {
       fruitsParArbre.set(key, {
         nom: r.arbre?.nom || `Arbre #${key}`,
-        totalKg: r.quantite,
+        totalKg: quantite,
         valeur: val,
         hasPrix,
       })
@@ -633,19 +644,24 @@ export async function computeStocksUnifies(userId: string) {
 
   // Bois en stock
   boisEnStock.forEach(b => {
-    const volume = b.volumeM3 || 0
+    const q = quantiteBois(b)
+    const volume = b.stockDisponibleCommercial ?? q.quantite
+    if (volume <= 0) return
     stocks.push({
       id: `bois-${b.id}`,
       module: 'verger',
       categorie: 'Bois en stock',
       nom: b.arbre?.nom || `Arbre #${b.arbreId}`,
       stock: volume,
-      unite: 'm³',
+      unite: q.unite,
       stockMin: null,
       alerteBas: false,
-      valeur: b.prixVente || null,
+      valeur: b.prixVente && q.quantite > 0 ? b.prixVente * volume / q.quantite : null,
     })
   })
+
+  const produitsBoutique = await prisma.produitBoutique.findMany({ where: { userId, stockDispo: { gt: 0 } } })
+  for (const p of produitsBoutique) stocks.push({ id: `boutique-${p.id}`, module: p.recolteId || ['legumes', 'fleurs'].includes(p.categorie || '') ? 'potager' : p.categorie === 'fruits' ? 'verger' : ['viande', 'oeufs', 'miel'].includes(p.categorie || '') ? 'elevage' : 'autre', categorie: 'Stock boutique', nom: p.nom, stock: p.stockDispo!, unite: p.unite, stockMin: null, alerteBas: false, valeur: p.stockDispo! * p.prix })
 
   // Stats
   // BUG #7 : on utilise le sélecteur testé `computeStocksTotaux` au lieu

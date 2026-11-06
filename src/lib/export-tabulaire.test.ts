@@ -9,6 +9,7 @@ describe("export tabulaire", () => {
       tables: [
         { modele: "Animal", nomTable: "animaux", rows: [{ id: 1, userId: "u1", nom: "Truffe", statut: "actif" }] },
         { modele: "SoinAnimal", nomTable: "soins_animaux", rows: [{ id: 3, userId: "u1", produit: "Valbazen", date: new Date("2025-04-12T00:00:00Z") }] },
+        // eslint-disable-next-line no-restricted-syntax -- nom de modèle Prisma
         { modele: "Recolte", nomTable: "récoltes", rows: [{ id: 9, quantite: 2.5 }] },
         { modele: "Planche", nomTable: "planches", rows: [] },
       ],
@@ -39,8 +40,18 @@ describe("export tabulaire", () => {
     expect(csv).toContain('"{""a"":1}"')
   })
 
+  it("dit dans le LISEZMOI ce que l'export a omis (brut des capteurs au-delà du seuil)", () => {
+    const { archive } = construireArchiveTabulaire({
+      dateExport: new Date("2026-10-30T10:00:00Z"),
+      tables: [{ modele: "Capteur", nomTable: "capteurs", rows: [{ id: "cap-1" }] }],
+      avertissements: ["Mesures brutes des capteurs non incluses : 350 000 mesures dépassent le seuil."],
+    })
+    expect(strFromU8(unzipSync(archive)["LISEZMOI.txt"])).toContain("Avertissements :\r\n- Mesures brutes des capteurs non incluses")
+  })
+
   it("dérive un nom de fichier du modèle quand la table n'a pas de nom SQL", () => {
     expect(nomFichierTable("HistoriqueLotAnimal")).toBe("historique_lot_animal.csv")
+    // eslint-disable-next-line no-restricted-syntax -- nom de modèle Prisma
     expect(nomFichierTable("Recolte", "récoltes")).toBe("recoltes.csv")
   })
 })

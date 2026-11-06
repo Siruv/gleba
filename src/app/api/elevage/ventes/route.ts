@@ -1,3 +1,4 @@
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
 /**
  * API Ventes de produits
  * GET /api/elevage/ventes - Liste des ventes
@@ -8,12 +9,29 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { enrichirVentesElevageReglements } from '@/lib/comptabilite/projection-reglements'
+import { Prisma, type VenteProduit } from '@prisma/client'
 import { lireAnnee } from '@/lib/api/annee'
-import { StockFromageError, verrouillerEtVerifierStockFromage } from '@/lib/elevage/stock-fromage'
+import {
+  StockFromageError,
+  recalerEtatLotFromage,
+  refusStockFromage,
+  stockDuLotFromage,
+  verrouillerEtVerifierStockFromage,
+} from '@/lib/elevage/stock-fromage'
+import { sortieCaveDepuisVente } from '@/lib/elevage/cave-fromage'
 import { createVenteFromVenteProduit, deleteAutoEntry } from '@/lib/auto-compta'
 import { creerFacture, annulerFactureLiee } from '@/lib/facture-utils'
 import { venteProduitSchema, venteProduitTypeSchema } from '@/lib/validations/elevage-vente'
+import { modeReglementSchema, modePaiementDepuisReglement } from '@/lib/validations/reglement'
+import { chargerSuiviDesSources, cleSource } from '@/lib/comptabilite/suivi-ecriture'
+import { ReglementVenteError } from '@/lib/comptabilite/reglement-vente'
+import { cleSourceReglement } from '@/lib/comptabilite/cle-reglement'
+import { verifierPointageDetaille } from '@/lib/comptabilite/suivi-reglement-source'
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
 import { invalidateKpi } from '@/lib/kpi'
+import { ErreurElevage } from '@/lib/elevage/erreurs'
+import { corpsLaitIndisponible, estVenteEnLitres, jourParis, verifierDisponibiliteLait } from '@/lib/elevage/bilan-lait'
 import {
   StockOeufsVenteError,
   supprimerStockOeufsVente,
@@ -42,13 +60,14 @@ export async function GET(request: NextRequest) {
     // Revue 2026-09-28 : `annee=all` pour la liste de gestion d'un historique.
     const { annee, bornes } = lireAnnee(searchParams)
 
-    const where: any = { userId: session.user.id, annule: { not: true } }
+    const where: Prisma.VenteProduitWhereInput = { userId: session.user.id, annule: { not: true } }
     if (bornes) where.date = { ...bornes }
     if (type) where.type = type
     if (dateDebut || dateFin) {
-      where.date = where.date ?? {}
-      if (dateDebut) where.date.gte = new Date(dateDebut)
-      if (dateFin) where.date.lte = new Date(dateFin)
+      const date: Prisma.DateTimeFilter = { ...bornes }
+      if (dateDebut) date.gte = new Date(dateDebut)
+      if (dateFin) date.lte = new Date(dateFin)
+      where.date = date
     }
     // Filtre par statut de paiement
     const payeParam = searchParams.get('paye')
@@ -74,27 +93,37 @@ export async function GET(request: NextRequest) {
 
     // Stats par type
     const statsParType = await prisma.venteProduit.groupBy({
-      by: ['type'],
+      by: ['type', 'unite'],
       where,
       _sum: { prixTotal: true, quantite: true },
       _count: true,
     })
 
+    const suivi = await chargerSuiviDesSources(session.user.id, {
+      sources: ventes.filter((v) => !v.factureId).map((v) => ({ sourceType: 'vente_produit', sourceId: v.id })),
+    })
+    const parType = new Map<string, { type: string; total: number; count: number; quantiteParUnite: Record<string, number> }>()
+    for (const s of statsParType) {
+      const ligne = parType.get(s.type) ?? { type: s.type, total: 0, count: 0, quantiteParUnite: {} }
+      ligne.total += s._sum.prixTotal ?? 0
+      ligne.count += s._count
+      ligne.quantiteParUnite[s.unite] = (ligne.quantiteParUnite[s.unite] ?? 0) + (s._sum.quantite ?? 0)
+      parType.set(s.type, ligne)
+    }
     return NextResponse.json({
-      data: ventes,
+      data: (await enrichirVentesElevageReglements(session.user.id, ventes)).map((v) => ({ ...v, modeReglement: suivi.parSource.get(cleSource('vente_produit', v.id))?.suivi.modeReglement ?? null })),
       stats: {
         totalVentes: stats._sum.prixTotal || 0,
         nbVentes: stats._count,
-        parType: statsParType.map(s => ({
-          type: s.type,
-          total: s._sum.prixTotal || 0,
-          quantite: s._sum.quantite || 0,
-          count: s._count,
-        })),
+        parType: [...parType.values()].map((s) => {
+          const unites = Object.keys(s.quantiteParUnite)
+          return { ...s, quantite: unites.length === 1 ? s.quantiteParUnite[unites[0]] : null, unite: unites.length === 1 ? unites[0] : null }
+        }),
       },
       meta: { year: annee, total: ventes.length },
     })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('GET /api/elevage/ventes error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la récupération', details: "Erreur interne du serveur" },
@@ -167,13 +196,22 @@ export async function POST(request: NextRequest) {
     // Review caprin 2026-07-21 — vente de fromage : une action unique doit
     // décrémenter le stock de cave ET enregistrer la recette ET tracer le lot.
     // On valide l'appartenance du lot + le stock disponible AVANT la transaction.
-    // La sortie de cave est dérivée de l'unité de vente : kg → poids, sinon pièces.
+    // La sortie de cave est dérivée de l'unité de vente (`sortieCaveDepuisVente`,
+    // règle partagée avec la valorisation de la cave) : kg ou g → poids, pièce
+    // ou unité → pièces ; toute autre unité est refusée en nommant le champ.
     let fromageSortie: { lotFromageId: string; nbPieces: number; poidsKg: number } | null = null
     if (type === 'fromage') {
       const lotFromageId = parsed.data.lotFromageId
       if (!lotFromageId) {
         return NextResponse.json(
           { error: 'Pour une vente de fromage, sélectionnez le lot de fabrication (traçabilité + stock de cave).' },
+          { status: 400 }
+        )
+      }
+      const sortie = sortieCaveDepuisVente(quantite, unite)
+      if (!sortie.ok) {
+        return NextResponse.json(
+          { error: sortie.message, details: { fieldErrors: { [sortie.champ]: [sortie.message] } } },
           { status: 400 }
         )
       }
@@ -184,27 +222,11 @@ export async function POST(request: NextRequest) {
       if (!lot) {
         return NextResponse.json({ error: 'Lot de fromage introuvable dans votre cave.' }, { status: 400 })
       }
-      const enKg = (unite || '').toLowerCase().startsWith('kg')
-      const nbPieces = enKg ? 0 : Math.round(quantite)
-      const poidsKg = enKg ? quantite : 0
-
-      const dejaSortiPieces = lot.mouvements.reduce((s, m) => s + m.nbPieces, 0)
-      const dejaSortiKg = lot.mouvements.reduce((s, m) => s + (Number(m.poidsKg) || 0), 0)
-      const restantPieces = lot.nbPieces - dejaSortiPieces
-      const restantKg = Number(lot.poidsTotalKg) - dejaSortiKg
-      if (nbPieces > restantPieces) {
-        return NextResponse.json(
-          { error: `Stock insuffisant : ${restantPieces} pièce(s) en cave, ${nbPieces} vendue(s).` },
-          { status: 409 }
-        )
+      const refus = refusStockFromage(stockDuLotFromage(lot), sortie.nbPieces, sortie.poidsKg)
+      if (refus) {
+        return NextResponse.json({ error: refus }, { status: 409 })
       }
-      if (poidsKg > restantKg + 1e-6) {
-        return NextResponse.json(
-          { error: `Stock insuffisant : ${Math.max(0, Math.round(restantKg * 1000) / 1000)} kg en cave, ${poidsKg} vendu(s).` },
-          { status: 409 }
-        )
-      }
-      fromageSortie = { lotFromageId, nbPieces, poidsKg }
+      fromageSortie = { lotFromageId, nbPieces: sortie.nbPieces, poidsKg: sortie.poidsKg }
     }
 
     // Bug cmp8rzcjc (Marc 2026-05-16) — pour une vente d'animal vivant,
@@ -213,6 +235,9 @@ export async function POST(request: NextRequest) {
     // alors qu'aucun animal ne s'appelle Clochette). On laisse les autres
     // types (oeufs/viande/lait/autre) passer sans contrainte animal.
     if (type === 'animal_vivant') {
+      if (quantite !== 1) {
+        return NextResponse.json({ error: 'Une vente individuelle porte sur un seul animal.' }, { status: 400 })
+      }
       if (!parsed.data.animalId) {
         return NextResponse.json(
           { error: 'Pour une vente d\'animal vivant, sélectionnez un animal du cheptel.' },
@@ -251,7 +276,25 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    // Bilan matière du lait (2026-11-03) : une vente de lait cru qui dépasse
+    // le lait collecté sur 7 jours demande confirmation (422 confirmable).
+    // Contrôle indicatif, hors transaction : il ne réserve aucun litre.
+    if (type === 'lait' && estVenteEnLitres(unite) && parsed.data.confirmerLaitIndisponible !== true) {
+      const alerte = await verifierDisponibiliteLait(prisma, session.user.id, {
+        ajout: [{ jour: jourParis(date || new Date()), poste: 'venduCru', litres: quantite }],
+      })
+      if (alerte) return NextResponse.json(corpsLaitIndisponible(alerte), { status: 422 })
+    }
+
     const result = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session.user.id)
+      if (type === 'animal_vivant' && parsed.data.animalId) {
+        await tx.$queryRaw`SELECT id FROM animaux WHERE id = ${parsed.data.animalId} AND user_id = ${session.user.id} FOR UPDATE`
+        const animal = await tx.animal.findFirst({ where: { id: parsed.data.animalId, userId: session.user.id } })
+        if (!animal || animal.statut !== 'actif') {
+          throw new ErreurElevage("Cet animal n'est plus disponible à la vente. Rechargez le cheptel.")
+        }
+      }
       // Contrôle autoritatif sous verrou : le pré-contrôle ci-dessus améliore le
       // message, celui-ci empêche deux requêtes concurrentes de sur-vendre.
       if (fromageSortie) {
@@ -327,8 +370,8 @@ export async function POST(request: NextRequest) {
       }
 
       // Vente de fromage : sortie de cave liée (décrément de stock) + passage
-      // du lot à 'ecoule' dès qu'une des deux dimensions (pièces OU kg) est
-      // épuisée — même logique que POST /mouvements-fromage.
+      // du lot à 'ecoule' dès qu'il n'a plus de pièce en cave — même règle que
+      // POST /mouvements-fromage (`recalerEtatLotFromage`).
       if (fromageSortie) {
         await tx.mouvementFromage.create({
           data: {
@@ -342,20 +385,7 @@ export async function POST(request: NextRequest) {
             notes: client ? `Vente ${client}` : null,
           },
         })
-        const lot = await tx.lotFromage.findUnique({
-          where: { id: fromageSortie.lotFromageId },
-          include: { mouvements: { select: { nbPieces: true, poidsKg: true } } },
-        })
-        if (lot) {
-          const sortiesPieces = lot.mouvements.reduce((s, m) => s + m.nbPieces, 0)
-          const sortiesKg = lot.mouvements.reduce((s, m) => s + (Number(m.poidsKg) || 0), 0)
-          if (
-            lot.etat !== 'ecoule' &&
-            (sortiesPieces >= lot.nbPieces || sortiesKg >= Number(lot.poidsTotalKg) - 1e-6)
-          ) {
-            await tx.lotFromage.update({ where: { id: lot.id }, data: { etat: 'ecoule' } })
-          }
-        }
+        await recalerEtatLotFromage(tx, session.user.id, fromageSortie.lotFromageId, 'sortie')
       }
 
       await createVenteFromVenteProduit(session.user.id, {
@@ -370,6 +400,7 @@ export async function POST(request: NextRequest) {
         date: vente.date,
         tauxTVA: vente.tauxTVA,
         paye: vente.paye,
+        modeReglement: parsed.data.modeReglement,
       }, tx)
 
       return vente
@@ -407,6 +438,8 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ data: result, warning }, { status: 201 })
   } catch (error) {
+    if (error instanceof ErreurElevage) return NextResponse.json({ error: error.message }, { status: error.status })
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     if (error instanceof StockOeufsVenteError) {
       return NextResponse.json({ error: error.message }, { status: error.status })
     }
@@ -452,9 +485,13 @@ export async function DELETE(request: NextRequest) {
     // rendre l'animal au cheptel (il restait 'vendu' définitivement).
     // On ne restaure que si l'animal est toujours en statut 'vendu'.
     const annulation = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session.user.id)
+      await tx.$queryRaw`SELECT id FROM ventes_produits WHERE id = ${existing.id} AND user_id = ${session.user.id} FOR UPDATE`
+      const courante = await tx.venteProduit.findFirst({ where: { id: existing.id, userId: session.user.id } })
+      if (!courante || courante.annule) throw new ErreurElevage('Vente déjà annulée ou introuvable. Rechargez la liste.')
       // Symétrie annulation ↔ facture + miroir dans la même transaction.
-      if (existing.factureId) {
-        const liee = await annulerFactureLiee(tx, session.user.id, existing.factureId)
+      if (courante.factureId) {
+        const liee = await annulerFactureLiee(tx, session.user.id, courante.factureId)
         if (!liee.ok) return liee
       }
       await deleteAutoEntry('vente_produit', existing.id, 'vente', session.user.id, tx)
@@ -464,16 +501,16 @@ export async function DELETE(request: NextRequest) {
         where: { id: existing.id },
         data: { annule: true, dateAnnulation: new Date() },
       })
-      if (existing.type === 'oeufs') {
+      if (courante.type === 'oeufs') {
         await supprimerStockOeufsVente(tx, session.user.id, existing.id)
       }
-      if (estVenteProduitRuche(existing.type)) {
+      if (estVenteProduitRuche(courante.type)) {
         await supprimerStockRucheVente(tx, session.user.id, existing.id)
       }
 
-      if (existing.type === 'animal_vivant' && existing.animalId) {
+      if (courante.type === 'animal_vivant' && courante.animalId) {
         await tx.animal.updateMany({
-          where: { id: existing.animalId, userId: session.user.id, statut: 'vendu' },
+          where: { id: courante.animalId, userId: session.user.id, statut: 'vendu' },
           data: { statut: 'actif', dateSortie: null, causeSortie: null },
         })
       }
@@ -481,21 +518,11 @@ export async function DELETE(request: NextRequest) {
       // Vente de fromage annulée : supprimer la (les) sortie(s) de cave liée(s)
       // pour restaurer le stock, puis recalculer l'état du lot (un lot passé à
       // 'ecoule' par cette vente redevient 'pret' s'il reste du stock).
-      if (existing.type === 'fromage' && existing.lotFromageId) {
+      if (courante.type === 'fromage' && courante.lotFromageId) {
         await tx.mouvementFromage.deleteMany({
           where: { venteProduitId: existing.id, userId: session.user.id },
         })
-        const lot = await tx.lotFromage.findUnique({
-          where: { id: existing.lotFromageId },
-          include: { mouvements: { select: { nbPieces: true, poidsKg: true } } },
-        })
-        if (lot && lot.etat === 'ecoule') {
-          const sortiesPieces = lot.mouvements.reduce((s, m) => s + m.nbPieces, 0)
-          const sortiesKg = lot.mouvements.reduce((s, m) => s + (Number(m.poidsKg) || 0), 0)
-          if (sortiesPieces < lot.nbPieces && sortiesKg < Number(lot.poidsTotalKg) - 1e-6) {
-            await tx.lotFromage.update({ where: { id: lot.id }, data: { etat: 'pret' } })
-          }
-        }
+        await recalerEtatLotFromage(tx, session.user.id, courante.lotFromageId, 'retour')
       }
       return { ok: true as const }
     })
@@ -506,6 +533,8 @@ export async function DELETE(request: NextRequest) {
 
     return NextResponse.json({ success: true })
   } catch (error) {
+    if (error instanceof ErreurElevage) return NextResponse.json({ error: error.message }, { status: error.status })
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     if (error instanceof StockOeufsVenteError) {
       return NextResponse.json({ error: error.message }, { status: error.status })
     }
@@ -527,6 +556,11 @@ export async function PATCH(request: NextRequest) {
   try {
     const body = await request.json()
     const { id, paye, client, notes } = body
+
+    const mode = modeReglementSchema.safeParse(body.modeReglement)
+    if (!mode.success || (paye !== undefined && typeof paye !== 'boolean')) {
+      return NextResponse.json({ error: 'Règlement invalide' }, { status: 400 })
+    }
 
     if (!id) {
       return NextResponse.json({ error: 'ID requis' }, { status: 400 })
@@ -567,7 +601,9 @@ export async function PATCH(request: NextRequest) {
       }
     }
 
-    const updateData: any = {}
+    // Les champs sont relus (recalcul du total, facture sur les valeurs
+    // finales) : valeurs scalaires du modèle, pas des opérations Prisma.
+    const updateData: Partial<VenteProduit> = {}
     if (paye !== undefined) updateData.paye = paye
     if (client !== undefined) updateData.client = client
     if (notes !== undefined) updateData.notes = notes
@@ -575,13 +611,20 @@ export async function PATCH(request: NextRequest) {
     // Audit 2026-07 (#15) : le PATCH ignorait date, type, quantité, prix,
     // unité et description — l'édition affichait un succès mais ne changeait
     // rien (CA/TVA/écriture auto calculés sur l'ancien prix). On les persiste.
-    if (body.date !== undefined) updateData.date = new Date(body.date)
+    if (body.date !== undefined) {
+      const date = new Date(body.date)
+      if (!Number.isFinite(date.getTime())) return NextResponse.json({ error: 'Date invalide' }, { status: 400 })
+      updateData.date = date
+    }
     if (body.type !== undefined) {
       const typeParse = venteProduitTypeSchema.safeParse(body.type)
       if (!typeParse.success) {
         return NextResponse.json({ error: 'Type de vente invalide' }, { status: 400 })
       }
       updateData.type = typeParse.data
+      if (typeParse.data !== existing.type) {
+        return NextResponse.json({ error: 'Pour changer le type de produit, annulez cette vente puis saisissez une nouvelle vente.' }, { status: 409 })
+      }
       if (body.tauxTVA === undefined && typeParse.data !== existing.type) {
         updateData.tauxTVA = tauxTvaVenteProduitParDefaut(typeParse.data)
       }
@@ -590,21 +633,22 @@ export async function PATCH(request: NextRequest) {
     if (body.unite !== undefined) updateData.unite = body.unite
     if (body.quantite !== undefined) {
       const q = parseFloat(String(body.quantite))
-      if (Number.isNaN(q) || q <= 0) {
+      if (!Number.isFinite(q) || q <= 0) {
         return NextResponse.json({ error: 'Quantité invalide' }, { status: 400 })
       }
       updateData.quantite = q
     }
     if (body.prixUnitaire !== undefined) {
       const pu = parseFloat(String(body.prixUnitaire))
-      if (Number.isNaN(pu) || pu < 0) {
+      if (!Number.isFinite(pu) || pu < 0) {
         return NextResponse.json({ error: 'Prix unitaire invalide' }, { status: 400 })
       }
       updateData.prixUnitaire = pu
     }
     if (body.tauxTVA !== undefined) {
       const t = parseFloat(String(body.tauxTVA))
-      if (!Number.isNaN(t) && t >= 0 && t <= 100) updateData.tauxTVA = t
+      if (!Number.isFinite(t) || t < 0 || t > 100) return NextResponse.json({ error: 'TVA invalide' }, { status: 400 })
+      updateData.tauxTVA = t
     }
     // Recalcul du total si quantité ou prix unitaire changent.
     if (updateData.quantite !== undefined || updateData.prixUnitaire !== undefined) {
@@ -616,16 +660,47 @@ export async function PATCH(request: NextRequest) {
     // Ticket cms1vqsqu — exception : cession gratuite (convention notes
     // préfixées « [Cession gratuite] », il n'y a rien à encaisser).
     const payeFinal = updateData.paye ?? existing.paye
+    if (existing.factureId) {
+      const modifies = Object.entries(updateData).some(([champ, valeur]) => {
+        if (champ === 'notes') return false
+        const avant = existing[champ as keyof VenteProduit]
+        return valeur instanceof Date && avant instanceof Date ? valeur.getTime() !== avant.getTime() : valeur !== avant
+      })
+      if (modifies || body.modeReglement !== undefined) {
+        return NextResponse.json({ error: 'Cette vente est facturée. Suivez son règlement dans Factures ; une correction des montants passe par un avoir.', factureId: existing.factureId }, { status: 409 })
+      }
+    }
     const prixTotalFinal = updateData.prixTotal ?? existing.prixTotal
     const notesFinales = String((updateData.notes ?? existing.notes) ?? '')
     if (payeFinal === true && prixTotalFinal === 0 && !notesFinales.startsWith('[Cession gratuite]')) {
       return NextResponse.json(
-        { error: 'Une vente "Payé" ne peut pas être à 0 € — décochez "Payé" ou saisissez un prix.' },
+        { error: 'Une vente payée ne peut pas être à 0 € : décochez « Vente payée » ou saisissez un prix.' },
         { status: 400 }
       )
     }
 
     const userId = session.user.id
+
+    // Bilan matière du lait (2026-11-03) : une correction qui change le volume,
+    // l'unité ou le jour d'une vente de lait cru est recontrôlée, la vente
+    // corrigée étant retirée de l'état d'arrivée. Réduire n'alerte jamais.
+    if (existing.type === 'lait' && body.confirmerLaitIndisponible !== true) {
+      const dateFinale = updateData.date ?? existing.date
+      const quantiteFinale = updateData.quantite ?? existing.quantite
+      const uniteFinale = updateData.unite ?? existing.unite
+      const change = dateFinale.getTime() !== existing.date.getTime()
+        || quantiteFinale !== existing.quantite
+        || uniteFinale !== existing.unite
+      if (change && estVenteEnLitres(uniteFinale)) {
+        const source = `vente:${existing.id}`
+        const alerte = await verifierDisponibiliteLait(prisma, userId, {
+          ajout: [{ jour: jourParis(dateFinale), poste: 'venduCru', litres: quantiteFinale, source }],
+          retirerSource: source,
+          jours: [jourParis(existing.date)],
+        })
+        if (alerte) return NextResponse.json(corpsLaitIndisponible(alerte), { status: 422 })
+      }
+    }
 
     // Anti-double-facture : une vente déjà facturée ne peut pas générer
     // une seconde facture (l'ancienne resterait comptée dans KPI/TVA/FEC).
@@ -636,8 +711,37 @@ export async function PATCH(request: NextRequest) {
       )
     }
 
+    // Revue 2026-10-19, refus muet corrigé le 2026-10-23 — `creerFacture`
+    // ignorait en silence la fiche d'un autre compte (ou disparue) : la facture
+    // partait sans client, SIRET ni exonération, et la réponse disait « OK ».
+    // Même contrôle que les PATCH de récolte et de bois, avant la transaction.
+    if (body.creerFacture && (updateData.prixTotal ?? existing.prixTotal) && body.clientId != null && body.clientId !== '') {
+      const clientIdFacture = Number(body.clientId)
+      const clientOk = Number.isInteger(clientIdFacture)
+        ? await prisma.client.findFirst({ where: { id: clientIdFacture, userId }, select: { id: true } })
+        : null
+      if (!clientOk) {
+        return NextResponse.json({ error: 'Client introuvable', champ: 'clientId' }, { status: 400 })
+      }
+      body.clientId = clientIdFacture
+    }
+
     // Transaction atomique : facture + update vente
     const vente = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session.user.id)
+      await tx.$queryRaw`SELECT id FROM ventes_produits WHERE id = ${existing.id} AND user_id = ${userId} FOR UPDATE`
+      const courante = await tx.venteProduit.findFirst({ where: { id: existing.id, userId } })
+      const aChange = !courante || Object.entries(existing).some(([champ, avant]) => {
+        const apres = courante[champ as keyof VenteProduit]
+        return avant instanceof Date && apres instanceof Date ? avant.getTime() !== apres.getTime() : avant !== apres
+      })
+      if (aChange) {
+        throw new ReglementVenteError('Cette vente a changé. Rechargez la liste avant de la modifier.')
+      }
+      if (!courante.factureId) {
+        const projection = await verifierPointageDetaille(tx, userId, cleSourceReglement('vente', 'vente_produit', courante.id), updateData.prixTotal ?? courante.prixTotal, typeof updateData.paye === 'boolean' ? updateData.paye : undefined)
+        Object.assign(updateData, projection)
+      }
       // Revue élevage 2026-07-21 — la facture était construite sur les ANCIENNES
       // valeurs (existing.*) même quand le même PATCH modifiait prix/quantité →
       // document légal ≠ vente ≠ compta. On facture sur les valeurs FINALES.
@@ -660,7 +764,7 @@ export async function PATCH(request: NextRequest) {
           // POSTREVIEW — Toujours 'facture' (la sémantique métier est dans objet/sourceType)
           type: 'facture',
           clientId: body.clientId || null,
-          clientNom: existing.client || undefined,
+          clientNom: (updateData.client !== undefined ? updateData.client : existing.client) || undefined,
           date: dateF,
           objet: `Vente de ${typeF} - ${descF || ''}`,
           totalHT,
@@ -668,7 +772,7 @@ export async function PATCH(request: NextRequest) {
           totalTTC: totalFinal,
           statut: payeFinal ? 'payee' : 'emise',
           datePaiement: payeFinal ? new Date() : null,
-          modePaiement: body.modePaiement || 'especes',
+          modePaiement: body.modePaiement || modePaiementDepuisReglement(mode.data !== undefined ? mode.data : (await tx.venteManuelle.findFirst({ where: { userId, auto: true, sourceType: 'vente_produit', sourceId: existing.id }, select: { modeReglement: true } }))?.modeReglement),
           lignes: [{
             description: `${typeF} - ${descF || ''}`,
             quantite: qteF,
@@ -727,6 +831,7 @@ export async function PATCH(request: NextRequest) {
         tauxTVA: updated.tauxTVA,
         factureId: updated.factureId,
         paye: updated.paye,
+        modeReglement: mode.data,
       }, tx)
       return updated
     })
@@ -734,6 +839,8 @@ export async function PATCH(request: NextRequest) {
 
     return NextResponse.json({ data: vente })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
+    if (error instanceof ReglementVenteError) return NextResponse.json({ error: error.message }, { status: 409 })
     if (error instanceof StockOeufsVenteError) {
       return NextResponse.json({ error: error.message }, { status: error.status })
     }

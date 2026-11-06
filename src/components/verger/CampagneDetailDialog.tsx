@@ -26,10 +26,8 @@ import {
   Check,
   TreeDeciduous,
   CalendarClock,
-  Eye,
   Plus,
   Trash2,
-  Sprout,
   Edit2,
   Save,
   X,
@@ -39,6 +37,8 @@ import Link from "next/link"
 import { useToast } from "@/hooks/use-toast"
 import { getAidesByType, NIVEAU_LIBELLE } from "@/data/aides-plantation"
 import { nomEssenceCampagne } from "@/lib/verger/essence-campagne"
+import { libelleVolumeBois } from "@/lib/verger/production-bois"
+import { formatMontantDevise } from "@/lib/format-utils"
 
 const ETAPE_LIBELLES: Record<string, string> = {
   preparation_sol: "Préparation du sol",
@@ -417,9 +417,9 @@ export function CampagneDetailDialog({ campagneId, open, onOpenChange, onUpdate 
                   <Info label="Localisation" value={campagne.parcelleGeo?.nom || campagne.zoneVerger?.nom || "—"} />
                   <Info label="Protection" value={campagne.protectionType || "—"} />
                   <Info label="Objectifs" value={campagne.objectifs || "—"} />
-                  <Info label="Budget prévu" value={campagne.budgetPrevu ? `${campagne.budgetPrevu.toFixed(2)} €` : "—"} />
-                  <Info label="Coût réel" value={campagne.coutReel ? `${campagne.coutReel.toFixed(2)} €` : "—"} />
-                  <Info label="Aides perçues" value={campagne.montantAides ? `${campagne.montantAides.toFixed(2)} €` : "—"} />
+                  <Info label="Budget prévu" value={campagne.budgetPrevu ? formatMontantDevise(campagne.budgetPrevu) : "—"} />
+                  <Info label="Coût réel" value={campagne.coutReel ? formatMontantDevise(campagne.coutReel) : "—"} />
+                  <Info label="Aides perçues" value={campagne.montantAides ? formatMontantDevise(campagne.montantAides) : "—"} />
                 </CardContent>
               </Card>
               {/* Contexte de la replantation (si applicable) */}
@@ -434,11 +434,11 @@ export function CampagneDetailDialog({ campagneId, open, onOpenChange, onUpdate 
                       <Info label="Surface initiale" value={campagne.surfacePrecedenteHa ? `${campagne.surfacePrecedenteHa} ha` : "—"} />
                       {campagne.productionBois && (
                         <div className="col-span-2 md:col-span-3">
-                          <p className="text-xs text-muted-foreground">Coupe d'origine</p>
+                          <p className="text-xs text-muted-foreground">Coupe d&apos;origine</p>
                           <p className="font-medium text-sm">
                             {new Date(campagne.productionBois.date).toLocaleDateString("fr-FR")}
                             {campagne.productionBois.arbre?.nom ? ` — ${campagne.productionBois.arbre.nom}` : ""}
-                            {campagne.productionBois.volumeM3 ? ` (${campagne.productionBois.volumeM3} m³)` : ""}
+                            {campagne.productionBois.volumeM3 ? ` (${libelleVolumeBois(campagne.productionBois.volumeM3)})` : ""}
                           </p>
                         </div>
                       )}
@@ -498,7 +498,7 @@ export function CampagneDetailDialog({ campagneId, open, onOpenChange, onUpdate 
                             {etape.dateRealisation && (
                               <span>✓ Réalisée : {new Date(etape.dateRealisation).toLocaleDateString("fr-FR")}</span>
                             )}
-                            {etape.cout != null && <span>{etape.cout.toFixed(2)} €</span>}
+                            {etape.cout != null && <span>{formatMontantDevise(etape.cout)}</span>}
                           </div>
                           {/* Bug feedback testeur 2026-05-25 (cmplk4f5x) —
                               alerte quand dateRealisation < datePrevue, signe
@@ -646,7 +646,7 @@ export function CampagneDetailDialog({ campagneId, open, onOpenChange, onUpdate 
             {/* Aides */}
             <TabsContent value="aides" className="space-y-3">
               <p className="text-sm text-muted-foreground">
-                Dispositifs d'aide compatibles avec ce type de plantation.
+                Dispositifs d&apos;aide compatibles avec ce type de plantation.
               </p>
               {aides.length === 0 ? (
                 <Card><CardContent className="py-6 text-center text-muted-foreground text-sm">Aucune aide spécifique référencée pour ce type. <Link href="/verger/aides" className="underline">Voir tout le catalogue</Link></CardContent></Card>
@@ -667,7 +667,7 @@ export function CampagneDetailDialog({ campagneId, open, onOpenChange, onUpdate 
                     </Card>
                   ))}
                   <div className="text-center pt-2">
-                    <Link href="/verger/aides"><Button variant="outline" size="sm"><HelpCircle className="h-4 w-4 mr-1" />Voir tout le catalogue d'aides</Button></Link>
+                    <Link href="/verger/aides"><Button variant="outline" size="sm"><HelpCircle className="h-4 w-4 mr-1" />Voir tout le catalogue d&apos;aides</Button></Link>
                   </div>
                 </div>
               )}

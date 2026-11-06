@@ -7,9 +7,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
-import { calculerStocksNet } from '@/lib/stocks-helpers'
+import { calculerStocksNet, chargerComparaisonsStockLots } from '@/lib/stocks-helpers'
 import { visibiliteReferentiel } from '@/lib/referentiel-communaute'
 import { enregistrerStockVariete, stockVarieteSchema } from '@/lib/stocks/stock-variete'
+import { enregistrerInventaireEspece, inventaireEspeceSchema } from '@/lib/stocks/inventaire-espece'
 import { ESPECE_TYPES_MARAICHAGE, ESPECE_TYPES_VERGER } from '@/lib/validations/espece'
 
 // Ticket FB-PMWX8O — le filtre « légumes » énumérait le triplet historique en
@@ -83,13 +84,30 @@ export async function PATCH(request: NextRequest) {
         return NextResponse.json({ success: true, data: userStock })
       }
 
+      // Comptage manuel du stock de récolte d'une espèce (Stocks > Récoltes et
+      // carte « Chez moi » de la fiche espèce) : espèce visible du compte,
+      // quantité dans l'unité du stock, règle unique dans
+      // `enregistrerInventaireEspece` (revue QA du 2026-10-20).
       case 'recolte': {
-        const userStock = await prisma.userStockEspece.upsert({
-          where: { userId_especeId: { userId, especeId: id } },
-          create: { userId, especeId: id, inventaire: stock, dateInventaire: date },
-          update: { inventaire: stock, dateInventaire: date },
+        const saisie = inventaireEspeceSchema.safeParse({
+          stock: stock ?? null,
+          ...(dateStock ? { dateStock } : {}),
         })
-        return NextResponse.json({ success: true, data: userStock })
+        if (!saisie.success) {
+          const premiere = saisie.error.issues[0]
+          return NextResponse.json(
+            { error: `Stock invalide — ${premiere?.path.join('.') ?? 'stock'} : ${premiere?.message ?? ''}` },
+            { status: 400 },
+          )
+        }
+        const resultat = await enregistrerInventaireEspece(userId, String(id), saisie.data)
+        if (!resultat.ok) {
+          return NextResponse.json({ error: resultat.error }, { status: resultat.status })
+        }
+        return NextResponse.json({
+          success: true,
+          data: { ...resultat.ligne, especeId: resultat.especeId, unite: resultat.unite },
+        })
       }
 
       default:
@@ -101,7 +119,7 @@ export async function PATCH(request: NextRequest) {
   } catch (error) {
     console.error('PATCH /api/stocks error:', error)
     return NextResponse.json(
-      { error: 'Erreur lors de la mise a jour du stock', details: "Erreur interne du serveur" },
+      { error: 'Erreur lors de la mise à jour du stock', details: "Erreur interne du serveur" },
       { status: 500 }
     )
   }
@@ -276,6 +294,12 @@ export async function GET(request: NextRequest) {
       // inventaire brut (qui n'est plus incrémenté à chaque récolte). Sans ça
       // l'écran afficherait vide pour les espèces sans comptage manuel.
       const nets = await calculerStocksNet(userId)
+      // Ticket cmvnpe6ip — l'écran Récoltes > Stock compare ses lots à ce
+      // stock, espèce par espèce, sans supposer la cause de l'écart.
+      const comparaisons = await chargerComparaisonsStockLots(
+        userId,
+        Object.fromEntries(especes.filter(e => nets[e.id]).map(e => [e.id, nets[e.id]])),
+      )
       return NextResponse.json({
         data: especes.map(e => ({
           id: e.id,
@@ -287,6 +311,7 @@ export async function GET(request: NextRequest) {
           autresUnites: nets[e.id]?.autresUnites ?? {},
           dateInventaire: e.userStocks[0]?.dateInventaire ?? null,
           couleur: e.couleur,
+          comparaisonLots: comparaisons[e.id] ?? null,
         })),
       })
     }
@@ -356,7 +381,7 @@ export async function GET(request: NextRequest) {
   } catch (error) {
     console.error('GET /api/stocks error:', error)
     return NextResponse.json(
-      { error: 'Erreur lors de la recuperation des stocks', details: "Erreur interne du serveur" },
+      { error: 'Erreur lors de la récupération des stocks', details: "Erreur interne du serveur" },
       { status: 500 }
     )
   }

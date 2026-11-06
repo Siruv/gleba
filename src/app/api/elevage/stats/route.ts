@@ -4,14 +4,22 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server'
+import { finJourLivraison } from '@/lib/commercial/dates-stock'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
-import { whereSoinAnimalPresent } from '@/lib/elevage/soins-a-faire'
 import { calculerStockOeufs } from '@/lib/stocks-helpers'
 import { computeStockOeufsParLots } from '@/lib/elevage/stock-oeufs-lots'
-import { tauxPonteSaisonnalise } from '@/lib/lait'
+import { chargerBilanLait, decalerJour, jourParis } from '@/lib/elevage/bilan-lait'
 import { fenetrePonteGlissante, tauxPonteAttenduPeriode } from '@/lib/elevage/taux-ponte'
 import { reconstituerEffectifsLots } from '@/lib/elevage/effectif'
+import {
+  ageEntreePonteJours,
+  calculerTetesNonPondeuses,
+  effectifPondeuses,
+  nominatifPondeur,
+  SELECT_NOMINATIF_PONDEUR_HORS_LOT,
+  whereNominatifsPondeursHorsLot,
+} from '@/lib/elevage/pondeuses'
 import {
   aUneActiviteOeufsDashboard,
   agregerProductionsLaitieresDashboard,
@@ -25,13 +33,18 @@ export async function GET(request: NextRequest) {
 
   try {
     const { searchParams } = new URL(request.url)
-    const annee = parseInt(searchParams.get('annee') || new Date().getFullYear().toString())
+    const anneeBrute = searchParams.get('annee') || String(new Date().getFullYear())
+    const annee = Number(anneeBrute)
+    if (!/^\d{4}$/.test(anneeBrute) || annee < 2000 || annee > 2200) return NextResponse.json({ error: 'Année invalide' }, { status: 400 })
 
     const userId = session.user.id
     const startOfYear = new Date(annee, 0, 1)
-    const endOfYear = new Date(annee, 11, 31, 23, 59, 59)
+    const endOfYear = new Date(annee, 11, 31, 23, 59, 59, 999)
     const startOfPrevYear = new Date(annee - 1, 0, 1)
-    const endOfPrevYear = new Date(annee - 1, 11, 31, 23, 59, 59)
+    const endOfPrevYear = new Date(annee - 1, 11, 31, 23, 59, 59, 999)
+    const finProduction = finJourLivraison(new Date())
+    const finProductionAnnee = new Date(Math.min(endOfYear.getTime(), finProduction.getTime()))
+    const finProductionAnneePrecedente = new Date(Math.min(endOfPrevYear.getTime(), finProduction.getTime()))
 
     // Lots de ponte : une seule lecture, partagée par le stock physique et les
     // statuts (commercialisables, bloqués véto).
@@ -50,14 +63,12 @@ export async function GET(request: NextRequest) {
       ventesAnneePrecedente,
       ventesParCategorie,
       abattagesAnnee,
-      soinsAPlanifier,
       alimentsStockBas,
       stockOeufs,
       stockOeufsLots,
       mortaliteAnnee,
-      animauxPondeursActifs,
+      nominatifsPondeursHorsLot,
       lotsPondeusesDetail,
-      lotsParType,
       totalConsommationAliments,
     ] = await Promise.all([
       // Animaux actifs
@@ -65,11 +76,11 @@ export async function GET(request: NextRequest) {
         where: { userId, statut: 'actif' },
       }),
 
-      // QA caprin cms1v227a — fiches actives SANS lot : les fiches rattachées
-      // à un lot sont déjà comprises dans l'effectif calculé des lots
-      // (reconstituerEffectifsLots), les additionner double-compterait.
+      // Comme le stock de cheptel : seules les fiches d'un lot ACTIF sont
+      // déjà comprises dans l'effectif de ce lot. Une fiche restée active
+      // dans un lot terminé reste une tête présente.
       prisma.animal.count({
-        where: { userId, statut: 'actif', lotId: null },
+        where: { userId, statut: 'actif', OR: [{ lotId: null }, { lot: { statut: { not: 'actif' } } }] },
       }),
 
       // Animaux par type d'espece — individuels uniquement à ce stade,
@@ -85,14 +96,14 @@ export async function GET(request: NextRequest) {
       // non décrémentés, cf. bug cmpmr3837). Voir reconstituerEffectifsLots.
       prisma.lotAnimaux.findMany({
         where: { userId, statut: 'actif' },
-        select: { id: true, quantiteInitiale: true, quantiteActuelle: true },
+        select: { id: true, especeAnimaleId: true, quantiteInitiale: true, quantiteActuelle: true },
       }),
 
       // Production œufs annee
       prisma.productionOeuf.aggregate({
         where: {
           userId,
-          date: { gte: startOfYear, lte: endOfYear },
+          date: { gte: startOfYear, lte: finProductionAnnee },
         },
         _sum: { quantite: true },
       }),
@@ -101,7 +112,7 @@ export async function GET(request: NextRequest) {
       prisma.productionOeuf.aggregate({
         where: {
           userId,
-          date: { gte: startOfPrevYear, lte: endOfPrevYear },
+          date: { gte: startOfPrevYear, lte: finProductionAnneePrecedente },
         },
         _sum: { quantite: true },
       }),
@@ -109,13 +120,13 @@ export async function GET(request: NextRequest) {
       // Production œufs par mois
       prisma.$queryRaw`
         SELECT
-          EXTRACT(MONTH FROM date) as mois,
+          EXTRACT(MONTH FROM date AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Paris') as mois,
           SUM(quantite) as total
         FROM production_oeufs
         WHERE user_id = ${userId}
           AND date >= ${startOfYear}
-          AND date <= ${endOfYear}
-        GROUP BY EXTRACT(MONTH FROM date)
+          AND date <= ${finProductionAnnee}
+        GROUP BY EXTRACT(MONTH FROM date AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Paris')
         ORDER BY mois
       ` as Promise<{ mois: number; total: bigint }[]>,
 
@@ -156,15 +167,10 @@ export async function GET(request: NextRequest) {
         _count: true,
       }),
 
-      // Soins à planifier (non faits), d'un animal encore présent (ticket cmv294whk)
-      prisma.soinAnimal.count({
-        where: {
-          userId,
-          fait: false,
-          datePrevue: { lte: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) }, // 30 jours
-          AND: [whereSoinAnimalPresent()],
-        },
-      }),
+      // QA 2026-10-19 — le compteur « soins à planifier » ne vit plus ici : il
+      // comptait les retards parmi les soins « prévus dans les 30 prochains
+      // jours ». La tuile lit `stats.echeancesSoins` de `/api/elevage/taches`,
+      // calculé sur les lignes mêmes de la liste « Soins à faire ».
 
       // Aliments en stock bas (via UserStockAliment per-user)
       prisma.userStockAliment.count({
@@ -208,13 +214,12 @@ export async function GET(request: NextRequest) {
         },
       }),
 
-      // Animaux individuels rattachés à un atelier œufs actif.
-      prisma.animal.count({
-        where: {
-          userId,
-          statut: 'actif',
-          especeAnimale: { production: { in: ['oeufs', 'mixte'] } },
-        },
+      // Les pondeuses suivies individuellement hors lot actif ne sont pas
+      // dans l'effectif reconstitué des lots. Même règle d'âge et de sexe,
+      // même lecture que l'assistant (`whereNominatifsPondeursHorsLot`).
+      prisma.animal.findMany({
+        where: whereNominatifsPondeursHorsLot(userId),
+        select: SELECT_NOMINATIF_PONDEUR_HORS_LOT,
       }),
 
       // BUG #5 — Lots pondeuses détaillés (espèce + effectif) pour le
@@ -231,19 +236,8 @@ export async function GET(request: NextRequest) {
           id: true,
           quantiteInitiale: true,
           quantiteActuelle: true,
-          especeAnimale: { select: { nom: true } },
+          especeAnimale: { select: { nom: true, dureeElevage: true } },
         },
-      }),
-
-      // BUG #7 — Lots actifs groupés par espèce pour merger dans
-      // `animauxParType` (PieChart « Répartition par espèce »). Avant,
-      // seuls les animaux individuels étaient comptés, donc l'éleveur
-      // qui gérait son troupeau exclusivement en LotAnimaux voyait un
-      // PieChart vide.
-      prisma.lotAnimaux.groupBy({
-        by: ['especeAnimaleId'],
-        where: { userId, statut: 'actif' },
-        _sum: { quantiteActuelle: true },
       }),
 
       // Total consommation aliments annee (kg)
@@ -256,13 +250,21 @@ export async function GET(request: NextRequest) {
       }),
     ])
 
+    // QA cmsp5lzye — l'effectif des pondeuses lisait `quantiteActuelle` brut
+    // alors que l'écran Lots affiche l'effectif reconstitué (fiches nominatives
+    // rattachées incluses) : « 29 pondeuses » au dénominateur du taux de ponte
+    // contre « Actuel 30 » dans les lots. Un seul appel au helper sert les
+    // usages (répartition par espèce, total en lots, pondeuses), les lots
+    // pondeurs actifs étant un sous-ensemble des lots actifs.
+    const effectifsLots = await reconstituerEffectifsLots(userId, lotsActifs)
+
     // Récupérer les noms des especes pour les stats — on inclut les ids
     // venant des LOTS aussi (BUG #7) pour ne pas perdre l'étiquette des
     // espèces présentes uniquement en lot.
     const especeIds = Array.from(
       new Set([
         ...animauxParType.map(a => a.especeAnimaleId),
-        ...lotsParType.map(l => l.especeAnimaleId),
+        ...lotsActifs.map(l => l.especeAnimaleId),
       ])
     )
     const especes = await prisma.especeAnimale.findMany({
@@ -277,8 +279,17 @@ export async function GET(request: NextRequest) {
     for (const a of animauxParType) {
       animauxParTypeMerged.set(a.especeAnimaleId, (animauxParTypeMerged.get(a.especeAnimaleId) ?? 0) + a._count)
     }
-    for (const l of lotsParType) {
-      const n = l._sum.quantiteActuelle ?? 0
+    // BUG #7 — les lots actifs entrent dans la répartition (PieChart
+    // « Répartition par espèce »), sinon un troupeau tenu en lots la laissait
+    // vide. Revue 2026-10-20 — pour leur part collective reconstituée
+    // (effectif de l'écran Lots moins les fiches rattachées, déjà comptées
+    // ci-dessus sur leur propre espèce), comme les ateliers de
+    // /api/elevage/analyse-couts, et non plus au compteur stocké
+    // `quantiteActuelle`, qui dérive (la mort d'une fiche rattachée ne le
+    // décrémente pas).
+    for (const l of lotsActifs) {
+      const e = effectifsLots.get(l.id)
+      const n = e ? e.effectifCollectif : l.quantiteActuelle
       if (n > 0) {
         animauxParTypeMerged.set(l.especeAnimaleId, (animauxParTypeMerged.get(l.especeAnimaleId) ?? 0) + n)
       }
@@ -302,18 +313,25 @@ export async function GET(request: NextRequest) {
       if (prods.some((p) => p.includes('viande'))) profil.viande = true
     }
 
-    // Métriques calculées
-    // QA cmsp5lzye — l'effectif des pondeuses lisait `quantiteActuelle` brut
-    // alors que l'écran Lots affiche l'effectif reconstitué (fiches nominatives
-    // rattachées incluses) : « 29 pondeuses » au dénominateur du taux de ponte
-    // contre « Actuel 30 » dans les lots. Un seul appel au helper sert les deux
-    // usages, les lots pondeurs actifs étant un sous-ensemble des lots actifs.
-    const effectifsLots = await reconstituerEffectifsLots(userId, lotsActifs)
+    // Métriques calculées (effectif reconstitué : `effectifsLots` plus haut).
+    // QA cmv5jfsol — les poussins nés dans le lot (et les fiches mâles ou trop
+    // jeunes) ne pondent pas : retranchés de l'effectif pondeur, donc du taux
+    // observé et de l'attendu (helper partagé avec /lots et /taches).
+    // Âge des jeunes lu à la même borne que la fenêtre de ponte plus bas :
+    // aujourd'hui pour l'année courante, fin d'année pour une année passée.
+    const referencePonte = annee === new Date().getFullYear() ? new Date() : endOfYear
+    const tetesNonPondeuses = await calculerTetesNonPondeuses(userId, lotsPondeusesDetail, referencePonte)
     const effectifLotPondeur = (lot: { id: number; quantiteActuelle: number }) =>
-      effectifsLots.get(lot.id)?.effectifCalcule ?? lot.quantiteActuelle
+      effectifPondeuses(
+        effectifsLots.get(lot.id)?.effectifCalcule ?? lot.quantiteActuelle,
+        tetesNonPondeuses.get(lot.id),
+      )
+    const pondeusesIndividuelles = nominatifsPondeursHorsLot.filter((animal) =>
+      nominatifPondeur(animal, ageEntreePonteJours(animal.especeAnimale), referencePonte),
+    )
     const nbPondeuses = lotsPondeusesDetail.reduce(
       (somme, lot) => somme + effectifLotPondeur(lot),
-      0,
+      pondeusesIndividuelles.length,
     )
     const nbOeufsAnnee = productionOeufsAnnee._sum.quantite || 0
     const nbOeufsAnneePrecedente = productionOeufsAnneePrecedente._sum.quantite || 0
@@ -322,7 +340,7 @@ export async function GET(request: NextRequest) {
     const consoAlimentsKg = totalConsommationAliments._sum.quantite || 0
     const poidsCarcasseTotal = abattagesAnnee._sum.poidsCarcasse || 0
     const activiteOeufs = aUneActiviteOeufsDashboard({
-      animauxPondeursActifs,
+      animauxPondeursActifs: nominatifsPondeursHorsLot.length,
       // Le contrat produit parle d'un lot pondeur actif, indépendamment de son
       // effectif courant. `lotsPondeusesDetail` contient aussi les lots à zéro.
       lotsPondeursActifs: lotsPondeusesDetail.length,
@@ -350,7 +368,7 @@ export async function GET(request: NextRequest) {
 
     // Taux observé sur 7 j glissants : œufs collectés / (pondeuses × jours).
     const productionOeufs7j = await prisma.productionOeuf.aggregate({
-      where: { userId, date: { gte: periodStart, lte: periodEnd } },
+      where: { userId, date: { gte: periodStart, lte: new Date(Math.min(periodEnd.getTime(), finProduction.getTime())) } },
       _sum: { quantite: true },
     })
     const nbOeufs7j = productionOeufs7j._sum.quantite || 0
@@ -367,46 +385,66 @@ export async function GET(request: NextRequest) {
       sommeAttenduPondere += q * tx
       effectifPondeur += q
     }
+    for (const animal of pondeusesIndividuelles) {
+      sommeAttenduPondere += tauxPonteAttenduPeriode(animal.especeAnimale.nom, periodStart, periodEnd)
+      effectifPondeur += 1
+    }
     const tauxPonteAttendu =
       effectifPondeur > 0 ? Math.round((sommeAttenduPondere / effectifPondeur) * 10) / 10 : null
 
     const tauxPonte = nbPondeuses > 0 ? Math.round(tauxObserve7j * 10) / 10 : null
 
     // Compat : `tauxPonteRatio` (observé / attendu) reste utile pour les
-    // anciens écrans qui comparent ratio plutôt qu'écart. On garde aussi
-    // `ponteSais` pour la rétro-compat des consommateurs API existants.
+    // anciens écrans qui comparent ratio plutôt qu'écart.
     const tauxPonteRatio =
       tauxPonte !== null && tauxPonteAttendu && tauxPonteAttendu > 0
         ? Math.round((tauxPonte / tauxPonteAttendu) * 100) / 100
         : null
-    const ponteSais = tauxPonteSaisonnalise(nbOeufsAnnee, nbPondeuses, startOfYear, periodEnd)
+
+    const animauxEnLots = Array.from(effectifsLots.values()).reduce(
+      (sum, e) => sum + e.effectifCalcule,
+      0,
+    )
+    const lotsActifsCount = lotsActifs.length
+    // QA caprin cms1v227a / cms1vcvc5 — effectif physique réel : effectif des
+    // lots (fiches rattachées incluses) + fiches hors lot. Avant : animauxActifs
+    // + animauxEnLots comptait deux fois chaque fiche rattachée à un lot
+    // (+25 % d'effectif fantôme sur la démo, faux inventaire PAC/registre).
+    const animauxRattachesLots = animauxActifs - animauxHorsLot
+    const animauxTotal = animauxHorsLot + animauxEnLots
 
     // FCR = kg aliment / kg carcasse
     const fcr = poidsCarcasseTotal > 0 ? consoAlimentsKg / poidsCarcasseTotal : null
 
-    // Taux de mortalité
+    // Taux de mortalité des FICHES : fiches mortes de l'année rapportées aux
+    // fiches (actives + ces mortes). Une perte dans un lot ne s'enregistre
+    // qu'en baissant son compteur, sans date ni nombre de morts : compter ses
+    // têtes au dénominateur seul diluait le taux (6 chèvres dont 1 morte et un
+    // lot de 100 poules : 0,9 % au lieu de 14,3 %, alerte « > 5 % » muette).
     const totalAnimauxEver = animauxActifs + mortaliteAnnee
     const tauxMortalite = totalAnimauxEver > 0
       ? (mortaliteAnnee / totalAnimauxEver) * 100
       : 0
 
     // PROMPT 17 — KPI lait
-    const [productionsLaitieres, laitNonAffecte, laitJ30] = await Promise.all([
+    const fenetreLait = fenetrePonteGlissante(new Date(), 30)
+    // Bilan matière du lait (2026-11-03) : remplace « lait sans lot de
+    // fromage », qui ignorait ventes et livraisons. 30 jours jusqu'à
+    // aujourd'hui (ou la fin de l'année demandée), comme la moyenne voisine.
+    // Jours civils de Paris, indépendants du fuseau du serveur.
+    const finBilanLait = [jourParis(new Date()), `${annee}-12-31`].sort()[0]
+    const [productionsLaitieres, bilanLait30, laitJ30] = await Promise.all([
       agregerProductionsLaitieresDashboard({
         collecteLait: { aggregate: (args) => prisma.collecteLait.aggregate(args) },
         lotFromage: { aggregate: (args) => prisma.lotFromage.aggregate(args) },
       }, userId, startOfYear, endOfYear),
+      chargerBilanLait(prisma, userId, decalerJour(finBilanLait, -29), finBilanLait),
       prisma.collecteLait.aggregate({
-        where: { userId, lotFromageId: null, ecarteAttente: false, date: { gte: startOfYear, lte: endOfYear } },
-        _sum: { quantiteLitres: true },
-      }),
-      prisma.collecteLait.aggregate({
-        where: { userId, date: { gte: new Date(Date.now() - 30 * 86_400_000) } },
+        where: { userId, date: { gte: fenetreLait.debut, lte: fenetreLait.fin } },
         _sum: { quantiteLitres: true },
       }),
     ])
     const laitTotalAnnee = productionsLaitieres.laitLitres
-    const laitNonAffecteL = Number(laitNonAffecte._sum.quantiteLitres ?? 0)
     const laitJ30L = Number(laitJ30._sum.quantiteLitres ?? 0)
     const laitMoyenJourJ30 = Math.round((laitJ30L / 30) * 100) / 100
     const productions = construireProductionsDashboard({
@@ -424,17 +462,7 @@ export async function GET(request: NextRequest) {
     // contenaient 63 bêtes). Désormais on expose les deux compteurs et le
     // total cheptel pour que l'UI puisse afficher « 69 animaux · 6 individus
     // · 63 en lots (3 lots) ».
-    const animauxEnLots = Array.from(effectifsLots.values()).reduce(
-      (sum, e) => sum + e.effectifCalcule,
-      0,
-    )
-    const lotsActifsCount = lotsActifs.length
-    // QA caprin cms1v227a / cms1vcvc5 — effectif physique réel : effectif des
-    // lots (fiches rattachées incluses) + fiches hors lot. Avant : animauxActifs
-    // + animauxEnLots comptait deux fois chaque fiche rattachée à un lot
-    // (+25 % d'effectif fantôme sur la démo, faux inventaire PAC/registre).
-    const animauxRattachesLots = animauxActifs - animauxHorsLot
-    const animauxTotal = animauxHorsLot + animauxEnLots
+
 
     return NextResponse.json({
       stats: {
@@ -451,7 +479,6 @@ export async function GET(request: NextRequest) {
         nbVentes: ventesAnnee._count,
         abattagesAnnee: abattagesAnnee._sum.quantite || 0,
         poidsCarcasseAnnee: poidsCarcasseTotal,
-        soinsAPlanifier,
         alimentsStockBas,
         stockOeufs: stockOeufs.stockNet,
         stockOeufsDetail: stockOeufs.detail,
@@ -474,13 +501,13 @@ export async function GET(request: NextRequest) {
         // PROMPT 17 — KPI Lait
         laitTotalAnnee: Math.round(laitTotalAnnee * 100) / 100,
         laitMoyenJourJ30,
-        laitStockTransformable: Math.round(laitNonAffecteL * 100) / 100,
+        bilanLait30j: bilanLait30.nbCollectes > 0 ? bilanLait30 : null,
         nbCollectesAnnee: productionsLaitieres.nbCollectes,
         // Profil du cheptel (pour l'UI : onglet Production par défaut, etc.)
         profil,
       },
-      // BUG #7 : la répartition par espèce additionne désormais les
-      // animaux individuels + ceux comptés en LotAnimaux.quantiteActuelle.
+      // BUG #7 : la répartition par espèce additionne les fiches actives (sur
+      // leur espèce) et la part collective reconstituée des lots actifs.
       animauxParType: Array.from(animauxParTypeMerged.entries()).map(([especeAnimaleId, count]) => ({
         especeAnimaleId,
         nom: especeMap.get(especeAnimaleId)?.nom || especeAnimaleId,

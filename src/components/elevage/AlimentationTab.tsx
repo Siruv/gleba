@@ -48,11 +48,12 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { confirmDialog } from "@/lib/global-dialog"
 import { useToast } from "@/hooks/use-toast"
 import { verifierPrixAliment, type CategorieAliment } from "@/lib/elevage/prix-aliment-seuils"
-import { todayLocalISO } from '@/lib/format-utils'
+import { formatMontantDevise, todayLocalISO } from '@/lib/format-utils'
+import { dateSoinARenvoyer, jourSoin } from '@/lib/elevage/date-soin'
 import { useFiliereSelection, capacitesSelection, filiereMatch } from "@/lib/elevage/filiere-context"
 import { SelecteurPeriodeExercice, parametreAnnee, type PeriodeListe } from "./SelecteurPeriodeExercice"
 import { stockMedicamentEstDisponible } from "@/lib/elevage/stock-medicament"
-import { TYPES_SOIN } from "@/lib/elevage/types-soin"
+import { TYPES_SOIN, libelleTypeSoin } from "@/lib/elevage/types-soin"
 
 // ============================================================
 // Composant principal
@@ -212,7 +213,7 @@ function StocksSubTab() {
   const { toast } = useToast()
   const [isLoading, setIsLoading] = React.useState(true)
   const [aliments, setAliments] = React.useState<Aliment[]>([])
-  const [stats, setStats] = React.useState<any>(null)
+  const [stats, setStats] = React.useState<{ total: number; stockBas: number } | null>(null)
   const [isDialogOpen, setIsDialogOpen] = React.useState(false)
   const [editingStock, setEditingStock] = React.useState<string | null>(null)
   const [newStock, setNewStock] = React.useState("")
@@ -450,7 +451,7 @@ function StocksSubTab() {
                           </div>
                         ) : (
                         <div className="flex items-center justify-end gap-1.5">
-                          {a.prix ? `${a.prix.toFixed(2)} \u20ac` : '-'}
+                          {a.prix ? formatMontantDevise(a.prix) : '-'}
                           {prixHorsNorme && (
                             <button
                               type="button"
@@ -1027,13 +1028,6 @@ function dateAfficheeInjection(injection: { datePrevue: string; dateRealisee: st
   return new Date(d).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })
 }
 
-const SOIN_TYPE_LABELS: Record<string, string> = {
-  vaccination: "Vaccination",
-  vermifuge: "Vermifuge",
-  traitement: "Traitement",
-  autre: "Autre",
-}
-
 // QA caprin cms1vowbh — `fait` passe à true dès la 1re injection réalisée
 // (serveur), donc la coche verte mentait sur un protocole en cours. On dérive
 // l'état réel des injections : vert = protocole terminé, ambre = en cours.
@@ -1184,7 +1178,9 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
       cible: s.animalId ? "animal" : "lot",
       lotId: s.lot?.id ? s.lot.id.toString() : "",
       animalId: s.animal?.id ? s.animal.id.toString() : "",
-      date: s.date.split('T')[0],
+      // Ticket cmvnp6s3z : jour du soin, local pour une heure réelle (24/09
+      // 00:30 Paris est stockée 23/09 22:30 UTC), et non `split('T')[0]`.
+      date: jourSoin(new Date(s.date)),
       type: s.type ?? "Vaccination",
       description: s.description ?? "",
       produit: s.produit ?? "",
@@ -1195,7 +1191,7 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
       motif: s.motif ?? "",
       ordonnanceUrl: s.ordonnanceUrl ?? "",
       veterinaire: s.veterinaire ?? "",
-      datePrevue: s.datePrevue ? s.datePrevue.split('T')[0] : "",
+      datePrevue: s.datePrevue ? jourSoin(new Date(s.datePrevue)) : "",
       quantite: s.quantite ? s.quantite.toString() : "",
       unite: s.unite ?? "",
       cout: s.cout ? s.cout.toString() : "",
@@ -1596,8 +1592,10 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
     }
     setIsSavingSoin(true)
     try {
-      const payload: any = {
-        date: dateSoinSoumise,
+      // Ticket cmvnp6s3z : un jour non touché renvoie la date stockée intacte
+      // (heure réelle comprise) ; seul un jour modifié part en « AAAA-MM-JJ ».
+      const payload: Record<string, unknown> = {
+        date: soinEnEdition ? dateSoinARenvoyer(dateSoinSoumise, soinEnEdition.date) : dateSoinSoumise,
         type: formData.type,
         description: formData.description || null,
         produit: formData.produit || null,
@@ -1608,7 +1606,9 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
         motif: formData.motif || null,
         ordonnanceUrl: formData.ordonnanceUrl || null,
         veterinaire: formData.veterinaire || null,
-        datePrevue: datePrevueSoumise || null,
+        datePrevue: datePrevueSoumise
+          ? (soinEnEdition ? dateSoinARenvoyer(datePrevueSoumise, soinEnEdition.datePrevue) : datePrevueSoumise)
+          : null,
         quantite: formData.quantite ? parseFloat(formData.quantite) : null,
         unite: formData.unite || null,
         cout: formData.cout ? parseFloat(formData.cout) : null,
@@ -2292,7 +2292,7 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
                         )}
                       </div>
                     </TableCell>
-                    <TableCell><Badge variant="outline">{SOIN_TYPE_LABELS[soin.type] || soin.type}</Badge></TableCell>
+                    <TableCell><Badge variant="outline">{libelleTypeSoin(soin.type)}</Badge></TableCell>
                     <TableCell>{soin.lot?.nom || soin.animal?.nom || soin.animal?.identifiant || '-'}</TableCell>
                     <TableCell>
                       <div>{soin.produit || '-'}</div>
@@ -2350,7 +2350,7 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
                       })()}
                     </TableCell>
                     )}
-                    <TableCell className="text-right">{soin.cout ? `${soin.cout.toFixed(2)} \u20ac` : '-'}</TableCell>
+                    <TableCell className="text-right">{soin.cout ? formatMontantDevise(soin.cout) : '-'}</TableCell>
                     <TableCell className="text-muted-foreground text-sm max-w-[200px] truncate">{soin.notes || '-'}</TableCell>
                   </TableRow>
                   )
@@ -2387,7 +2387,7 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-medium">{cible}</span>
                           {boucle && boucle !== cible && <span className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">{boucle}</span>}
-                          <Badge variant="outline" className="text-xs">{SOIN_TYPE_LABELS[soin.type] || soin.type}</Badge>
+                          <Badge variant="outline" className="text-xs">{libelleTypeSoin(soin.type)}</Badge>
                         </div>
                         <div className="mt-1 text-sm">
                           {soin.produit || "—"}
@@ -2414,7 +2414,7 @@ function SoinsSubTab({ initialAnimalId = null, initialOpen = false, year }: { in
                     <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
                       <span className="text-muted-foreground">{new Date(dateAffichee).toLocaleDateString("fr-FR")}</span>
                       {enRetard && <span className="font-medium text-red-700 uppercase tracking-wide">En retard</span>}
-                      {soin.cout ? <span className="text-muted-foreground">{soin.cout.toFixed(2)} €</span> : null}
+                      {soin.cout ? <span className="text-muted-foreground">{formatMontantDevise(soin.cout)}</span> : null}
                       {rvLait && <span className={rvLait > auj ? "text-amber-700 font-medium" : "text-slate-500"}>Lait : {rvLait.toLocaleDateString("fr-FR")}</span>}
                       {rvOeufs && <span className={rvOeufs > auj ? "text-amber-700 font-medium" : "text-slate-500"}>Œufs : {rvOeufs.toLocaleDateString("fr-FR")}</span>}
                       {rvViande && <span className={rvViande > auj ? "text-amber-700 font-medium" : "text-slate-500"}>Viande : {rvViande.toLocaleDateString("fr-FR")}</span>}

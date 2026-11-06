@@ -1,3 +1,8 @@
+import { invalidateKpi } from '@/lib/kpi/cache'
+import { verifierReferencesCampagne, masquerReferencesCampagnes } from "@/lib/verger/references-campagne"
+import { ErreurVerger } from "@/lib/verger/erreur"
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
 /**
  * API Campagne individuelle
  * GET - Détail (avec etapes et observations)
@@ -44,11 +49,13 @@ export async function GET(_request: NextRequest, { params }: Params) {
       return NextResponse.json({ error: "Campagne non trouvée" }, { status: 404 })
     }
 
-    return NextResponse.json(campagne)
+    return NextResponse.json((await masquerReferencesCampagnes(prisma, session!.user.id, [campagne]))[0])
   } catch (err) {
+    if (err instanceof ErreurVerger) return NextResponse.json({ error: err.message, champ: err.champ }, { status: err.status })
+    if (err instanceof ErreurReglement) return NextResponse.json({ error: err.message }, { status: err.status })
     console.error("GET /api/arbres/campagnes/[id] error:", err)
     return NextResponse.json(
-      { error: "Erreur lors de la recuperation" },
+      { error: "Erreur lors de la récupération" },
       { status: 500 }
     )
   }
@@ -75,7 +82,11 @@ export async function PUT(request: NextRequest, { params }: Params) {
 
     const body = await request.json()
 
-    const campagne = await prisma.campagnePlantation.update({
+    await verifierReferencesCampagne(prisma, session!.user.id, body)
+
+    const campagne = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
+      const campagne = await tx.campagnePlantation.update({
       where: { id: campagneId },
       data: {
         nom: body.nom !== undefined ? body.nom : undefined,
@@ -125,22 +136,21 @@ export async function PUT(request: NextRequest, { params }: Params) {
       },
     })
 
-    // Auto-comptabilite : resynchroniser la depense auto (coutReel) avec les
-    // valeurs finales (le helper supprime l'ecriture si coutReel devient null/0)
-    try {
       await createDepenseFromCampagnePlantation(session!.user.id, {
         id: campagne.id,
         nom: campagne.nom,
         coutReel: campagne.coutReel,
         datePlantationReelle: campagne.datePlantationReelle,
         datePlantationPrevue: campagne.datePlantationPrevue,
-      })
-    } catch (autoComptaError) {
-      console.error('Auto-compta error (campagne_plantation PUT):', autoComptaError)
-    }
+      }, tx)
+      return campagne
+    })
 
-    return NextResponse.json(campagne)
+    invalidateKpi(session!.user.id)
+    return NextResponse.json((await masquerReferencesCampagnes(prisma, session!.user.id, [campagne]))[0])
   } catch (err) {
+    if (err instanceof ErreurVerger) return NextResponse.json({ error: err.message, champ: err.champ }, { status: err.status })
+    if (err instanceof ErreurReglement) return NextResponse.json({ error: err.message }, { status: err.status })
     console.error("PUT /api/arbres/campagnes/[id] error:", err)
     return NextResponse.json(
       { error: "Erreur lors de la mise à jour" },
@@ -168,16 +178,17 @@ export async function DELETE(_request: NextRequest, { params }: Params) {
       return NextResponse.json({ error: "Campagne non trouvée" }, { status: 404 })
     }
 
-    // Supprimer les ecritures auto-compta liees
-    try {
-      await deleteAutoEntry('campagne_plantation', campagneId, 'depense')
-    } catch (autoComptaError) {
-      console.error('Auto-compta cleanup error (campagne_plantation):', autoComptaError)
-    }
+    await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
+      await deleteAutoEntry('campagne_plantation', campagneId, 'depense', session!.user.id, tx)
+      await tx.campagnePlantation.delete({ where: { id: campagneId, userId: session!.user.id } })
+    })
 
-    await prisma.campagnePlantation.delete({ where: { id: campagneId } })
+    invalidateKpi(session!.user.id)
     return NextResponse.json({ success: true })
   } catch (err) {
+    if (err instanceof ErreurVerger) return NextResponse.json({ error: err.message, champ: err.champ }, { status: err.status })
+    if (err instanceof ErreurReglement) return NextResponse.json({ error: err.message }, { status: err.status })
     console.error("DELETE /api/arbres/campagnes/[id] error:", err)
     return NextResponse.json(
       { error: "Erreur lors de la suppression" },

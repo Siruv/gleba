@@ -25,10 +25,8 @@ import {
 } from "lucide-react"
 import { format } from "date-fns"
 import { fr } from "date-fns/locale"
-import {
-  estimerNombrePlants,
-  necesiteIrrigation,
-} from "@/lib/assistant-helpers"
+import { necesiteIrrigation } from "@/lib/assistant-helpers"
+import { corpsCultureSemer, libelleDonneesManquantes, plantsSemer } from "./corps-culture-semer"
 import type { AssistantState } from "./AssistantDialog"
 import { useToast } from "@/hooks/use-toast"
 import { nomAffichableItp } from "@/lib/itp-label"
@@ -57,19 +55,16 @@ export function AssistantStepRecap({ state, onSuccess }: AssistantStepRecapProps
 
   const { planche, culture, espece, itp, variete } = state
 
-  // Calculer le nombre de plants
-  const nbPlants = React.useMemo(() => {
-    return estimerNombrePlants(
-      culture.longueur || planche.longueur || 0,
-      planche.largeur || 0,
-      culture.nbRangs || 1,
-      culture.espacement || 30
-    )
-  }, [culture.longueur, planche.longueur, planche.largeur, culture.nbRangs, culture.espacement])
+  // Ticket QA cmvnpkkhp (2026-10-25) — le nombre affiché est celui envoyé,
+  // calculé sur les valeurs envoyées (`corps-culture-semer.ts`).
+  const plants = plantsSemer(state)
+  const quantitePlants = plants.quantite
+  const nbPlants = quantitePlants ?? 0
 
   // Verifier le stock (graines OU plants selon la variete)
   React.useEffect(() => {
-    if (!variete) {
+    // Sans rangs ni espacement, le besoin n'est pas connu : rien à comparer.
+    if (!variete || quantitePlants == null) {
       setStockCheck(null)
       return
     }
@@ -136,7 +131,7 @@ export function AssistantStepRecap({ state, onSuccess }: AssistantStepRecapProps
             }
       )
     }
-  }, [variete, nbPlants, itp?.nbGrainesPlant, culture.itp?.nbGrainesPlant])
+  }, [variete, nbPlants, quantitePlants, itp?.nbGrainesPlant, culture.itp?.nbGrainesPlant])
 
   // Charger les associations recommandees
   React.useEffect(() => {
@@ -198,11 +193,11 @@ export function AssistantStepRecap({ state, onSuccess }: AssistantStepRecapProps
             const existingPlanche = await existingRes.json()
             plancheId = existingPlanche.id // cuid for FK
           } else {
-            throw new Error(`La planche "${plancheName}" existe deja`)
+            throw new Error(`La planche "${plancheName}" existe déjà`)
           }
         } else {
           const err = await plancheRes.json()
-          throw new Error(err.error || 'Erreur creation planche')
+          throw new Error(err.error || 'Erreur de création de la planche')
         }
       }
 
@@ -210,31 +205,7 @@ export function AssistantStepRecap({ state, onSuccess }: AssistantStepRecapProps
       const especeRef = espece || culture.espece
       const aIrriguer = especeRef ? necesiteIrrigation(especeRef) : false
 
-      // Convertir les dates de maniere robuste (string ou Date)
-      const toISO = (d: any) => {
-        if (!d) return null
-        if (d instanceof Date) return d.toISOString()
-        if (typeof d === 'string') return new Date(d).toISOString()
-        return null
-      }
-
-      const cultureBody = {
-        especeId: espece?.id || culture.especeId,
-        varieteId: variete?.id || culture.varieteId || null,
-        itpId: itp?.id || culture.itpId || null,
-        plancheId: plancheId || null,
-        annee: culture.annee,
-        dateSemis: toISO(culture.dateSemis),
-        datePlantation: toISO(culture.datePlantation),
-        dateRecolte: toISO(culture.dateRecolte),
-        nbRangs: culture.nbRangs || null,
-        longueur: culture.longueur || null,
-        espacement: culture.espacement || null,
-        aIrriguer,
-        semisFait: false,
-        plantationFaite: false,
-        recolteFaite: false,
-      }
+      const cultureBody = corpsCultureSemer(state, { plancheId: plancheId || null, aIrriguer })
 
       const cultureRes = await fetch('/api/cultures', {
         method: 'POST',
@@ -244,7 +215,7 @@ export function AssistantStepRecap({ state, onSuccess }: AssistantStepRecapProps
 
       if (!cultureRes.ok) {
         const err = await cultureRes.json().catch(() => ({}))
-        const errorMsg = err.error || 'Erreur creation culture'
+        const errorMsg = err.error || 'Erreur de création de la culture'
         // QA cmv2r1v63 — un refus de largeur porte ses ajustements lisibles :
         // les dire plutôt que de vider l'objet `details` (largeurs brutes).
         const suggestions: string[] = Array.isArray(err.suggestions) ? err.suggestions : []
@@ -266,7 +237,7 @@ export function AssistantStepRecap({ state, onSuccess }: AssistantStepRecapProps
       toast({
         variant: "destructive",
         title: "Erreur",
-        description: error instanceof Error ? error.message : 'Erreur lors de la creation',
+        description: error instanceof Error ? error.message : 'Erreur lors de la création',
       })
     } finally {
       setLoading(false)
@@ -307,7 +278,7 @@ export function AssistantStepRecap({ state, onSuccess }: AssistantStepRecapProps
               )}
               {planche.ilot && (
                 <div>
-                  <span className="text-muted-foreground">Ilot:</span>{' '}
+                  <span className="text-muted-foreground">Îlot :</span>{' '}
                   <span className="font-medium">{planche.ilot}</span>
                 </div>
               )}
@@ -379,9 +350,13 @@ export function AssistantStepRecap({ state, onSuccess }: AssistantStepRecapProps
           <div className="flex items-center gap-4 text-sm">
             <Grid3X3 className="h-4 w-4 text-muted-foreground" />
             <span>
-              {culture.nbRangs || '-'} rangs x {culture.longueur || '-'}m
-              ({culture.espacement || '-'}cm esp.)
-              = ~{nbPlants} plants
+              {plants.nbRangs ?? '-'} rangs x {plants.longueur ?? '-'}m
+              ({plants.espacement ?? '-'}cm esp.)
+              {quantitePlants != null
+                ? ` = ~${quantitePlants} plants`
+                : plants.manquants.length > 0
+                  ? ` : nombre de plants à préciser (${libelleDonneesManquantes(plants.manquants)})`
+                  : ' : la longueur ne loge aucun plant à cet espacement'}
             </span>
           </div>
         </CardContent>
@@ -461,7 +436,7 @@ export function AssistantStepRecap({ state, onSuccess }: AssistantStepRecapProps
           {loading ? (
             <>
               <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              Creation en cours...
+              Création en cours…
             </>
           ) : (
             <>

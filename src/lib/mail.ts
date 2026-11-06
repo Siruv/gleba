@@ -3,6 +3,7 @@
  */
 
 import nodemailer from "nodemailer"
+import { formatMontantDevise } from "@/lib/format-utils"
 
 /**
  * URL publique de l'instance (dérivée de NEXTAUTH_URL, bascule propre en
@@ -32,6 +33,7 @@ interface SendMailOptions {
   replyTo?: string
   /** En-têtes additionnels (ex. List-Unsubscribe pour les campagnes). */
   headers?: Record<string, string>
+  attachments?: Array<{ filename: string; content: Buffer; contentType: string }>
 }
 
 /**
@@ -67,7 +69,7 @@ export async function smtpConfigure(): Promise<boolean> {
   return Boolean(config.host && config.user)
 }
 
-export async function sendMail({ to, subject, html, replyTo, headers }: SendMailOptions) {
+export async function sendMail({ to, subject, html, replyTo, headers, attachments }: SendMailOptions) {
   const config = await getSmtpConfig()
   if (!config.host || !config.user) {
     console.warn("SMTP non configure, email non envoye:", subject)
@@ -91,6 +93,7 @@ export async function sendMail({ to, subject, html, replyTo, headers }: SendMail
     html,
     ...(replyTo && { replyTo }),
     ...(headers && { headers }),
+    ...(attachments && { attachments }),
   })
 }
 
@@ -267,8 +270,8 @@ export function commandeBoutiqueEmail(args: CommandeBoutiqueEmailArgs) {
       <tr>
         <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">${escapeHtml(l.nom)}</td>
         <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;">${l.quantite} ${escapeHtml(l.unite)}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;">${l.prixUnitaire.toFixed(2)} €</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;font-weight:600;">${l.total.toFixed(2)} €</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;">${formatMontantDevise(l.prixUnitaire)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;font-weight:600;">${formatMontantDevise(l.total)}</td>
       </tr>`
     )
     .join("")
@@ -322,7 +325,7 @@ export function commandeBoutiqueEmail(args: CommandeBoutiqueEmailArgs) {
               <tfoot>
                 <tr style="background:#0d9488;color:white;">
                   <td colspan="3" style="padding:12px;text-align:right;font-size:14px;font-weight:600;">Total commande</td>
-                  <td style="padding:12px;text-align:right;font-size:16px;font-weight:700;">${args.total.toFixed(2)} €</td>
+                  <td style="padding:12px;text-align:right;font-size:16px;font-weight:700;">${formatMontantDevise(args.total)}</td>
                 </tr>
               </tfoot>
             </table>
@@ -523,8 +526,8 @@ export function welcomeEmail(name?: string | null, unsubscribeUrl?: string) {
                 <td style="padding:12px 16px;background:#f0fdf4;border-radius:10px;border-left:3px solid #10b981;">
                   <p style="margin:0 0 8px;font-size:14px;font-weight:600;color:#065f46;">Pour démarrer :</p>
                   <ul style="margin:0;padding:0 0 0 18px;font-size:14px;color:#475569;line-height:1.8;">
-                    <li>Creez vos planches de culture</li>
-                    <li>Ajoutez vos premieres cultures</li>
+                    <li>Créez vos planches de culture</li>
+                    <li>Ajoutez vos premières cultures</li>
                     <li>Explorez les 154 itinéraires techniques</li>
                   </ul>
                 </td>
@@ -608,7 +611,7 @@ export function commandeClientConfirmationEmail(args: CommandeClientEmailArgs) {
       <tr>
         <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">${escapeHtml(l.nom)}</td>
         <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;">${l.quantite} ${escapeHtml(l.unite)}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;font-weight:600;">${l.total.toFixed(2)} €</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;font-weight:600;">${formatMontantDevise(l.total)}</td>
       </tr>`
     )
     .join("")
@@ -648,7 +651,7 @@ export function commandeClientConfirmationEmail(args: CommandeClientEmailArgs) {
               <tfoot>
                 <tr style="background:#0d9488;color:white;">
                   <td colspan="2" style="padding:12px;text-align:right;font-size:14px;font-weight:600;">À régler</td>
-                  <td style="padding:12px;text-align:right;font-size:16px;font-weight:700;">${args.total.toFixed(2)} €</td>
+                  <td style="padding:12px;text-align:right;font-size:16px;font-weight:700;">${formatMontantDevise(args.total)}</td>
                 </tr>
               </tfoot>
             </table>
@@ -731,7 +734,7 @@ export function commandeStatutClientEmail(args: CommandeStatutEmailArgs) {
   const suiviUrl = commandeSuiviUrl(args.slug, args.numero, args.suiviToken)
   const rappelPaiement =
     args.statut === "prete"
-      ? `<div style="background:#fffbeb;border-radius:10px;padding:14px 16px;border-left:3px solid #f59e0b;margin:16px 0;"><p style="margin:0;font-size:13px;color:#78350f;line-height:1.6;"><strong>${args.total.toFixed(2)} €</strong> à régler au retrait${args.modesPaiement ? `, par&nbsp;: ${escapeHtml(args.modesPaiement)}` : ""}.</p></div>`
+      ? `<div style="background:#fffbeb;border-radius:10px;padding:14px 16px;border-left:3px solid #f59e0b;margin:16px 0;"><p style="margin:0;font-size:13px;color:#78350f;line-height:1.6;"><strong>${formatMontantDevise(args.total)}</strong> à régler au retrait${args.modesPaiement ? `, par&nbsp;: ${escapeHtml(args.modesPaiement)}` : ""}.</p></div>`
       : ""
 
   return {

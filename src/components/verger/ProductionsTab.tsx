@@ -5,12 +5,18 @@
  */
 
 import * as React from "react"
+import { ReglementVente, paiementVenteInitial } from "./ReglementVente"
+import { ReglementsDialog } from "@/components/comptabilite/ReglementsDialog"
+import { MontantCommercial, PiecesCommerciales, QuantiteCommerciale, RevenusProductions } from './SuiviVenteCommerciale'
+import type { VenteCommercialeVerger } from '@/lib/verger/suivi-commercial-types'
+import { montantVenteFruit } from '@/lib/verger/montant-vente'
+import { quantiteBois } from "@/lib/commercial/stock-types"
 import Link from "next/link"
 import { isPast, differenceInDays } from "date-fns"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { confirmDialog } from "@/lib/global-dialog"
-import { checkOperationSaison } from "@/lib/tree-care-calendar"
+import { alerteSaisonRecolteArbre, retirerMarqueSaison, type PeriodeRecolteVariete } from "@/lib/verger/saison-recolte-arbre"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -33,12 +39,26 @@ import {
   Sprout,
   Home,
   Pencil,
+  RotateCcw,
+  FlaskConical,
 } from "lucide-react"
+import { ProduitsTransformesSubTab, TransformationDialog } from "./ProduitsTransformes"
 import { Combobox } from "@/components/ui/combobox"
 import { useToast } from "@/hooks/use-toast"
 import { AssistantPlantationDialog } from "./AssistantPlantationDialog"
-import { todayLocalISO } from '@/lib/format-utils'
+import { todayLocalISO, formatNombre } from '@/lib/format-utils'
 import { labelStatutRecolteArbre } from '@/lib/verger/statut-recolte-arbre'
+import { estTypeArbreFruitier } from '@/lib/verger/types-arbre'
+// QA cmsjhmi58 puis cmvnp0dm9 — type et volume d'un lot de bois affichés par
+// la source partagée avec la facture (« Élagage », « 0,2 m³ »), jamais par la
+// valeur technique.
+import {
+  libellePoidsBois,
+  libelleTypeBois,
+  libelleVolumeBois,
+  resumeLotBois,
+  TYPES_PRODUCTION_BOIS,
+} from '@/lib/verger/production-bois'
 
 // ============================================================
 // Types
@@ -50,6 +70,8 @@ interface Arbre {
   type: string
   espece?: string | null
   variete?: string | null
+  /** Période de récolte de la variété (référentiel), servie par GET /api/arbres. */
+  periodeRecolteVariete?: PeriodeRecolteVariete | null
   parcelleGeo?: { id: string; nom: string } | null
 }
 
@@ -63,7 +85,16 @@ interface Client {
   nom: string
 }
 
+interface SortieVerger { id: string; nature: string; quantite: number; unite: string; date: string; notes: string | null }
+
 interface RecolteArbre {
+  ventesCommerciales?: VenteCommercialeVerger[]
+  mouvementsCommerciaux?: SortieVerger[]
+  /** Lot livré par BL ou facture : ni correction ni suppression (calculé par l'API). */
+  figeCommercial?: boolean
+  ecriture?: { id: number } | null
+  warnings?: string[]
+  stockDisponibleCommercial?: number | null
   id: number
   arbreId: number
   date: string
@@ -108,11 +139,18 @@ function formulaireRecolteVierge() {
 }
 
 interface ProductionBois {
+  ventesCommerciales?: VenteCommercialeVerger[]
+  mouvementsCommerciaux?: SortieVerger[]
+  /** Lot livré par BL ou facture : ni correction ni suppression (calculé par l'API). */
+  figeCommercial?: boolean
+  ecriture?: { id: number } | null
+  stockDisponibleCommercial?: number | null
   id: number
   arbreId: number | null
   date: string
   type: string
   volumeM3: number | null
+  volumeStere: number | null
   poidsKg: number | null
   statut: string
   destination: string | null
@@ -125,23 +163,11 @@ interface ProductionBois {
   arbre: Arbre | null
 }
 
-const TYPES_PRODUCTION = [
-  { value: "elagage", label: "Élagage" },
-  { value: "abattage", label: "Abattage" },
-  { value: "branchage", label: "Branchage" },
-]
-
 const DESTINATIONS_UTILISATION = [
   { value: "chauffage", label: "Bois de chauffage (perso)" },
   { value: "BRF", label: "BRF / Paillage" },
   { value: "construction", label: "Construction" },
 ]
-
-// QA cmsjhmi58 — les listes affichaient la valeur technique (« elagage »
-// passé en CSS capitalize → « Elagage » sans accent) au lieu du libellé.
-function labelTypeBois(type: string): string {
-  return TYPES_PRODUCTION.find((t) => t.value === type)?.label ?? type
-}
 
 function labelDestinationBois(destination: string | null): string {
   if (!destination) return "-"
@@ -155,7 +181,9 @@ function labelDestinationBois(destination: string | null): string {
 export function ProductionsTab() {
   return (
     <Tabs defaultValue="recoltes" className="space-y-4">
-      <TabsList>
+      {/* Trois onglets dépassent 390 px : ils passent à la ligne plutôt que
+          d'élargir la page (sonde de production du 2026-10-30). */}
+      <TabsList className="flex-wrap h-auto gap-y-1">
         <TabsTrigger value="recoltes" className="flex items-center gap-1.5">
           <Apple className="h-4 w-4" />
           Récoltes Fruits
@@ -164,6 +192,10 @@ export function ProductionsTab() {
           <Axe className="h-4 w-4" />
           Production Bois
         </TabsTrigger>
+        <TabsTrigger value="transformes" className="flex items-center gap-1.5">
+          <FlaskConical className="h-4 w-4" />
+          Produits transformés
+        </TabsTrigger>
       </TabsList>
 
       <TabsContent value="recoltes">
@@ -171,6 +203,9 @@ export function ProductionsTab() {
       </TabsContent>
       <TabsContent value="bois">
         <ProductionBoisSubTab />
+      </TabsContent>
+      <TabsContent value="transformes">
+        <ProduitsTransformesSubTab />
       </TabsContent>
     </Tabs>
   )
@@ -192,6 +227,9 @@ function RecoltesFruitsSubTab() {
   // pouvait qu'être supprimée puis re-saisie ; l'utilisateur a re-saisi sans
   // supprimer, d'où un doublon en stock. Le même dialogue sert désormais à
   // modifier une récolte existante.
+  const [sortieEnCours, setSortieEnCours] = React.useState(false)
+  // Retour FB-8CXUUN (2026-10-30) : le produit obtenu entre en stock.
+  const [lotATransformer, setLotATransformer] = React.useState<number | null>(null)
   const [editingRecolte, setEditingRecolte] = React.useState<RecolteArbre | null>(null)
   const [parcelles, setParcelles] = React.useState<ParcelleOption[]>([])
   const [isSubmitting, setIsSubmitting] = React.useState(false)
@@ -201,7 +239,7 @@ function RecoltesFruitsSubTab() {
     clientId: "",
     clientNom: "",
     prixKg: "",
-    creerFacture: false,
+    creerFacture: false, ...paiementVenteInitial(),
   })
   // DEV3 #4 — Champs traçabilité AB (audit Marc 2026-05-14)
   const [newRecolte, setNewRecolte] = React.useState(formulaireRecolteVierge)
@@ -237,9 +275,15 @@ function RecoltesFruitsSubTab() {
     fetchData()
   }, [fetchData])
 
-  const stockRecoltes = recoltes.filter(r => !r.statut || r.statut === "en_stock")
-  const venduRecoltes = recoltes.filter(r => r.statut === "vendu")
-  const perteRecoltes = recoltes.filter(r => r.statut === "perte" || r.statut === "consomme")
+  const stockRecoltes = recoltes.filter(r => (!r.statut || r.statut === "en_stock") && (r.stockDisponibleCommercial ?? r.quantite) > 0).map(r => ({ ...r, quantite: r.stockDisponibleCommercial ?? r.quantite }))
+  const venduRecoltes = recoltes.filter(r => r.statut === "vendu" && !r.ventesCommerciales?.some(v => v.facture?.id === r.factureId))
+  const livraisonsFruits = recoltes.flatMap(lot => (lot.ventesCommerciales ?? []).map(vente => ({ lot, vente })))
+  const nombreVentesFruits = venduRecoltes.length + livraisonsFruits.length
+  const perteRecoltes = [
+    ...recoltes.filter(r => r.statut === "perte" || r.statut === "consomme").map(r => ({ ...r, cleHistorique: `lot-${r.id}`, sortieId: null as string | null })),
+    ...recoltes.flatMap(r => (r.mouvementsCommerciaux ?? []).map(m => ({ ...r, cleHistorique: m.id, sortieId: m.id as string | null,
+      statut: m.nature, date: m.date, quantite: m.quantite, notes: m.notes }))),
+  ].sort((a, b) => b.date.localeCompare(a.date))
 
   const now = new Date()
   const perimesCount = stockRecoltes.filter(r => r.datePeremption && isPast(new Date(r.datePeremption))).length
@@ -250,8 +294,8 @@ function RecoltesFruitsSubTab() {
   }).length
 
   const stockKg = stockRecoltes.reduce((sum, r) => sum + r.quantite, 0)
-  const venduKg = venduRecoltes.reduce((sum, r) => sum + r.quantite, 0)
-  const totalCA = venduRecoltes.reduce((sum, r) => sum + (r.prixTotal || 0), 0)
+  const venduKg = venduRecoltes.reduce((sum, r) => sum + r.quantite, 0) + livraisonsFruits.reduce((sum, r) => sum + r.vente.quantiteNette, 0)
+  const totalCA = venduRecoltes.reduce((sum, r) => sum + montantVenteFruit(r), 0)
   const perteKg = perteRecoltes.reduce((sum, r) => sum + r.quantite, 0)
   const stockValeur = stockRecoltes.reduce((sum, r) => sum + r.quantite * (r.prixKg || 0), 0)
 
@@ -260,9 +304,32 @@ function RecoltesFruitsSubTab() {
     [clients]
   )
 
-  const arbresFruitiers = arbres.filter((a) =>
-    ["fruitier", "petit_fruit"].includes(a.type)
-  )
+  const arbresFruitiers = arbres.filter((a) => estTypeArbreFruitier(a.type))
+
+  // Feedback cmpky7zmy — l'alerte hors saison reste visible après coup dans la
+  // liste. Calculée à l'affichage par la même règle que le formulaire et la
+  // route (revue du 2026-10-23) : elle suit la date corrigée, au lieu d'une
+  // mention figée dans les notes.
+  const alerteSaisonDe = (r: RecolteArbre) => {
+    const arbre = arbres.find((a) => a.id === r.arbreId)
+    return arbre
+      ? alerteSaisonRecolteArbre({ espece: arbre.espece, variete: arbre.periodeRecolteVariete, date: new Date(r.date) })
+      : null
+  }
+  const celluleDate = (r: RecolteArbre) => {
+    const alerte = alerteSaisonDe(r)
+    return (
+      <span className="inline-flex items-center gap-1">
+        {new Date(r.date).toLocaleDateString("fr-FR")}
+        {alerte && (
+          <span title={alerte.message} className="inline-flex text-amber-600">
+            <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
+            <span className="sr-only">Hors saison : {alerte.message}</span>
+          </span>
+        )}
+      </span>
+    )
+  }
 
   const getPeremptionBadge = (datePeremption: string | null) => {
     if (!datePeremption) return null
@@ -413,7 +480,7 @@ function RecoltesFruitsSubTab() {
       qualite: r.qualite ?? "",
       prixKg: r.prixKg != null ? String(r.prixKg) : "",
       datePeremption: r.datePeremption ? r.datePeremption.slice(0, 10) : "",
-      notes: r.notes ?? "",
+      notes: retirerMarqueSaison(r.notes) ?? "",
       statutBioSnapshot: r.statutBioSnapshot ?? "",
       parcelleId: r.parcelleId ?? "",
       numLot: r.numLot ?? "",
@@ -440,7 +507,9 @@ function RecoltesFruitsSubTab() {
   const arbreSansParcelle = Boolean(arbreSelectionne) && !arbreSelectionne?.parcelleGeo && !newRecolte.parcelleId
 
   const handleDelete = async (id: number) => {
-    if (!(await confirmDialog("Supprimer cette récolte ?"))) return
+    // Revue du 2026-10-29 : un lot sans BL ni facture se supprime avec ses sorties.
+    const sorties = recoltes.find((r) => r.id === id)?.mouvementsCommerciaux?.length ?? 0
+    if (!(await confirmDialog(`Supprimer cette récolte ?${sorties ? " Ses pertes et usages internes enregistrés seront supprimés aussi." : ""}`))) return
     try {
       const res = await fetch(`/api/arbres/recoltes/${id}`, { method: "DELETE" })
       if (res.ok) {
@@ -461,16 +530,19 @@ function RecoltesFruitsSubTab() {
       clientId: "",
       clientNom: "",
       prixKg: recolte.prixKg?.toString() || "",
-      creerFacture: false,
+      creerFacture: false, ...paiementVenteInitial(),
     })
     setShowVenteDialog(true)
   }
 
+  const [venteEnCours, setVenteEnCours] = React.useState(false)
+
   const handleVendre = async () => {
-    if (!selectedRecolte) return
+    if (!selectedRecolte || venteEnCours) return
     const prixKg = parseFloat(venteData.prixKg) || 0
     const prixTotal = prixKg * selectedRecolte.quantite
-
+    if (!Number.isFinite(prixKg) || prixKg <= 0) { toast({ title: "Saisissez un prix supérieur à zéro", variant: "destructive" }); return }
+    setVenteEnCours(true)
     try {
       const res = await fetch(`/api/arbres/recoltes/${selectedRecolte.id}`, {
         method: "PATCH",
@@ -482,6 +554,9 @@ function RecoltesFruitsSubTab() {
           clientId: venteData.clientId ? parseInt(venteData.clientId) : null,
           clientNom: venteData.clientNom || null,
           creerFacture: venteData.creerFacture,
+          paye: venteData.paye,
+          modeReglement: venteData.modeReglement || null,
+          datePaiement: venteData.paye ? venteData.datePaiement : undefined,
         }),
       })
       if (res.ok) {
@@ -494,47 +569,37 @@ function RecoltesFruitsSubTab() {
       }
     } catch {
       toast({ title: "Erreur", variant: "destructive" })
-    }
+    } finally { setVenteEnCours(false) }
   }
 
-  const handlePerte = async (id: number) => {
-    if (!(await confirmDialog("Marquer cette récolte comme perte ?"))) return
+  // Revue du 2026-10-29 : une perte ou une consommation se rattrape ; la
+  // quantité revient au reliquat (route idempotente, mêmes verrous que la sortie).
+  const handleAnnulerSortie = async (lotId: number, sortie: { id: string; quantite: number; statut: string }) => {
+    if (sortieEnCours) return
+    setSortieEnCours(true)
     try {
-      const res = await fetch(`/api/arbres/recoltes/${id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ statut: "perte" }),
-      })
-      if (res.ok) {
-        toast({ title: "Perte enregistrée" })
-        fetchData()
-      } else {
-        const data = await res.json().catch(() => ({}))
-        toast({ title: "Échec de l'enregistrement de la perte", description: data.error || `Erreur ${res.status}`, variant: "destructive" })
-      }
-    } catch {
-      toast({ title: "Erreur", variant: "destructive" })
-    }
+      if (!(await confirmDialog(`Annuler ${sortie.statut === 'perte' ? 'cette perte' : 'cet usage interne'} de ${sortie.quantite} kg ? La quantité revient en stock.`))) return
+      const res = await fetch(`/api/arbres/recoltes/${lotId}/sorties/${encodeURIComponent(sortie.id)}`, { method: 'DELETE' })
+      if (!res.ok) { const data = await res.json().catch(() => ({})); throw new Error(data.error || `Erreur ${res.status}`) }
+      toast({ title: 'Sortie annulée', description: 'La quantité est revenue en stock.' })
+      await fetchData()
+    } catch (e) { toast({ title: 'Annulation refusée', description: e instanceof Error ? e.message : 'Erreur', variant: 'destructive' }) }
+    finally { setSortieEnCours(false) }
   }
 
-  const handleUsageInterne = async (id: number) => {
-    if (!(await confirmDialog("Marquer cette récolte comme usage interne (auto-consommation) ?"))) return
+  const handleSortie = async (id: number, statut: 'perte' | 'consomme') => {
+    if (sortieEnCours) return
+    setSortieEnCours(true)
     try {
-      const res = await fetch(`/api/arbres/recoltes/${id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ statut: "consomme" }),
-      })
-      if (res.ok) {
-        toast({ title: "Usage interne enregistré" })
-        fetchData()
-      } else {
-        const data = await res.json().catch(() => ({}))
-        toast({ title: "Échec de l'enregistrement", description: data.error || `Erreur ${res.status}`, variant: "destructive" })
-      }
-    } catch {
-      toast({ title: "Erreur", variant: "destructive" })
-    }
+      const lot = stockRecoltes.find(r => r.id === id)
+      if (!lot || !(await confirmDialog(`Enregistrer ${lot.quantite} kg ${statut === 'perte' ? 'en perte' : 'en usage interne'} ? Cette sortie sera conservée dans l’historique.`))) return
+      const res = await fetch(`/api/arbres/recoltes/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ statut, quantite: lot.quantite, cleIdempotence: crypto.randomUUID() }) })
+      if (!res.ok) { const data = await res.json().catch(() => ({})); throw new Error(data.error || `Erreur ${res.status}`) }
+      toast({ title: statut === 'perte' ? 'Perte enregistrée' : 'Usage interne enregistré' })
+      await fetchData()
+    } catch (e) { toast({ title: 'Sortie refusée', description: e instanceof Error ? e.message : 'Erreur', variant: 'destructive' }) }
+    finally { setSortieEnCours(false) }
   }
 
   return (
@@ -559,12 +624,12 @@ function RecoltesFruitsSubTab() {
           <CardHeader className="pb-1 pt-3 px-4">
             <CardTitle className="text-sm text-muted-foreground flex items-center gap-2">
               <ShoppingCart className="h-4 w-4 text-blue-600" />
-              Vendu
+              Vendu / livré
             </CardTitle>
           </CardHeader>
           <CardContent className="pb-3 px-4">
             <p className="text-2xl font-bold">{venduKg.toFixed(1)} kg</p>
-            <p className="text-xs text-muted-foreground">{totalCA.toFixed(0)} EUR CA</p>
+            <RevenusProductions direct={totalCA} commercial={livraisonsFruits.map(r => r.vente)} className="text-xs text-muted-foreground" />
           </CardContent>
         </Card>
         <Card>
@@ -622,7 +687,7 @@ function RecoltesFruitsSubTab() {
             </TabsTrigger>
             <TabsTrigger value="vendu" className="flex items-center gap-2">
               <ShoppingCart className="h-4 w-4" />
-              Vendu ({venduRecoltes.length})
+              Vendu / livré ({nombreVentesFruits})
             </TabsTrigger>
             <TabsTrigger value="pertes" className="flex items-center gap-2">
               <AlertTriangle className="h-4 w-4" />
@@ -660,34 +725,39 @@ function RecoltesFruitsSubTab() {
                 <TableBody>
                   {stockRecoltes.map((r) => (
                     <TableRow key={r.id} className={r.datePeremption && isPast(new Date(r.datePeremption)) ? "bg-red-50" : ""}>
-                      <TableCell>{new Date(r.date).toLocaleDateString("fr-FR")}</TableCell>
-                      <TableCell className="font-medium">{r.arbre.nom}</TableCell>
+                      <TableCell>{celluleDate(r)}</TableCell>
+                      <TableCell className="font-medium">{r.arbre.nom}{r.warnings?.map(message => <p key={message} className="mt-1 max-w-sm text-xs text-amber-800">{message}</p>)}</TableCell>
                       <TableCell className="text-right">{r.quantite} kg</TableCell>
                       <TableCell className="capitalize">{r.qualite || "-"}</TableCell>
                       <TableCell className="text-right">{r.prixKg ? `${r.prixKg} EUR` : "-"}</TableCell>
                       <TableCell>
                         {r.datePeremption ? (
-                          <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2">
                             <span className="text-sm">{new Date(r.datePeremption).toLocaleDateString("fr-FR")}</span>
                             {getPeremptionBadge(r.datePeremption)}
                           </div>
                         ) : "-"}
                       </TableCell>
                       <TableCell className="text-right">
+                        <Link className="block text-sm text-primary underline" href={`/comptabilite/factures?tab=livraisons&stock=fruit:${r.id}`}>Préparer un BL</Link>
                         <div className="flex items-center gap-1 justify-end">
-                          <Button variant="ghost" size="sm" onClick={() => openVenteDialog(r)} title="Vendre">
+                          <Button disabled={r.stockDisponibleCommercial != null} variant="ghost" size="sm" onClick={() => openVenteDialog(r)} title="Vendre">
                             <Euro className="h-4 w-4 text-green-600" />
                           </Button>
-                          <Button variant="ghost" size="sm" onClick={() => handleUsageInterne(r.id)} title="Usage interne (auto-consommation)">
+                          <Button disabled={sortieEnCours} variant="ghost" size="sm" onClick={() => handleSortie(r.id, "consomme")} title="Usage interne (auto-consommation)">
                             <Home className="h-4 w-4 text-blue-600" />
                           </Button>
-                          <Button variant="ghost" size="sm" onClick={() => handlePerte(r.id)} title="Perte">
+                          <Button disabled={sortieEnCours} variant="ghost" size="sm" onClick={() => setLotATransformer(r.id)} title="Transformer (jus, compote…) : le produit obtenu entre en stock">
+                            <FlaskConical className="h-4 w-4 text-purple-600" />
+                          </Button>
+                          <Button disabled={sortieEnCours} variant="ghost" size="sm" onClick={() => handleSortie(r.id, "perte")} title="Perte">
                             <AlertTriangle className="h-4 w-4 text-orange-500" />
                           </Button>
-                          <Button variant="ghost" size="sm" onClick={() => ouvrirModification(r)} title="Modifier (date, quantité, parcelle…)">
+                          {/* La ligne affiche le reliquat : on corrige la récolte d'origine. */}
+                          <Button disabled={!!r.figeCommercial} variant="ghost" size="sm" onClick={() => ouvrirModification(recoltes.find((x) => x.id === r.id) ?? r)} title="Modifier (date, quantité, parcelle…)">
                             <Pencil className="h-4 w-4 text-slate-600" />
                           </Button>
-                          <Button variant="ghost" size="sm" onClick={() => handleDelete(r.id)} title="Supprimer">
+                          <Button disabled={!!r.figeCommercial} variant="ghost" size="sm" onClick={() => handleDelete(r.id)} title="Supprimer">
                             <Trash2 className="h-4 w-4 text-red-500" />
                           </Button>
                         </div>
@@ -705,7 +775,7 @@ function RecoltesFruitsSubTab() {
       {activeTab === "vendu" && (
         <Card>
           <CardContent className="p-0">
-            {venduRecoltes.length === 0 ? (
+            {nombreVentesFruits === 0 ? (
               <p className="p-8 text-muted-foreground text-center">Aucune vente</p>
             ) : (
               <Table>
@@ -713,23 +783,37 @@ function RecoltesFruitsSubTab() {
                   <TableRow>
                     <TableHead>Date récolte</TableHead>
                     <TableHead>Arbre</TableHead>
-                    <TableHead className="text-right">Quantité</TableHead>
+                    <TableHead className="text-right">Quantité nette</TableHead>
                     <TableHead className="text-right">Prix/kg</TableHead>
                     <TableHead className="text-right">Total</TableHead>
                     <TableHead>Client</TableHead>
                     <TableHead>Date vente</TableHead>
+                    <TableHead>Règlements</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {venduRecoltes.map((r) => (
                     <TableRow key={r.id}>
                       <TableCell>{new Date(r.date).toLocaleDateString("fr-FR")}</TableCell>
-                      <TableCell className="font-medium">{r.arbre.nom}</TableCell>
+                      <TableCell className="font-medium">{r.arbre.nom}{r.warnings?.map(message => <p key={message} className="mt-1 max-w-sm text-xs text-amber-800">{message}</p>)}</TableCell>
                       <TableCell className="text-right">{r.quantite} kg</TableCell>
                       <TableCell className="text-right">{r.prixKg ? `${r.prixKg} EUR` : "-"}</TableCell>
                       <TableCell className="text-right font-bold">{r.prixTotal ? `${r.prixTotal.toFixed(2)} EUR` : "-"}</TableCell>
                       <TableCell>{r.clientNom || "-"}</TableCell>
                       <TableCell>{r.dateVente ? new Date(r.dateVente).toLocaleDateString("fr-FR") : "-"}</TableCell>
+                      <TableCell>{r.factureId ? <><Link className="block text-sm text-primary underline" href={`/comptabilite/factures?id=${r.factureId}`}>Facture</Link><ReglementsDialog type="Facture" id={r.factureId} onChange={fetchData} /></> : r.ecriture ? <ReglementsDialog type="VenteManuelle" id={r.ecriture.id} onChange={fetchData} /> : "-"}</TableCell>
+                    </TableRow>
+                  ))}
+                  {livraisonsFruits.map(({ lot, vente }) => (
+                    <TableRow key={`commercial:${vente.cle}`}>
+                      <TableCell>{new Date(lot.date).toLocaleDateString('fr-FR')}</TableCell>
+                      <TableCell className="font-medium">{lot.arbre.nom}<PiecesCommerciales vente={vente} /></TableCell>
+                      <TableCell className="text-right"><QuantiteCommerciale vente={vente} /></TableCell>
+                      <TableCell className="text-right">-</TableCell>
+                      <TableCell className="text-right font-bold"><MontantCommercial vente={vente} /></TableCell>
+                      <TableCell>{vente.clientNom}</TableCell>
+                      <TableCell>{new Date(vente.date).toLocaleDateString('fr-FR')}</TableCell>
+                      <TableCell>{vente.facture && ['emise', 'payee'].includes(vente.facture.statut) ? <ReglementsDialog type="Facture" id={vente.facture.id} onChange={fetchData} /> : '-'}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -755,13 +839,14 @@ function RecoltesFruitsSubTab() {
                     <TableHead>Qualité</TableHead>
                     <TableHead>Statut</TableHead>
                     <TableHead>Notes</TableHead>
+                    <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {perteRecoltes.map((r) => (
-                    <TableRow key={r.id}>
-                      <TableCell>{new Date(r.date).toLocaleDateString("fr-FR")}</TableCell>
-                      <TableCell className="font-medium">{r.arbre.nom}</TableCell>
+                    <TableRow key={r.cleHistorique}>
+                      <TableCell>{celluleDate(r)}</TableCell>
+                      <TableCell className="font-medium">{r.arbre.nom}{r.warnings?.map(message => <p key={message} className="mt-1 max-w-sm text-xs text-amber-800">{message}</p>)}</TableCell>
                       <TableCell className="text-right">{r.quantite} kg</TableCell>
                       <TableCell className="capitalize">{r.qualite || "-"}</TableCell>
                       <TableCell>
@@ -769,7 +854,17 @@ function RecoltesFruitsSubTab() {
                           {labelStatutRecolteArbre(r.statut)}
                         </Badge>
                       </TableCell>
-                      <TableCell className="text-muted-foreground text-sm">{r.notes || "-"}</TableCell>
+                      <TableCell className="text-muted-foreground text-sm">{retirerMarqueSaison(r.notes) || "-"}</TableCell>
+                      <TableCell className="text-right">
+                        {r.sortieId && r.statut === "transforme" ? (
+                          <span className="text-xs text-muted-foreground">Annulable depuis Produits transformés</span>
+                        ) : r.sortieId && (
+                          <Button disabled={sortieEnCours} variant="ghost" size="sm" onClick={() => handleAnnulerSortie(r.id, { id: r.sortieId!, quantite: r.quantite, statut: r.statut })} title="Annuler cette sortie : la quantité revient en stock">
+                            <RotateCcw className="h-4 w-4 mr-1" />
+                            Annuler
+                          </Button>
+                        )}
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -778,6 +873,8 @@ function RecoltesFruitsSubTab() {
           </CardContent>
         </Card>
       )}
+
+      <TransformationDialog open={lotATransformer != null} onOpenChange={(ouvert) => { if (!ouvert) setLotATransformer(null) }} lotInitialId={lotATransformer} onCree={fetchData} />
 
       {/* Dialog Nouvelle recolte */}
       <Dialog open={showDialog} onOpenChange={(ouvert) => (ouvert ? setShowDialog(true) : fermerDialogue())}>
@@ -820,11 +917,17 @@ function RecoltesFruitsSubTab() {
             {/* QA cmsqn6n46 — même contrôle de fenêtre que la taille : une
                 récolte de Golden fin mai était acceptée sans un mot et rendait
                 le graphique mensuel inexploitable (pic en mai). Non bloquant :
-                les micro-climats existent, mais l'écart est DIT. */}
+                les micro-climats existent, mais l'écart est DIT.
+                QA cmvkoxe5o (2026-10-23) — période de la VARIÉTÉ d'abord,
+                espèce à défaut : même règle que la route. */}
             {(() => {
               const arbre = arbresFruitiers.find((a) => a.id.toString() === newRecolte.arbreId)
-              const w = arbre?.espece
-                ? checkOperationSaison(arbre.espece, "recolte", newRecolte.date, arbre.variete)
+              const w = arbre
+                ? alerteSaisonRecolteArbre({
+                    espece: arbre.espece,
+                    variete: arbre.periodeRecolteVariete,
+                    date: newRecolte.date,
+                  })
                 : null
               if (!w) return null
               return (
@@ -1073,6 +1176,7 @@ function RecoltesFruitsSubTab() {
                 <Input
                   type="number"
                   step="0.01"
+                  min="0.01"
                   value={venteData.prixKg}
                   onChange={(e) => setVenteData({ ...venteData, prixKg: e.target.value })}
                 />
@@ -1082,6 +1186,8 @@ function RecoltesFruitsSubTab() {
                   Total : {(parseFloat(venteData.prixKg) * selectedRecolte.quantite).toFixed(2)} EUR
                 </p>
               )}
+              {selectedRecolte.warnings?.map(message => <p key={message} role="alert" className="text-sm text-amber-800">{message}</p>)}
+              <ReglementVente value={venteData} onChange={v => setVenteData({ ...venteData, ...v })} />
               <div className="flex items-center space-x-2">
                 <Checkbox
                   id="creerFactureRecolte"
@@ -1096,7 +1202,7 @@ function RecoltesFruitsSubTab() {
                 <Button variant="outline" onClick={() => setShowVenteDialog(false)}>
                   Annuler
                 </Button>
-                <Button onClick={handleVendre} disabled={!venteData.prixKg}>
+                <Button onClick={handleVendre} disabled={venteEnCours || !venteData.prixKg || (venteData.paye && (!venteData.modeReglement || !venteData.datePaiement))}>
                   Valider la vente
                 </Button>
               </div>
@@ -1142,7 +1248,7 @@ function ProductionBoisSubTab() {
     clientId: "",
     clientNom: "",
     prixVente: "",
-    creerFacture: false,
+    creerFacture: false, ...paiementVenteInitial(),
   })
 
   const [utiliseData, setUtiliseData] = React.useState({
@@ -1203,12 +1309,26 @@ function ProductionBoisSubTab() {
     fetchData()
   }, [fetchData])
 
-  const stockProductions = productions.filter(p => p.statut === "en_stock")
-  const venduProductions = productions.filter(p => p.statut === "vendu")
-  const utiliseProductions = productions.filter(p => p.statut === "utilise")
+  const stockProductions = productions.filter(p => p.statut === "en_stock" && (p.stockDisponibleCommercial ?? quantiteBois(p).quantite) > 0).map(p => {
+    const initial = quantiteBois(p).quantite
+    const ratio = p.stockDisponibleCommercial == null || initial <= 0 ? 1 : p.stockDisponibleCommercial / initial
+    return { ...p, volumeM3: p.volumeM3 == null ? null : p.volumeM3 * ratio, volumeStere: p.volumeStere == null ? null : p.volumeStere * ratio, poidsKg: p.poidsKg == null ? null : p.poidsKg * ratio }
+  })
+  const venduProductions = productions.filter(p => p.statut === "vendu" && !p.ventesCommerciales?.some(v => v.facture?.id === p.factureId))
+  const livraisonsBois = productions.flatMap(lot => (lot.ventesCommerciales ?? []).map(vente => ({ lot, vente })))
+  const nombreVentesBois = venduProductions.length + livraisonsBois.length
+  const utiliseProductions = [
+    ...productions.filter(p => p.statut === "utilise").map(p => ({ ...p, cleHistorique: `lot-${p.id}`, sortieId: null as string | null, quantiteUtilisee: quantiteBois(p) })),
+    ...productions.flatMap(p => (p.mouvementsCommerciaux ?? []).map(m => ({ ...p, cleHistorique: m.id, sortieId: m.id as string | null, date: m.date,
+      destination: m.notes, quantiteUtilisee: { quantite: m.quantite, unite: m.unite } }))),
+  ].sort((a, b) => b.date.localeCompare(a.date))
 
   const stockVolume = stockProductions.reduce((sum, p) => sum + (p.volumeM3 || 0), 0)
-  const venduVolume = venduProductions.reduce((sum, p) => sum + (p.volumeM3 || 0), 0)
+  const venduVolume = venduProductions.reduce((sum, p) => sum + (p.volumeM3 || 0), 0) + livraisonsBois.reduce((sum, { lot, vente }) => {
+    const initial = quantiteBois(lot).quantite
+    return sum + (initial > 0 ? (lot.volumeM3 ?? 0) * vente.quantiteNette / initial : 0)
+  }, 0)
+  const venduPoids = venduProductions.reduce((sum, p) => sum + (quantiteBois(p).unite === 'kg' ? p.poidsKg ?? 0 : 0), 0) + livraisonsBois.filter(r => r.vente.unite === 'kg').reduce((sum, r) => sum + r.vente.quantiteNette, 0)
   const totalVentes = venduProductions.reduce((sum, p) => sum + (p.prixVente || 0), 0)
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -1283,8 +1403,12 @@ function ProductionBoisSubTab() {
     }
   }
 
+  const [venteEnCours, setVenteEnCours] = React.useState(false)
+
   const handleVendre = async () => {
-    if (!selectedProduction) return
+    if (!selectedProduction || venteEnCours) return
+    if (!Number.isFinite(Number(venteData.prixVente)) || Number(venteData.prixVente) <= 0) { toast({ title: "Saisissez un prix supérieur à zéro", variant: "destructive" }); return }
+    setVenteEnCours(true)
     try {
       const res = await fetch(`/api/arbres/bois/${selectedProduction.id}`, {
         method: "PATCH",
@@ -1297,12 +1421,15 @@ function ProductionBoisSubTab() {
           clientNom: venteData.clientNom || null,
           destination: "vente",
           creerFacture: venteData.creerFacture,
+          paye: venteData.paye,
+          modeReglement: venteData.modeReglement || null,
+          datePaiement: venteData.paye ? venteData.datePaiement : undefined,
         }),
       })
       if (res.ok) {
         setShowVenteDialog(false)
         setSelectedProduction(null)
-        setVenteData({ clientId: "", clientNom: "", prixVente: "", creerFacture: false })
+        setVenteData({ clientId: "", clientNom: "", prixVente: "", creerFacture: false, ...paiementVenteInitial() })
         toast({ title: "Vente enregistrée" })
         fetchData()
       } else {
@@ -1311,17 +1438,35 @@ function ProductionBoisSubTab() {
       }
     } catch {
       toast({ title: "Erreur", variant: "destructive" })
-    }
+    } finally { setVenteEnCours(false) }
+  }
+
+  // Revue du 2026-10-29 : un usage interne se rattrape ; le volume revient au
+  // reliquat (route idempotente, mêmes verrous que la sortie).
+  const handleAnnulerUsage = async (lotId: number, sortie: { id: string; quantite: number; unite: string }) => {
+    if (isSubmitting) return
+    setIsSubmitting(true)
+    try {
+      if (!(await confirmDialog(`Annuler cet usage interne de ${sortie.quantite.toLocaleString("fr-FR")} ${sortie.unite} ? La quantité revient en stock.`))) return
+      const res = await fetch(`/api/arbres/bois/${lotId}/sorties/${encodeURIComponent(sortie.id)}`, { method: "DELETE" })
+      if (!res.ok) { const data = await res.json().catch(() => ({})); throw new Error(data.error || `Erreur ${res.status}`) }
+      toast({ title: "Usage annulé", description: "La quantité est revenue en stock." })
+      fetchData()
+    } catch (e) {
+      toast({ title: "Annulation refusée", description: e instanceof Error ? e.message : "Erreur", variant: "destructive" })
+    } finally { setIsSubmitting(false) }
   }
 
   const handleUtiliser = async () => {
-    if (!selectedProduction) return
+    if (!selectedProduction || isSubmitting) return
+    setIsSubmitting(true)
     try {
       const res = await fetch(`/api/arbres/bois/${selectedProduction.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           statut: "utilise",
+          cleIdempotence: crypto.randomUUID(),
           destination: utiliseData.destination,
         }),
       })
@@ -1337,11 +1482,13 @@ function ProductionBoisSubTab() {
       }
     } catch {
       toast({ title: "Erreur", variant: "destructive" })
-    }
+    } finally { setIsSubmitting(false) }
   }
 
   const handleDelete = async (id: number) => {
-    if (!(await confirmDialog("Supprimer cette production ?"))) return
+    // Revue du 2026-10-29 : un lot sans BL ni facture se supprime avec ses sorties.
+    const sorties = productions.find((p) => p.id === id)?.mouvementsCommerciaux?.length ?? 0
+    if (!(await confirmDialog(`Supprimer cette production ?${sorties ? " Ses usages internes enregistrés seront supprimés aussi." : ""}`))) return
     try {
       const res = await fetch(`/api/arbres/bois/${id}`, { method: "DELETE" })
       if (res.ok) {
@@ -1358,7 +1505,7 @@ function ProductionBoisSubTab() {
 
   const openVenteDialog = (p: ProductionBois) => {
     setSelectedProduction(p)
-    setVenteData({ clientId: "", clientNom: "", prixVente: "", creerFacture: false })
+    setVenteData({ clientId: "", clientNom: "", prixVente: "", creerFacture: false, ...paiementVenteInitial() })
     setShowVenteDialog(true)
   }
 
@@ -1371,14 +1518,14 @@ function ProductionBoisSubTab() {
   return (
     <div className="space-y-4">
       {/* Stats */}
-      <div className="grid gap-3 grid-cols-3">
+      <div className="grid gap-3 grid-cols-2 sm:grid-cols-3">
         <Card className="border-amber-200 bg-amber-50">
           <CardContent className="pt-4">
             <div className="flex items-center gap-2 mb-1">
               <Package className="h-4 w-4 text-amber-600" />
               <p className="text-sm text-amber-700">En stock</p>
             </div>
-            <p className="text-2xl font-bold text-amber-800">{stockVolume.toFixed(1)} m³</p>
+            <p className="text-2xl font-bold text-amber-800">{libelleVolumeBois(stockVolume)}</p>
             <p className="text-xs text-amber-600">{stockProductions.length} lot(s)</p>
           </CardContent>
         </Card>
@@ -1386,19 +1533,20 @@ function ProductionBoisSubTab() {
           <CardContent className="pt-4">
             <div className="flex items-center gap-2 mb-1">
               <ShoppingCart className="h-4 w-4 text-green-600" />
-              <p className="text-sm text-green-700">Vendu</p>
+              <p className="text-sm text-green-700">Vendu / livré</p>
             </div>
-            <p className="text-2xl font-bold text-green-800">{venduVolume.toFixed(1)} m³</p>
-            <p className="text-xs text-green-600">{venduProductions.length} vente(s)</p>
+            <p className="text-2xl font-bold text-green-800">{libelleVolumeBois(venduVolume)}</p>
+            {venduPoids > 0 && <p className="text-sm text-green-700">{libellePoidsBois(venduPoids)}</p>}
+            <p className="text-xs text-green-600">{nombreVentesBois} vente(s) / livraison(s)</p>
           </CardContent>
         </Card>
-        <Card className="border-blue-200 bg-blue-50">
+        <Card className="col-span-2 border-blue-200 bg-blue-50 sm:col-span-1" data-testid="bois-revenus">
           <CardContent className="pt-4">
             <div className="flex items-center gap-2 mb-1">
               <Euro className="h-4 w-4 text-blue-600" />
               <p className="text-sm text-blue-700">CA Ventes</p>
             </div>
-            <p className="text-2xl font-bold text-blue-800">{totalVentes.toFixed(2)} EUR</p>
+            <RevenusProductions direct={totalVentes} commercial={livraisonsBois.map(r => r.vente)} className="break-words text-2xl font-bold text-blue-800" />
           </CardContent>
         </Card>
       </div>
@@ -1414,7 +1562,7 @@ function ProductionBoisSubTab() {
             </TabsTrigger>
             <TabsTrigger value="vendu" className="flex items-center gap-2">
               <ShoppingCart className="h-4 w-4" />
-              Vendu ({venduProductions.length})
+              Vendu / livré ({nombreVentesBois})
             </TabsTrigger>
             <TabsTrigger value="utilise" className="flex items-center gap-2">
               <Axe className="h-4 w-4" />
@@ -1452,11 +1600,12 @@ function ProductionBoisSubTab() {
                   {stockProductions.map((p) => (
                     <TableRow key={p.id}>
                       <TableCell>{new Date(p.date).toLocaleDateString("fr-FR")}</TableCell>
-                      <TableCell>{labelTypeBois(p.type)}</TableCell>
+                      <TableCell>{libelleTypeBois(p.type)}</TableCell>
                       <TableCell>{p.arbre?.nom || "-"}</TableCell>
-                      <TableCell className="text-right">{p.volumeM3 ? `${p.volumeM3} m³` : "-"}</TableCell>
-                      <TableCell className="text-right">{p.poidsKg ? `${p.poidsKg} kg` : "-"}</TableCell>
+                      <TableCell className="text-right">{p.volumeM3 ? libelleVolumeBois(p.volumeM3) : "-"}</TableCell>
+                      <TableCell className="text-right">{p.poidsKg ? libellePoidsBois(p.poidsKg) : "-"}</TableCell>
                       <TableCell className="text-right">
+                        <Link className="block text-sm text-primary underline" href={`/comptabilite/factures?tab=livraisons&stock=bois:${p.id}`}>Préparer un BL</Link>
                         <div className="flex justify-end gap-1">
                           {p.type === "abattage" && (
                             <Button
@@ -1470,14 +1619,14 @@ function ProductionBoisSubTab() {
                               Replanter
                             </Button>
                           )}
-                          <Button variant="outline" size="sm" onClick={() => openVenteDialog(p)}>
+                          <Button variant="outline" size="sm" disabled={p.stockDisponibleCommercial != null} onClick={() => openVenteDialog(p)}>
                             <Euro className="h-4 w-4 mr-1" />
                             Vendre
                           </Button>
-                          <Button variant="ghost" size="sm" onClick={() => openUtiliseDialog(p)}>
+                          <Button variant="ghost" size="sm" disabled={isSubmitting} onClick={() => openUtiliseDialog(p)}>
                             Utiliser
                           </Button>
-                          <Button variant="ghost" size="sm" onClick={() => handleDelete(p.id)}>
+                          <Button variant="ghost" size="sm" disabled={!!p.figeCommercial} onClick={() => handleDelete(p.id)}>
                             <Trash2 className="h-4 w-4 text-red-500" />
                           </Button>
                         </div>
@@ -1495,7 +1644,7 @@ function ProductionBoisSubTab() {
       {activeTab === "vendu" && (
         <Card>
           <CardContent className="p-0">
-            {venduProductions.length === 0 ? (
+            {nombreVentesBois === 0 ? (
               <p className="p-8 text-muted-foreground text-center">Aucune vente enregistrée</p>
             ) : (
               <Table>
@@ -1503,18 +1652,19 @@ function ProductionBoisSubTab() {
                   <TableRow>
                     <TableHead>Date vente</TableHead>
                     <TableHead>Type</TableHead>
-                    <TableHead className="text-right">Volume</TableHead>
+                    <TableHead className="text-right">Quantité</TableHead>
                     <TableHead>Client</TableHead>
                     <TableHead className="text-right">Prix</TableHead>
                     <TableHead>Facture</TableHead>
+                    <TableHead>Règlements</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {venduProductions.map((p) => (
                     <TableRow key={p.id}>
                       <TableCell>{p.dateVente ? new Date(p.dateVente).toLocaleDateString("fr-FR") : "-"}</TableCell>
-                      <TableCell>{labelTypeBois(p.type)}</TableCell>
-                      <TableCell className="text-right">{p.volumeM3 ? `${p.volumeM3} m³` : "-"}</TableCell>
+                      <TableCell>{libelleTypeBois(p.type)}</TableCell>
+                      <TableCell className="text-right">{formatNombre(quantiteBois(p).quantite, 3)} {quantiteBois(p).unite}</TableCell>
                       <TableCell>{p.clientNom || "-"}</TableCell>
                       <TableCell className="text-right font-medium text-green-600">
                         {p.prixVente ? `${p.prixVente} EUR` : "-"}
@@ -1528,6 +1678,18 @@ function ProductionBoisSubTab() {
                           </Link>
                         ) : "-"}
                       </TableCell>
+                      <TableCell>{p.factureId ? <ReglementsDialog type="Facture" id={p.factureId} onChange={fetchData} /> : p.ecriture ? <ReglementsDialog type="VenteManuelle" id={p.ecriture.id} onChange={fetchData} /> : "-"}</TableCell>
+                    </TableRow>
+                  ))}
+                  {livraisonsBois.map(({ lot, vente }) => (
+                    <TableRow key={`commercial:${vente.cle}`}>
+                      <TableCell>{new Date(vente.date).toLocaleDateString('fr-FR')}</TableCell>
+                      <TableCell>{libelleTypeBois(lot.type)}</TableCell>
+                      <TableCell className="text-right"><QuantiteCommerciale vente={vente} /></TableCell>
+                      <TableCell>{vente.clientNom}</TableCell>
+                      <TableCell className="text-right font-medium text-green-600"><MontantCommercial vente={vente} /></TableCell>
+                      <TableCell><PiecesCommerciales vente={vente} /></TableCell>
+                      <TableCell>{vente.facture && ['emise', 'payee'].includes(vente.facture.statut) ? <ReglementsDialog type="Facture" id={vente.facture.id} onChange={fetchData} /> : '-'}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -1551,15 +1713,24 @@ function ProductionBoisSubTab() {
                     <TableHead>Type</TableHead>
                     <TableHead className="text-right">Volume</TableHead>
                     <TableHead>Destination</TableHead>
+                    <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {utiliseProductions.map((p) => (
-                    <TableRow key={p.id}>
+                    <TableRow key={p.cleHistorique}>
                       <TableCell>{new Date(p.date).toLocaleDateString("fr-FR")}</TableCell>
-                      <TableCell>{labelTypeBois(p.type)}</TableCell>
-                      <TableCell className="text-right">{p.volumeM3 ? `${p.volumeM3} m³` : "-"}</TableCell>
+                      <TableCell>{libelleTypeBois(p.type)}</TableCell>
+                      <TableCell className="text-right">{p.quantiteUtilisee.quantite.toLocaleString("fr-FR")} {p.quantiteUtilisee.unite}</TableCell>
                       <TableCell>{labelDestinationBois(p.destination)}</TableCell>
+                      <TableCell className="text-right">
+                        {p.sortieId && (
+                          <Button disabled={isSubmitting} variant="ghost" size="sm" onClick={() => handleAnnulerUsage(p.id, { id: p.sortieId!, ...p.quantiteUtilisee })} title="Annuler cet usage : la quantité revient en stock">
+                            <RotateCcw className="h-4 w-4 mr-1" />
+                            Annuler
+                          </Button>
+                        )}
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -1590,7 +1761,7 @@ function ProductionBoisSubTab() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {TYPES_PRODUCTION.map((t) => (
+                    {TYPES_PRODUCTION_BOIS.map((t) => (
                       <SelectItem key={t.value} value={t.value}>
                         {t.label}
                       </SelectItem>
@@ -1689,7 +1860,7 @@ function ProductionBoisSubTab() {
             <div className="space-y-4">
               <div className="p-3 bg-amber-50 rounded-lg">
                 <p className="text-sm text-amber-700">
-                  {selectedProduction.type} - {selectedProduction.volumeM3} m³
+                  {resumeLotBois(selectedProduction)}
                   {selectedProduction.arbre && ` (${selectedProduction.arbre.nom})`}
                 </p>
               </div>
@@ -1737,6 +1908,7 @@ function ProductionBoisSubTab() {
                   placeholder="Ex: 150.00"
                 />
               </div>
+              <ReglementVente value={venteData} onChange={v => setVenteData({ ...venteData, ...v })} />
               <div className="flex items-center space-x-2">
                 <Checkbox
                   id="creerFactureBois"
@@ -1750,7 +1922,7 @@ function ProductionBoisSubTab() {
               <Button
                 onClick={handleVendre}
                 className="w-full bg-green-600 hover:bg-green-700"
-                disabled={!venteData.prixVente}
+                disabled={venteEnCours || !venteData.prixVente || (venteData.paye && (!venteData.modeReglement || !venteData.datePaiement))}
               >
                 Confirmer la vente
               </Button>
@@ -1769,7 +1941,7 @@ function ProductionBoisSubTab() {
             <div className="space-y-4">
               <div className="p-3 bg-amber-50 rounded-lg">
                 <p className="text-sm text-amber-700">
-                  {selectedProduction.type} - {selectedProduction.volumeM3} m³
+                  {resumeLotBois(selectedProduction)}
                 </p>
               </div>
               <div>
@@ -1790,7 +1962,7 @@ function ProductionBoisSubTab() {
                   </SelectContent>
                 </Select>
               </div>
-              <Button onClick={handleUtiliser} className="w-full">
+              <Button disabled={isSubmitting} onClick={handleUtiliser} className="w-full">
                 Confirmer
               </Button>
             </div>

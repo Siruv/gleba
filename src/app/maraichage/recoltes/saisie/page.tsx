@@ -6,8 +6,7 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
-import { ArrowLeft, BarChart3, Save, Plus } from "lucide-react"
+import { ArrowLeft, BarChart3, Save } from "lucide-react"
 import { format, differenceInDays } from "date-fns"
 import { fr } from "date-fns/locale"
 
@@ -18,11 +17,13 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useToast } from "@/hooks/use-toast"
 import { AppHeader, PageToolbar } from "@/components/shell/AppHeader"
 import {
+  UNITES_QUANTITE,
   libelleUniteQuantite,
   rendementParM2,
   uniteQuantiteRecolte,
   type UniteQuantite,
 } from "@/lib/recolte/projection"
+import { lienChezMoiEspece } from "@/lib/especes/fiche-url"
 import {
   ajouterQuantite,
   formatQuantiteParUnite,
@@ -30,6 +31,8 @@ import {
 } from "@/lib/recolte/quantites"
 import { libelleUniteRendement } from "@/lib/validations/espece"
 import { surfaceCultureM2 } from "@/lib/culture-surface"
+import { useJourNavigateur } from "@/hooks/use-jour-navigateur"
+import { BoutonPartagerRecolte } from "@/components/avis/PartagerRecolte"
 
 interface Culture {
   id: number
@@ -78,19 +81,32 @@ function libelleCulture(culture: Culture): string {
 }
 
 export default function SaisieRecoltePage() {
-  const router = useRouter()
   const { toast } = useToast()
   const [cultures, setCultures] = React.useState<Culture[]>([])
   const [selectedCulture, setSelectedCulture] = React.useState<string>("")
   const [quantite, setQuantite] = React.useState<string>("")
-  const [date, setDate] = React.useState<string>(format(new Date(), "yyyy-MM-dd"))
+  // Date par défaut = jour du navigateur, vide au prérendu du build et à
+  // l'hydratation : une valeur initiale calculée au rendu y figeait le jour du
+  // build dans le HTML (value="2026-10-23" servi le 25, 2026-10-25). Le jour
+  // vaut tant que la personne n'a pas choisi de date (`null`) ; vider le champ
+  // reste un choix (`""`), refusé à l'envoi comme avant.
+  const jourNavigateur = useJourNavigateur()
+  const [dateChoisie, setDate] = React.useState<string | null>(null)
+  const date = dateChoisie ?? jourNavigateur ?? ""
+  const champDate = React.useRef<HTMLInputElement>(null)
+  React.useEffect(() => {
+    // Une date tapée avant l'hydratation (champ alors vide côté React) reste
+    // celle du champ : lue avant le re-rendu qui pose le jour.
+    const tapee = champDate.current?.value
+    if (tapee) setDate(tapee)
+  }, [])
   const [datePeremption, setDatePeremption] = React.useState<string>("")
   const [notes, setNotes] = React.useState<string>("")
   const [isSubmitting, setIsSubmitting] = React.useState(false)
   // Un refus du serveur (récolte avant la plantation…) reste affiché sous le
   // formulaire : un toast de quelques secondes passait inaperçu (cmsp5927v).
   const [submitError, setSubmitError] = React.useState<string | null>(null)
-  const [recentRecoltes, setRecentRecoltes] = React.useState<{especeId: string; especeNom?: string; cultureId: number; quantite: number; unite: UniteQuantite}[]>([])
+  const [recentRecoltes, setRecentRecoltes] = React.useState<{id: number | null; especeId: string; especeNom?: string; cultureId: number; quantite: number; unite: UniteQuantite}[]>([])
 
   // Charger les cultures actives (en cours de recolte ou plantées)
   React.useEffect(() => {
@@ -263,22 +279,29 @@ export default function SaisieRecoltePage() {
 
       // Ajouter aux recoltes récentes
       const especeNom = cultureData.espece.nom ?? cultureData.especeId
+      // L'unité affichée est celle que le serveur a figée sur la récolte.
+      const creee = await response.json().catch(() => null)
+      const uniteEnregistree: UniteQuantite =
+        creee && typeof creee.unite === "string" && (UNITES_QUANTITE as readonly string[]).includes(creee.unite)
+          ? (creee.unite as UniteQuantite)
+          : uniteQuantiteRecolte(cultureData.espece.uniteRendement)
       setRecentRecoltes((prev) => [
         {
+          id: typeof creee?.id === "number" ? creee.id : null,
           especeId: cultureData.especeId,
           especeNom,
           cultureId: cultureData.id,
           quantite: parseFloat(quantite),
           // L'unité voyage avec la ligne : la session peut enchaîner une carotte
           // au kilo et un dahlia à la tige.
-          unite: uniteQuantiteRecolte(cultureData.espece.uniteRendement),
+          unite: uniteEnregistree,
         },
         ...prev.slice(0, 4),
       ])
 
       toast({
         title: "Récolte enregistrée",
-        description: `${quantite} ${libelleUnite} de ${especeNom}`,
+        description: `${quantite} ${libelleUniteQuantite(uniteEnregistree, parseFloat(quantite))} de ${especeNom}`,
       })
 
       // Réinitialiser le formulaire (garder la culture sélectionnée)
@@ -339,6 +362,7 @@ export default function SaisieRecoltePage() {
                   {/* QA cmv2r0qua — name + resynchronisation au blur : la date
                       affichée est celle enregistrée (filet relu à l'envoi). */}
                   <Input
+                    ref={champDate}
                     id="saisie-recolte-date"
                     type="date"
                     name="date"
@@ -455,10 +479,17 @@ export default function SaisieRecoltePage() {
                 )}
               </div>
 
-              {/* Quantité */}
+              {/* Quantité, dans l'unité de comptage de l'espèce sur la ferme.
+                  Ticket QA du 2026-10-19 : l'unité n'était ni dite ni
+                  atteignable d'ici. Elle se décide pour l'espèce entière
+                  (récoltes, stock, projections), donc sur sa fiche, pas dans
+                  ce formulaire : on la montre et on y renvoie. */}
               <div>
-                <label className="text-sm font-medium">Quantité ({libelleUnite}) *</label>
+                <label className="text-sm font-medium" htmlFor="saisie-recolte-quantite">
+                  Quantité ({libelleUnite}) *
+                </label>
                 <Input
+                  id="saisie-recolte-quantite"
                   type="number"
                   step="0.01"
                   min="0"
@@ -467,6 +498,18 @@ export default function SaisieRecoltePage() {
                   placeholder="0.00"
                   className="mt-1 text-2xl h-14 text-center"
                 />
+                {selectedCultureData && (
+                  <p className="mt-1 text-xs text-muted-foreground" data-testid="saisie-recolte-unite">
+                    Unité de comptage de l&apos;espèce {selectedCultureData.espece.nom ?? selectedCultureData.espece.id} sur
+                    votre ferme : {libelleUnite}.{" "}
+                    <Link
+                      href={lienChezMoiEspece(selectedCultureData.espece.id)}
+                      className="text-primary underline underline-offset-2"
+                    >
+                      Changer l&apos;unité sur la fiche de l&apos;espèce
+                    </Link>
+                  </p>
+                )}
                 {/* Raccourcis */}
                 <div className="flex gap-2 mt-2">
                   {quickQuantities.map((q) => (
@@ -522,11 +565,12 @@ export default function SaisieRecoltePage() {
             <CardContent>
               <ul className="space-y-2">
                 {recentRecoltes.map((r, i) => (
-                  <li key={i} className="flex justify-between text-sm">
+                  <li key={r.id ?? i} className="flex flex-wrap items-center justify-between gap-2 text-sm">
                     <span>{r.especeNom ?? r.especeId}</span>
                     <span className="font-medium text-green-600">
                       {r.quantite} {libelleUniteQuantite(r.unite, r.quantite)}
                     </span>
+                    {r.id !== null && <BoutonPartagerRecolte recolteId={r.id} />}
                   </li>
                 ))}
               </ul>

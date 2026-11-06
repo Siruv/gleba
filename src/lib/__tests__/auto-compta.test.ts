@@ -3,22 +3,30 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   venteDeleteMany: vi.fn(),
   venteCreate: vi.fn(),
+  venteFindFirst: vi.fn(),
   depenseDeleteMany: vi.fn(),
   depenseCreate: vi.fn(),
+  depenseFindFirst: vi.fn(),
   alimentFindUnique: vi.fn(),
+  campagneFindFirst: vi.fn(),
 }))
 
 vi.mock('@/lib/prisma', () => {
   const tx = {
+    $queryRaw: async () => [],
+    $executeRaw: async () => 0,
     venteManuelle: {
       deleteMany: mocks.venteDeleteMany,
       create: mocks.venteCreate,
+      findFirst: mocks.venteFindFirst,
     },
     depenseManuelle: {
       deleteMany: mocks.depenseDeleteMany,
       create: mocks.depenseCreate,
+      findFirst: mocks.depenseFindFirst,
     },
     aliment: { findUnique: mocks.alimentFindUnique },
+    campagnePlantation: { findFirst: mocks.campagneFindFirst },
   }
   return {
     default: {
@@ -30,7 +38,16 @@ vi.mock('@/lib/prisma', () => {
 
 import {
   createDepenseFromAchatAnimal,
+  createDepenseFromAchatArbre,
+  createDepenseFromCampagnePlantation,
+  createDepenseFromIntervention,
+  createDepenseFromLotAnimaux,
+  createDepenseFromOperationArbre,
+  createDepenseFromSoinAnimal,
   createDepenseFromConsommationAliment,
+  createVenteFromProductionBois,
+  createVenteFromRecolte,
+  createVenteFromRecolteArbre,
   createVenteFromVenteProduit,
   upsertVenteFromReservationElevage,
 } from '@/lib/auto-compta'
@@ -39,6 +56,8 @@ describe('invariants auto-compta élevage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.venteCreate.mockImplementation(async ({ data }) => ({ id: 1, ...data }))
+    mocks.venteFindFirst.mockResolvedValue(null)
+    mocks.depenseFindFirst.mockResolvedValue(null)
     mocks.depenseCreate.mockImplementation(async ({ data }) => ({ id: 1, ...data }))
     mocks.alimentFindUnique.mockResolvedValue({
       nom: 'Foin',
@@ -64,6 +83,27 @@ describe('invariants auto-compta élevage', () => {
         paye: false,
       }),
     })
+  })
+
+  // Décision du 2026-10-30 : une vente démarre payée, comme avant le 2026-10-28.
+  it.each([undefined, null])('présume payée une vente au statut absent (%s)', async (paye) => {
+    await createVenteFromVenteProduit('user-1', {
+      id: 10, type: 'animal_vivant', prixTotal: 100, paye,
+    })
+    expect(mocks.venteCreate).toHaveBeenCalledWith({
+      data: expect.objectContaining({ paye: true }),
+    })
+  })
+
+  it('une vente maraîchère reste présumée payée', async () => {
+    await createVenteFromRecolte('user-1', { id: 12, especeId: 'Radis', quantite: 10, unite: 'botte', prixKg: 2, prixTotal: 20 })
+    expect(mocks.venteCreate.mock.calls[0][0].data).toMatchObject({ sourceType: 'recolte', paye: true, montant: 20 })
+  })
+
+  it('une vente maraîchère dépointée le reste quand la récolte est régénérée', async () => {
+    mocks.venteFindFirst.mockResolvedValue({ paye: false })
+    await createVenteFromRecolte('user-1', { id: 12, especeId: 'Radis', quantite: 10, unite: 'botte', prixKg: 2, prixTotal: 20 })
+    expect(mocks.venteCreate.mock.calls[0][0].data).toMatchObject({ sourceType: 'recolte', paye: false, montant: 20 })
   })
 
   it('classe une vente de miel dans les produits de la ruche avec son taux réel', async () => {
@@ -116,11 +156,13 @@ describe('invariants auto-compta élevage', () => {
 
   it('ventile une cession livrée entre acompte payé et solde impayé sans double compte', async () => {
     const tx = {
+      $executeRaw: async () => 0,
       venteManuelle: {
         deleteMany: mocks.venteDeleteMany,
         create: mocks.venteCreate,
+        findFirst: mocks.venteFindFirst,
       },
-    } as Parameters<typeof upsertVenteFromReservationElevage>[0]
+    } as unknown as Parameters<typeof upsertVenteFromReservationElevage>[0]
 
     await upsertVenteFromReservationElevage(tx, 'user-1', {
       id: 'reservation-1',
@@ -137,5 +179,202 @@ describe('invariants auto-compta élevage', () => {
     expect(rows.map((row) => row.montant)).toEqual([300, 1100])
     expect(rows.map((row) => row.paye)).toEqual([true, false])
     expect(rows.reduce((sum, row) => sum + row.montant, 0)).toBe(1400)
+  })
+
+  // Ticket cmvgdzsf7 (2026-10-20) — le miroir est supprimé puis recréé à chaque
+  // modification de la source : la pièce saisie dans Transactions (règlement,
+  // numéro de pièce, notes) doit survivre à la régénération.
+  it('reporte le suivi saisi sur l’ancien miroir, pas le statut payé', async () => {
+    mocks.venteFindFirst.mockResolvedValue({
+      modeReglement: 'Chèque',
+      numeroPiece: 'CHQ-0042',
+      journal: 'VE',
+      pjUrl: null,
+      notes: 'Remis en banque le 21/10',
+    })
+
+    await createVenteFromVenteProduit('user-1', {
+      id: 167,
+      type: 'oeufs',
+      prixTotal: 86.4,
+      tauxTVA: 5.5,
+      paye: false,
+    })
+
+    // L'ancien miroir est lu avec la même portée que celle qu'on supprime.
+    expect(mocks.venteFindFirst).toHaveBeenCalledWith({
+      where: { userId: 'user-1', sourceType: 'vente_produit', sourceId: 167, auto: true },
+      select: { modeReglement: true, numeroPiece: true, journal: true, pjUrl: true, notes: true },
+    })
+    const data = mocks.venteCreate.mock.calls[0][0].data
+    expect(data).toMatchObject({
+      modeReglement: 'Chèque',
+      numeroPiece: 'CHQ-0042',
+      journal: 'VE',
+      notes: 'Remis en banque le 21/10',
+      // `paye` reste celui de la source.
+      paye: false,
+      montant: 86.4,
+    })
+    expect(data).not.toHaveProperty('pjUrl')
+  })
+
+  it('reporte le suivi de chaque ligne d’une réservation sur la ligne de même référence', async () => {
+    mocks.venteFindFirst.mockImplementation(async ({ where }) =>
+      where.sourceRef === 'reservation-1:acompte' ? { numeroPiece: 'VIR-7', notes: null } : null,
+    )
+    const tx = {
+      $executeRaw: async () => 0,
+      venteManuelle: {
+        deleteMany: mocks.venteDeleteMany,
+        create: mocks.venteCreate,
+        findFirst: mocks.venteFindFirst,
+      },
+    } as unknown as Parameters<typeof upsertVenteFromReservationElevage>[0]
+
+    await upsertVenteFromReservationElevage(tx, 'user-1', {
+      id: 'reservation-1',
+      statut: 'livree',
+      acompte: 300,
+      montant: 1400,
+      dateReservation: new Date('2026-07-01'),
+      dateLivraison: new Date('2026-08-01'),
+    })
+
+    const rows = mocks.venteCreate.mock.calls.map((call) => call[0].data)
+    expect(rows.map((row) => row.numeroPiece)).toEqual(['VIR-7', undefined])
+  })
+
+  // Revue du 2026-10-20 : la lecture du suivi et la suppression de l'ancien
+  // miroir sont scopées au compte, pour chaque source (pas seulement l'élevage).
+  it.each([
+    ['recolte', () => createVenteFromRecolte('user-1', { id: 1177, especeId: 'Dahlia', quantite: 40, unite: 'tige', prixKg: 1.2, prixTotal: 48 })],
+    ['recolte_arbre', () => createVenteFromRecolteArbre('user-1', { id: 51, quantite: 10, prixKg: 3, prixTotal: 30 })],
+    ['production_bois', () => createVenteFromProductionBois('user-1', { id: 34, type: 'elagage', volumeM3: 3, prixVente: 450 })],
+  ])('reprend le suivi du miroir %s dans le seul compte de la source', async (sourceType, regenerer) => {
+    mocks.venteFindFirst.mockResolvedValue({ numeroPiece: 'PC-7', modeReglement: 'Virement', notes: null })
+
+    await regenerer()
+
+    const sourceId = { recolte: 1177, recolte_arbre: 51, production_bois: 34 }[sourceType as string]
+    const where = { userId: 'user-1', sourceType, sourceId, auto: true }
+    expect(mocks.venteFindFirst).toHaveBeenCalledWith(expect.objectContaining({ where }))
+    expect(mocks.venteDeleteMany).toHaveBeenCalledWith({ where })
+    expect(mocks.venteCreate.mock.calls[0][0].data).toMatchObject({
+      userId: 'user-1',
+      sourceType,
+      numeroPiece: 'PC-7',
+      modeReglement: 'Virement',
+    })
+  })
+
+  // QA cmvnp0dm9 (2026-10-25) — vente de bois sans facture : l'écriture
+  // portait « Vente bois - elagage - … - 0.2 m³ ».
+  it('décrit la vente de bois par le libellé du type, comme l’écran et la facture', async () => {
+    await createVenteFromProductionBois('user-1', {
+      id: 41,
+      type: 'elagage',
+      volumeM3: 0.2,
+      prixVente: 24,
+      arbre: { nom: 'Noyer 2', espece: 'Noyer' },
+    })
+
+    expect(mocks.venteCreate.mock.calls[0][0].data).toMatchObject({
+      description: 'Vente bois - Élagage - Noyer 2 - 0,2 m³',
+      quantite: 0.2,
+      unite: 'm³',
+    })
+  })
+})
+
+
+describe('suivi des achats d’élevage', () => {
+  it('conserve l’impayé, la pièce et l’échéance lors d’une correction de lot', async () => {
+    vi.clearAllMocks()
+    const suivi = { paye: false, modeReglement: 'Virement', numeroPiece: 'ACH-QA', journal: 'AC', pjUrl: null, notes: 'Pointage à vérifier', refFacture: 'FA-QA', dateEcheance: new Date('2026-11-01') }
+    mocks.depenseFindFirst.mockResolvedValue(suivi)
+    await createDepenseFromLotAnimaux('user-1', { id: 71, nom: 'Poules QA', prixAchatTotal: 211 })
+    expect(mocks.depenseFindFirst.mock.calls[0][0].where).toEqual({ userId: 'user-1', auto: true, sourceType: 'achat_animal', sourceId: 71 })
+    expect(mocks.depenseCreate).toHaveBeenCalledWith({ data: expect.objectContaining({ ...suivi, montant: 211, montantHT: 200, montantTVA: 11 }) })
+  })
+  it('permet de saisir le mode sur une vente sans changer son statut impayé', async () => {
+    mocks.venteFindFirst.mockResolvedValue(null)
+    await createVenteFromVenteProduit('user-1', { id: 22, type: 'oeufs', prixTotal: 12, paye: false, modeReglement: 'Chèque' })
+    expect(mocks.venteCreate).toHaveBeenCalledWith({ data: expect.objectContaining({ modeReglement: 'Chèque', paye: false }) })
+  })
+})
+
+/**
+ * Régression P1 de la revue du 2026-10-29 : la garde des paiements déclarés
+ * refusait la correction du coût de tout miroir payé (soins, interventions…).
+ * Depuis le 2026-10-30, opérations d'arbre et campagnes naissent payées aussi :
+ * la garde est retirée, une correction garde le pointage existant.
+ */
+describe('correction du coût d’un miroir de dépense payé', () => {
+  const pointage = { paye: true, modeReglement: 'Virement', numeroPiece: 'PIECE-QA', journal: 'AC', pjUrl: null, notes: null, refFacture: null, dateEcheance: null }
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.depenseCreate.mockImplementation(async ({ data }) => ({ id: 1, ...data }))
+    mocks.depenseFindFirst.mockResolvedValue({ ...pointage, montant: 50 })
+  })
+
+  it('accepte la correction d’un soin payé par défaut et garde son pointage', async () => {
+    await expect(createDepenseFromSoinAnimal('user-1', { id: 81, type: 'vermifuge', cout: 80, fait: true })).resolves.toMatchObject({ montant: 80, paye: true, modeReglement: 'Virement' })
+  })
+
+  it('accepte la correction d’une intervention payée par défaut et garde son pointage', async () => {
+    await expect(createDepenseFromIntervention('user-1', { id: 82, type: 'amendement', coutTotal: 80, intrantCout: 80 })).resolves.toMatchObject({ montant: 80, paye: true, numeroPiece: 'PIECE-QA' })
+  })
+
+  it('accepte la correction d’une opération d’arbre payée et garde son pointage', async () => {
+    await expect(createDepenseFromOperationArbre('user-1', { id: 83, type: 'taille', cout: 80, fait: true })).resolves.toMatchObject({ montant: 80, paye: true, numeroPiece: 'PIECE-QA' })
+  })
+
+  it('accepte la correction d’une campagne payée et garde son pointage', async () => {
+    await expect(createDepenseFromCampagnePlantation('user-1', { id: 84, nom: 'Haie QA', coutReel: 80, datePlantationReelle: '2026-03-01' })).resolves.toMatchObject({ montant: 80, paye: true, modeReglement: 'Virement' })
+  })
+
+  it('crée payées une nouvelle opération d’arbre et une nouvelle campagne', async () => {
+    mocks.depenseFindFirst.mockResolvedValue(null)
+    await createDepenseFromOperationArbre('user-1', { id: 85, type: 'greffe', cout: 40, fait: true })
+    await createDepenseFromCampagnePlantation('user-1', { id: 86, nom: 'Verger QA', coutReel: 220, datePlantationReelle: '2026-03-01' })
+    expect(mocks.depenseCreate.mock.calls.map(([{ data }]) => [data.sourceType, data.paye])).toEqual([['operation_arbre', true], ['campagne_plantation', true]])
+  })
+})
+
+describe('achat d’arbre présumé réglé', () => {
+  const arbre = { id: 91, nom: 'Pommier QA', prixAchat: 33, fournisseur: null, dateAchat: null, datePlantation: null, createdAt: new Date('2026-03-04T10:00:00Z') }
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.depenseCreate.mockImplementation(async ({ data }) => ({ id: 1, ...data }))
+  })
+
+  it('crée un nouvel achat réglé, à 10 % en plants, daté de la fiche', async () => {
+    mocks.depenseFindFirst.mockResolvedValue(null)
+    await createDepenseFromAchatArbre('user-1', arbre)
+    expect(mocks.depenseCreate).toHaveBeenCalledWith({ data: expect.objectContaining({ paye: true, tauxTVA: 10, categorie: 'plants', montant: 33, date: arbre.createdAt }) })
+    expect(mocks.depenseCreate.mock.calls[0][0].data.montantHT).toBeCloseTo(30, 10)
+  })
+
+  it('garde le taux, la catégorie et le pointage du miroir existant quand le prix change', async () => {
+    mocks.depenseFindFirst.mockResolvedValue({ montant: 100, paye: true, modeReglement: 'Chèque', numeroPiece: null, journal: 'AC', pjUrl: null, notes: null, refFacture: null, dateEcheance: null, tauxTVA: 5.5, categorie: 'achats' })
+    await createDepenseFromAchatArbre('user-1', { ...arbre, prixAchat: 211 })
+    const data = mocks.depenseCreate.mock.calls[0][0].data
+    expect(data).toMatchObject({ montant: 211, tauxTVA: 5.5, categorie: 'achats', paye: true, modeReglement: 'Chèque' })
+    expect(data.montantHT).toBeCloseTo(200, 10)
+    expect(data.montantTVA).toBeCloseTo(11, 10)
+  })
+})
+
+describe('campagne de plantation sans date', () => {
+  it('date sa dépense à la création de la campagne, comme la liste Transactions', async () => {
+    vi.clearAllMocks()
+    const creation = new Date('2026-02-11T08:00:00Z')
+    mocks.depenseFindFirst.mockResolvedValue(null)
+    mocks.depenseCreate.mockImplementation(async ({ data }) => ({ id: 1, ...data }))
+    mocks.campagneFindFirst.mockResolvedValue({ createdAt: creation })
+    await createDepenseFromCampagnePlantation('user-1', { id: 95, nom: 'Haie QA', coutReel: 220, datePlantationReelle: null, datePlantationPrevue: null })
+    expect(mocks.campagneFindFirst).toHaveBeenCalledWith({ where: { id: 95, userId: 'user-1' }, select: { createdAt: true } })
+    expect(mocks.depenseCreate.mock.calls[0][0].data.date).toEqual(creation)
   })
 })

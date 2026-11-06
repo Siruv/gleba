@@ -20,8 +20,12 @@ import { GpsPositionButton } from "@/components/gps/GpsPositionButton"
 import { GpsMapPickerDialog } from "@/components/gps/GpsMapPickerDialog"
 import { roundCoord } from "@/lib/geolocation"
 import { parcelleCompatibleVerger } from "@/lib/verger/lot-arbres"
-import { CONDUITES_ARBRE, ETATS_ARBRE as ETATS } from "@/lib/verger/arbre-constants"
+import { avertissementSuppressionArbre, CONDUITES_ARBRE, ETATS_ARBRE as ETATS } from "@/lib/verger/arbre-constants"
 import { labelStatutRecolteArbre } from "@/lib/verger/statut-recolte-arbre"
+import { TYPES_ARBRE, categoriesEspecePourTypeArbre, estTypeArbre, libelleTypeArbre } from "@/lib/verger/types-arbre"
+import { libelleVarieteOption } from "@/lib/verger/variete-arbre"
+import { lienOperationsArbre } from "@/lib/verger/lien-operations-arbre"
+import { ChampPorteGreffe } from "@/components/verger/ChampPorteGreffe"
 
 interface Arbre {
   id: number
@@ -32,6 +36,7 @@ interface Arbre {
   portGreffe: string | null
   // Bug #1 — Champs saisis à la création mais non restitués sur la fiche détail.
   porteGreffeId: string | null
+  porteGreffeRef?: { id: string; nom: string } | null
   circonferenceCm: number | null
   gpsLat: number | null
   gpsLng: number | null
@@ -77,6 +82,7 @@ interface EspeceRef {
 
 interface VarieteRef {
   id: string
+  nom?: string | null
   especeId: string
 }
 
@@ -84,20 +90,16 @@ interface FournisseurRef {
   id?: string | null
 }
 
-// Types d'espèce du référentiel proposés selon la conduite de l'arbre ; une
-// liane (kiwi, vigne) se conduit en fruitier ou en petit fruit (2026-10-08).
-const TYPE_TO_REF: Record<string, readonly string[]> = {
-  fruitier: ["arbre_fruitier", "liane"],
-  petit_fruit: ["petit_fruit", "liane"],
+// Types d'arbre et catégories d'espèce proposées par type : liste unique
+// (src/lib/verger/types-arbre.ts), partagée avec l'onglet Arbres et le plan.
+// Une valeur héritée hors liste reste affichée, pour ne pas vider le champ.
+function optionsTypesArbre(typeCourant: string | null | undefined) {
+  const options: Array<{ value: string; label: string }> = TYPES_ARBRE.map((t) => ({ value: t.value, label: t.label }))
+  if (typeCourant && !estTypeArbre(typeCourant)) {
+    options.push({ value: typeCourant, label: libelleTypeArbre(typeCourant) })
+  }
+  return options
 }
-
-const TYPES_ARBRES = [
-  { value: "fruitier", label: "Fruitier" },
-  { value: "petit_fruit", label: "Petit fruit" },
-  { value: "forestier", label: "Forestier" },
-  { value: "ornement", label: "Ornement" },
-  { value: "haie", label: "Haie" },
-]
 
 
 export default function DetailArbrePage() {
@@ -114,8 +116,6 @@ export default function DetailArbrePage() {
   const [fournisseursRef, setFournisseursRef] = React.useState<string[]>([])
   const [parcelles, setParcelles] = React.useState<ParcelleVerger[]>([])
   const [parcellesLoading, setParcellesLoading] = React.useState(true)
-  // Bug #1 — Référentiel des porte-greffes compatibles avec l'espèce.
-  const [portesGreffesRef, setPortesGreffesRef] = React.useState<Array<{ id: string; nom: string; vigueur: number | null; precocite: number | null }>>([])
   // Feedback LVBB40430 — saisie GPS assistée (géoloc directe + carte)
   const [gpsPickerOpen, setGpsPickerOpen] = React.useState(false)
   const [gpsAccuracy, setGpsAccuracy] = React.useState<number | null>(null)
@@ -161,7 +161,7 @@ export default function DetailArbrePage() {
         (Array.isArray(varietesRes?.data) ? varietesRes.data : []) as VarieteRef[]
       )
         .filter((v) => especesIds.has(v.especeId))
-        .map((v) => ({ id: v.id, especeId: v.especeId }))
+        .map((v) => ({ id: v.id, nom: v.nom ?? null, especeId: v.especeId }))
       setVarietesRef(varietes)
       const fournisseurs = (
         (Array.isArray(fournisseursRes?.data) ? fournisseursRes.data : []) as FournisseurRef[]
@@ -183,7 +183,7 @@ export default function DetailArbrePage() {
   }, [id])
 
   const especeOptions = React.useMemo(() => {
-    const refTypes = arbre ? TYPE_TO_REF[arbre.type] : null
+    const refTypes = arbre ? categoriesEspecePourTypeArbre(arbre.type) : null
     const refEspeces = refTypes
       ? especesRef.filter(e => refTypes.includes(e.type)).map(e => e.id)
       : especesRef.map(e => e.id)
@@ -193,9 +193,11 @@ export default function DetailArbrePage() {
   }, [especesRef, suggestions.especes, arbre])
 
   const varieteOptions = React.useMemo(() => {
+    // QA 2026-10-19 — une variété personnelle se propose sous son nom, pas
+    // sous son id technique (voir src/lib/verger/variete-arbre.ts).
     const refVarietes = arbre?.espece
-      ? varietesRef.filter(v => v.especeId === arbre.espece).map(v => v.id)
-      : varietesRef.map(v => v.id)
+      ? varietesRef.filter(v => v.especeId === arbre.espece).map(libelleVarieteOption)
+      : varietesRef.map(libelleVarieteOption)
     return [...new Set([...refVarietes, ...suggestions.varietes])]
       .sort()
       .map(v => ({ value: v, label: v }))
@@ -254,19 +256,6 @@ export default function DetailArbrePage() {
       .finally(() => setRecoltesLoading(false))
   }, [session?.user, id])
 
-  // Bug #1 — Recharger la liste des porte-greffes quand l'espèce change.
-  // L'API filtre par especeId via la table porte_greffe_especes.
-  React.useEffect(() => {
-    if (!arbre?.espece) {
-      setPortesGreffesRef([])
-      return
-    }
-    fetch(`/api/verger/porte-greffes?especeId=${encodeURIComponent(arbre.espece)}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((res) => setPortesGreffesRef(res?.data || []))
-      .catch(() => setPortesGreffesRef([]))
-  }, [arbre?.espece])
-
   const handleSave = async () => {
     if (!arbre) return
     setSaving(true)
@@ -298,13 +287,8 @@ export default function DetailArbrePage() {
     }
   }
 
-  // Feedback Marc 2026-05-16 — V4 Bug 1 : avant ce fix, la
-  // suppression d'un arbre passait par un `confirm()` browser qui
-  // peut être supprimé par certaines extensions / contextes mobiles,
-  // ou simplement skippé par l'utilisateur fatigué. Or l'API DELETE
-  // cascade sur recoltes_arbres / operations_arbres / observations
-  // → 12,5 kg de récoltes disparaissaient sans avertissement. On
-  // utilise désormais `DeleteConfirmDialog` qui liste les dépendances.
+  // Le serveur décide si l'historique permet la suppression ; son refus
+  // reste visible pour que l'utilisateur sache pourquoi conserver la fiche.
   const [confirmDeleteOpen, setConfirmDeleteOpen] = React.useState(false)
   const handleDelete = () => {
     setConfirmDeleteOpen(true)
@@ -316,7 +300,9 @@ export default function DetailArbrePage() {
         toast({ title: "Arbre supprimé" })
         router.push("/verger?tab=arbres")
       } else {
-        toast({ variant: "destructive", title: "Erreur", description: "Suppression refusée" })
+        const payload = await res.json().catch(() => null)
+        toast({ variant: "destructive", title: "Suppression refusée",
+          description: typeof payload?.error === "string" ? payload.error : "La suppression n’a pas pu être effectuée." })
       }
     } catch (err) {
       console.error("Erreur suppression:", err)
@@ -407,7 +393,7 @@ export default function DetailArbrePage() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        {TYPES_ARBRES.map((t) => (
+                        {optionsTypesArbre(arbre.type).map((t) => (
                           <SelectItem key={t.value} value={t.value}>
                             {t.label}
                           </SelectItem>
@@ -437,51 +423,24 @@ export default function DetailArbrePage() {
                     />
                   </div>
                   <div>
-                    <Label>Porte-greffe</Label>
-                    {/* Bug #1 — Select sur le référentiel (M9/M26/MM106…) avec
-                        fallback Combobox texte libre si aucune correspondance
-                        pour l'espèce. portGreffe texte libre conservé pour
-                        rétro-compat. */}
-                    {portesGreffesRef.length > 0 ? (
-                      <Select
-                        value={arbre.porteGreffeId || "_none"}
-                        onValueChange={(v) =>
-                          setArbre({
-                            ...arbre,
-                            porteGreffeId: v === "_none" ? null : v,
-                            // Reflet texte libre pour rétro-compat affichage.
-                            portGreffe:
-                              v === "_none"
-                                ? null
-                                : portesGreffesRef.find((p) => p.id === v)?.nom ?? null,
-                          })
-                        }
-                      >
-                        <SelectTrigger>
-                          <SelectValue placeholder="Sélectionner" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="_none">— Aucun</SelectItem>
-                          {portesGreffesRef.map((pg) => (
-                            <SelectItem key={pg.id} value={pg.id}>
-                              {pg.nom}
-                              {pg.vigueur != null && (
-                                <span className="text-muted-foreground text-xs ml-2">
-                                  vigueur {pg.vigueur}/5
-                                </span>
-                              )}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    ) : (
-                      <Combobox
-                        value={arbre.portGreffe || ""}
-                        onValueChange={(v) => setArbre({ ...arbre, portGreffe: v })}
-                        options={suggestions.portGreffes.map((v) => ({ value: v, label: v }))}
-                        placeholder="Ex: M26"
-                      />
-                    )}
+                    <Label htmlFor="arbre-porte-greffe">Porte-greffe</Label>
+                    {/* Référentiel compatible avec l'espèce, texte libre à défaut :
+                        même champ que l'inspecteur du plan (QA cmvkp3kqc). */}
+                    <ChampPorteGreffe
+                      id="arbre-porte-greffe"
+                      espece={arbre.espece}
+                      porteGreffeId={arbre.porteGreffeId}
+                      portGreffe={arbre.portGreffe}
+                      porteGreffeNom={arbre.porteGreffeRef?.nom ?? null}
+                      suggestions={suggestions.portGreffes}
+                      onChange={(v) =>
+                        setArbre({
+                          ...arbre,
+                          ...v,
+                          porteGreffeRef: v.porteGreffeId && v.portGreffe ? { id: v.porteGreffeId, nom: v.portGreffe } : null,
+                        })
+                      }
+                    />
                   </div>
                 </div>
 
@@ -878,7 +837,10 @@ export default function DetailArbrePage() {
                 <p className="text-muted-foreground mb-4">
                   Consultez les opérations de cet arbre dans la page dédiée.
                 </p>
-                <Link href="/verger?tab=operations">
+                {/* QA cmvnorxov — le lien porte l'identifiant de l'arbre : l'onglet
+                    Opérations s'ouvre filtré sur lui, et non sur tout le verger,
+                    sur l'année civile en cours (pas l'année mémorisée). */}
+                <Link href={lienOperationsArbre(arbre.id, new Date().getFullYear())}>
                   <Button variant="outline">Voir les opérations</Button>
                 </Link>
               </CardContent>
@@ -887,22 +849,11 @@ export default function DetailArbrePage() {
         </Tabs>
       </div>
 
-      {/* Feedback Marc 2026-05-16 — V4 Bug 1 : confirmation explicite
-          avec liste des récoltes/opérations/observations qui seront
-          supprimées en cascade. */}
       <DeleteConfirmDialog
         open={confirmDeleteOpen}
         onOpenChange={setConfirmDeleteOpen}
         entityLabel={`l'arbre "${arbre.nom}"`}
-        dependencies={
-          arbre._count
-            ? [
-                { label: "récoltes", count: arbre._count.recoltesArbres ?? 0 },
-                { label: "opérations (taille, traitement, greffe…)", count: arbre._count.operationsArbres ?? 0 },
-                { label: "observations de santé", count: arbre._count.observationsSante ?? 0 },
-              ]
-            : []
-        }
+        warning={avertissementSuppressionArbre(arbre)}
         onConfirm={performDelete}
       />
 

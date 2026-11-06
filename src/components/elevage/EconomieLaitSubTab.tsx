@@ -47,6 +47,7 @@ type Economie = {
     litresParKg: number | null
     ca: number
     prixMoyenKg: number | null
+    poidsVenduEstime?: boolean
   }[]
   methode: { partGlobaleLaitiere: number; tetesLaitieres: number; tetesTotales: number; note: string }
 }
@@ -108,7 +109,7 @@ export function EconomieLaitSubTab({ year }: { year?: number } = {}) {
           {aucuneDonnee ? (
             <div className="text-sm text-slate-500 bg-slate-50 p-4 rounded">
               Aucune donnée laitière pour {data.annee}. Saisissez des collectes de lait, des fabrications de fromage et
-              leurs ventes pour activer l'analyse économique.
+              leurs ventes pour activer l&apos;analyse économique.
             </div>
           ) : (
             <>
@@ -191,7 +192,7 @@ export function EconomieLaitSubTab({ year }: { year?: number } = {}) {
                           <th className="p-2 text-right">Rendement</th>
                           <th className="p-2 text-right">L / kg</th>
                           <th className="p-2 text-right">CA</th>
-                          <th className="p-2 text-right">Prix moy. /kg</th>
+                          <th className="p-2 text-right">Prix moy. /kg vendu</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -208,6 +209,7 @@ export function EconomieLaitSubTab({ year }: { year?: number } = {}) {
                             <td className="p-2 text-right">{eur(f.ca)}</td>
                             <td className="p-2 text-right font-semibold">
                               {f.prixMoyenKg != null ? eur(f.prixMoyenKg, 2) : "—"}
+                              {f.prixMoyenKg != null && f.poidsVenduEstime && <span className="ml-1 text-xs text-muted-foreground" title="Poids vendu estimé à partir du poids moyen des pièces du lot.">est.</span>}
                             </td>
                           </tr>
                         ))}

@@ -150,7 +150,7 @@ function CartePageContent() {
           : geo.coordinates[0]
 
       const latlngs = coords.map((c: [number, number]) => [c[1], c[0]] as [number, number])
-      const bounds = (window as any).L.latLngBounds(latlngs)
+      const bounds = (window as unknown as { L: typeof L }).L.latLngBounds(latlngs)
       // fitBounds et non flyToBounds : voir handleFlyTo (QA cmv2ek8t6).
       mapRef.fitBounds(bounds, { padding: [50, 50], maxZoom: 18 })
       setSelectedParcelle(target)
@@ -364,7 +364,7 @@ function CartePageContent() {
   const handleEditConfirm = useCallback(() => {
     // Fire l'event custom sur la map pour récupérer la géométrie
     if (mapRef) {
-      mapRef.fire("editing:confirm" as any)
+      mapRef.fire("editing:confirm")
     }
   }, [mapRef])
 
@@ -414,7 +414,7 @@ function CartePageContent() {
 
       // Construire les bornes a partir des coordonnees [lng, lat]
       const latlngs = coords.map((c: [number, number]) => [c[1], c[0]] as [number, number])
-      const bounds = (window as any).L.latLngBounds(latlngs)
+      const bounds = (window as unknown as { L: typeof L }).L.latLngBounds(latlngs)
 
       // QA cmv2ek8t6 — fitBounds, jamais flyToBounds : pendant un vol de
       // plusieurs niveaux, Leaflet étire le SVG des contours sans les
@@ -467,20 +467,20 @@ function CartePageContent() {
   const isPanelOpen = selectedParcelle !== null || (isCreating && newGeometry !== null)
 
   return (
-    <div className="h-screen flex flex-col bg-slate-50">
+    <div className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-slate-50 [&:fullscreen]:!h-[100dvh]" style={{ height: "calc(100dvh - var(--app-header-h, 0px) - var(--navigation-basse-h, 0px))" }}>
       {/* Header */}
-      <header className="border-b bg-white z-50 flex-shrink-0">
-        <div className="px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <header className="z-40 shrink-0 border-b bg-white">
+        <div className="flex min-w-0 items-center justify-between gap-2 px-4 py-2 lg:px-6">
+          <div className="flex min-w-0 items-center gap-2 sm:gap-4">
             <Link href={usageFilter === "elevage" || parcelleIdParam ? "/elevage?tab=animaux" : "/jardin"}>
-              <Button variant="ghost" size="sm">
-                <ArrowLeft className="h-4 w-4 mr-2" />
-                {usageFilter === "elevage" || parcelleIdParam ? "Élevage" : "Plan schématique"}
+              <Button variant="ghost" size="sm" className="min-h-11 min-w-11">
+                <ArrowLeft className="h-4 w-4 sm:mr-2" />
+                <span className="sr-only sm:not-sr-only">{usageFilter === "elevage" || parcelleIdParam ? "Élevage" : "Plan schématique"}</span>
               </Button>
             </Link>
-            <div className="flex items-center gap-2">
-              <MapIcon className={`h-6 w-6 ${usageFilter === "elevage" || parcelleIdParam ? "text-amber-600" : "text-green-600"}`} />
-              <h1 className="text-xl font-bold">Cartographie</h1>
+            <div className="flex min-w-0 items-center gap-2">
+              <MapIcon className={`h-5 w-5 shrink-0 ${usageFilter === "elevage" || parcelleIdParam ? "text-amber-600" : "text-green-600"}`} />
+              <h1 className="truncate text-lg font-semibold sm:text-xl">Cartographie</h1>
             </div>
           </div>
 
@@ -489,6 +489,7 @@ function CartePageContent() {
             <Button
               variant="outline"
               size="sm"
+              className="min-h-11 min-w-11 shrink-0"
               onClick={() => setShowList((prev) => {
                 const next = !prev
                 if (next && window.matchMedia('(max-width: 767px)').matches) {
@@ -523,10 +524,10 @@ function CartePageContent() {
       />
 
       {/* Contenu principal */}
-      <div className="flex-1 flex overflow-hidden relative">
+      <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
         {/* Liste des parcelles (gauche) */}
         {showList && (
-          <div className="absolute inset-0 z-40 md:static md:block md:flex-shrink-0">
+          <div className="absolute inset-0 z-40 min-h-0 md:static md:block md:shrink-0">
             <ParcelleList
               parcelles={parcelles}
               selectedId={selectedParcelle?.id ?? null}
@@ -537,8 +538,13 @@ function CartePageContent() {
           </div>
         )}
 
-        {/* Zone carte (centre) */}
-        <div className="flex-1 relative">
+        {/* Zone carte (centre). QA cmvflvsk4 (2026-10-19) : la barre d'outils
+            flottante (top-4, ~52 px de haut, au-dessus de toute la carte)
+            recouvrait le contrôle Calques ouvert dès que la carte est étroite
+            (rail + liste à ~1040 px de large) : boutons radio des fonds
+            inaccessibles, menu refermé au passage de la souris sur la barre.
+            Les contrôles du coin haut droit passent sous la barre. */}
+        <div className="relative min-h-0 min-w-0 flex-1 [&_.leaflet-top.leaflet-right]:top-[60px]">
           {loading ? (
             <div className="h-full w-full flex items-center justify-center bg-muted">
               <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -593,7 +599,7 @@ function CartePageContent() {
 
         {/* Panneau d'edition (droite) */}
         {isPanelOpen && (
-          <div className="absolute inset-x-0 bottom-0 z-40 h-[72%] md:static md:h-auto md:flex-shrink-0 md:w-80">
+          <div className="absolute inset-x-0 bottom-0 z-40 h-[72%] min-h-0 md:static md:h-auto md:w-80 md:shrink-0">
             <ParcellePanel
               parcelle={selectedParcelle}
               isCreating={isCreating}
@@ -615,7 +621,7 @@ function CartePageContent() {
 export default function CartePage() {
   return (
     <Suspense fallback={
-      <div className="h-screen flex items-center justify-center">
+      <div className="flex min-h-0 items-center justify-center" style={{ height: "calc(100dvh - var(--app-header-h, 0px) - var(--navigation-basse-h, 0px))" }}>
         <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
       </div>
     }>

@@ -16,6 +16,7 @@ import {
 import { googleAuthDisponible, motifRefusConnexionGoogle } from "./auth-google"
 import { estEmailDemo } from "./demo"
 import { REFUS_CONNEXION, type CodeRefusConnexion } from "./auth-refus"
+import { redirectionApresConnexion } from "./auth-retour"
 
 /**
  * Refus de connexion porteur d'un motif lisible par le formulaire.
@@ -224,6 +225,13 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   },
   pages: {
     signIn: "/login",
+    // Sans page d'erreur, toute erreur hors de la courte liste « client »
+    // d'Auth.js (dont le contrôle PKCE `InvalidCheck`) finit sur sa page par
+    // défaut, en anglais (« Server error ») : vu le 2026-10-27 sur un second
+    // retour Google, une seconde après celui qui avait créé le compte. Sur
+    // /login, le middleware renvoie une session déjà ouverte vers l'accueil ;
+    // sinon `LoginForm` affiche le message de `OAUTH_ERROR_MESSAGES`.
+    error: "/login",
   },
   providers: [
     Credentials({
@@ -317,6 +325,9 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       }
       return true
     },
+    // Même règle que le formulaire de connexion (QA cmvnout4y) : la requête
+    // du lien profond est gardée, toute cible hors du site renvoie à l'accueil.
+    redirect: redirectionApresConnexion,
     async jwt({ token, user }) {
       if (user) {
         token.id = user.id

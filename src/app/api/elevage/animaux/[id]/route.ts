@@ -1,8 +1,11 @@
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
 /**
  * API Animal individuel
  * GET /api/elevage/animaux/[id] - Détails d'un animal
  * PUT /api/elevage/animaux/[id] - Modifier un animal
- * DELETE /api/elevage/animaux/[id] - Supprimer un animal
+ * DELETE /api/elevage/animaux/[id] - Supprimer un animal sans aucune saisie
+ *   (sinon 409 : déclarer sa sortie, cf. `src/lib/elevage/traces-animal.ts`)
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -14,7 +17,10 @@ import { enregistrerChangementLot, isAssignableAnimalLot, isOwnedParcelle } from
 import { verifierLienParenteSansCycle } from '@/lib/elevage/genealogie-validation'
 import { effacementSortieSiActif, erreurMereSortieAvantNaissance } from '@/lib/elevage/sortie-animal'
 import { visibiliteReferentiel } from '@/lib/referentiel-communaute'
+import { especeAnimaleAccessible } from '@/lib/elevage/espece-accessible'
+import { aDesTracesAnimal, compterTracesAnimal, messageSuppressionAnimalRefusee } from '@/lib/elevage/traces-animal'
 import { invalidateKpi } from '@/lib/kpi'
+import { masquerReferentielsEmbarques } from '@/lib/referentiel-embarque'
 
 export async function GET(
   request: NextRequest,
@@ -125,8 +131,13 @@ export async function GET(
         .sort((a, b) => b.date.getTime() - a.date.getTime())
     }
 
-    return NextResponse.json({ data: { ...animal, soins } })
+    // Espèce animale embarquée : jamais l'id de l'auteur d'un profil partagé
+    // par un autre compte (revue 2026-10-20).
+    return NextResponse.json({
+      data: masquerReferentielsEmbarques({ ...animal, soins }, session.user.id),
+    })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('GET /api/elevage/animaux/[id] error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la récupération', details: "Erreur interne du serveur" },
@@ -171,14 +182,19 @@ export async function PATCH(
     // PROMPT 24 — bascule lactation longue (trait sans tarir)
     if (body.lactationLongue !== undefined) data.lactationLongue = Boolean(body.lactationLongue)
 
-    const animal = await prisma.animal.update({
-      where: { id: parseInt(id) },
-      data,
-      include: { especeAnimale: true, lot: true },
+    const animal = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session.user.id)
+      const animal = await tx.animal.update({
+        where: { id: parseInt(id) },
+        data,
+        include: { especeAnimale: true, lot: true },
+      })
+      return animal
     })
 
-    return NextResponse.json({ data: animal })
+    return NextResponse.json({ data: masquerReferentielsEmbarques(animal, session.user.id) })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('PATCH /api/elevage/animaux/[id] error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la mise à jour', details: "Erreur interne du serveur" },
@@ -312,6 +328,12 @@ export async function PUT(
       )
     }
 
+    // Même contrôle que le PATCH de la collection : le PUT écrivait l'espèce
+    // reçue sans vérifier qu'elle est visible du compte (audit 2026-10-19).
+    if (especeAnimaleId !== undefined && especeAnimaleId !== existing.especeAnimaleId
+      && (typeof especeAnimaleId !== 'string' || !await especeAnimaleAccessible(session.user.id, especeAnimaleId))) {
+      return NextResponse.json({ error: 'Espèce animale invalide', champ: 'especeAnimaleId' }, { status: 400 })
+    }
     const especeCible = especeAnimaleId ?? existing.especeAnimaleId
     if (orientationProduction !== undefined && orientationProduction !== null && !['lait', 'viande', 'laine', 'mixte'].includes(orientationProduction)) {
       return NextResponse.json({ error: 'Orientation de production invalide' }, { status: 400 })
@@ -322,15 +344,17 @@ export async function PUT(
     }) : null
     if (raceAnimaleId && !raceRef) return NextResponse.json({ error: 'Race incompatible ou inaccessible' }, { status: 400 })
 
-    // On ne (re)valide le lot que s'il CHANGE : conserver un lot inchangé
-    // (même devenu inactif) ne doit pas bloquer l'édition de l'animal.
+    // Un changement d'espèce remet aussi en jeu la compatibilité du lot.
+    // Les autres corrections gardent le lot inchangé, même devenu inactif ;
+    // un lot conservé n'a pas à être actif, seulement compatible.
     if (
-      lotId !== undefined && lotId !== null && lotId !== '' &&
-      Number(lotId) !== existing.lotId &&
+      lotCible != null &&
+      (lotCible !== existing.lotId || especeCible !== existing.especeAnimaleId) &&
       !await isAssignableAnimalLot(
         session.user.id,
-        lotId,
-        especeAnimaleId ?? existing.especeAnimaleId
+        lotCible,
+        especeCible,
+        { lotConserve: lotCible === existing.lotId },
       )
     ) {
       return NextResponse.json({ error: 'Lot invalide' }, { status: 400 })
@@ -359,11 +383,15 @@ export async function PUT(
     }
 
     const animal = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
       const updated = await tx.animal.update({
         where: { id: parseInt(id) },
         data: {
         especeAnimaleId,
-        lotId: lotId !== undefined ? (lotId ? parseInt(lotId) : null) : undefined,
+        // La valeur VALIDÉE ci-dessus (`Number`), jamais une seconde conversion :
+        // `parseInt("1e3")` vaut 1 quand `Number("1e3")` vaut 1000, et l'écart
+        // rattachait l'animal au lot d'un autre compte sans contrôle (2026-10-19).
+        lotId: lotId !== undefined ? lotCible : undefined,
         identifiant,
         nom,
         race: raceAnimaleId !== undefined ? (raceRef?.nom ?? null) : race,
@@ -420,8 +448,9 @@ export async function PUT(
     })
     invalidateKpi(session.user.id)
 
-    return NextResponse.json({ data: animal })
+    return NextResponse.json({ data: masquerReferentielsEmbarques(animal, session.user.id) })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('PUT /api/elevage/animaux/[id] error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la mise à jour', details: "Erreur interne du serveur" },
@@ -448,7 +477,20 @@ export async function DELETE(
       return NextResponse.json({ error: 'Animal non trouvé' }, { status: 404 })
     }
 
+    // Audit 2026-10-08 — soins, mouvements, productions, naissances… retiennent
+    // l'animal : les supprimer avec lui (ou les détacher) abîmait le registre
+    // d'élevage. Un animal réel se déclare sorti ; seule une fiche sans aucune
+    // saisie se supprime.
+    const traces = await compterTracesAnimal(prisma, existing.id, session.user.id)
+    if (aDesTracesAnimal(traces)) {
+      return NextResponse.json(
+        { error: messageSuppressionAnimalRefusee(existing, traces), details: traces },
+        { status: 409 }
+      )
+    }
+
     await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
       await deleteAutoEntry(
         'achat_animal_individuel',
         existing.id,
@@ -462,6 +504,7 @@ export async function DELETE(
 
     return NextResponse.json({ success: true })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('DELETE /api/elevage/animaux/[id] error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la suppression', details: "Erreur interne du serveur" },

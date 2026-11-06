@@ -13,8 +13,9 @@
 import * as React from "react"
 import { urlApercu } from "@/lib/apercu-document"
 import { useSearchParams } from "next/navigation"
+import { ongletLaitDepuisSub } from "@/lib/elevage/onglets-production"
 import { updateDashboardSearchParams } from "@/lib/dashboard-navigation"
-import { Milk, FileText, LineChart, Plus, Copy, Loader2, Download, Trash2, ShieldAlert, TrendingUp, TrendingDown, Minus, Trophy, Truck, Warehouse, FlaskConical } from "lucide-react"
+import { Milk, FileText, LineChart, Plus, Copy, Loader2, Trash2, ShieldAlert, TrendingUp, TrendingDown, Minus, Trophy, Truck, Warehouse } from "lucide-react"
 import { LivraisonLaitSubTab } from "./LivraisonLaitSubTab"
 import { AffinageSubTab } from "./AffinageSubTab"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -33,6 +34,9 @@ import {
 } from "@/components/ui/dialog"
 import { useToast } from "@/hooks/use-toast"
 import { confirmDialog } from "@/lib/global-dialog"
+import { envoyerAvecConfirmationLait } from "@/lib/elevage/confirmation-lait"
+import type { BilanLait } from "@/lib/elevage/bilan-lait"
+import { BilanLaitResume } from "./BilanLaitResume"
 import { todayLocalISO } from '@/lib/format-utils'
 import {
   listerCiblesCollecteLait,
@@ -118,8 +122,10 @@ function addDaysIso(iso: string, n: number): string {
 }
 
 export function LaitSubTab() {
+  // Lien direct (`?sub=cave`, catalogue des stocks) : ouvre ce sous-onglet.
+  const ongletUrl = ongletLaitDepuisSub(useSearchParams().get("sub"))
   return (
-    <Tabs defaultValue="collecte" className="space-y-4">
+    <Tabs defaultValue={ongletUrl ?? "collecte"} className="space-y-4">
       <TabsList className="flex-wrap h-auto gap-y-1">
         <TabsTrigger value="collecte" className="flex items-center gap-1.5">
           <Milk className="h-4 w-4" />
@@ -615,6 +621,7 @@ function CollecteView() {
   const [lots, setLots] = React.useState<Lot[]>([])
   const [collectes, setCollectes] = React.useState<Collecte[]>([])
   const [attentesLait, setAttentesLait] = React.useState<AttenteLaitActive[]>([])
+  const [bilans, setBilans] = React.useState<{ jours7: BilanLait; mois: BilanLait } | null>(null)
   const [endDate, setEndDate] = React.useState(todayIso())
   const [loading, setLoading] = React.useState(true)
   const [savingKey, setSavingKey] = React.useState<string | null>(null)
@@ -635,8 +642,12 @@ function CollecteView() {
       fetch("/api/elevage/lots?statut=actif").then((r) => r.json()),
       fetch(`/api/elevage/collectes-lait?from=${from}&to=${to}`).then((r) => r.json()),
       fetch("/api/elevage/attentes").then((r) => r.json()),
+      // Bilan matière des 7 jours affichés et du mois (2026-11-03) ; un échec
+      // n'empêche pas la saisie.
+      fetch(`/api/elevage/bilan-lait?date=${to}`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ])
-      .then(([a, l, c, attentes]) => {
+      .then(([a, l, c, attentes, bilan]) => {
+        setBilans(bilan?.jours7 && bilan?.mois ? bilan : null)
         const { animaux: aList, lots: lList } = listerCiblesCollecteLait<Animal, Lot>(
           a.data,
           l.data,
@@ -1014,6 +1025,7 @@ function CollecteView() {
             </ul>
           </div>
         )}
+        <BilanLaitResume bilans={bilans} />
       </CardContent>
     </Card>
   )
@@ -1041,16 +1053,17 @@ function CellSaisie(props: {
           ? props.causeAttente
             ? `Lait exclu — ${props.causeAttente.traitement}, délai jusqu'au ${new Date(props.causeAttente.finAttenteLait).toLocaleDateString("fr-FR")} inclus`
             : "Lait exclu manuellement"
-          : undefined
+          : props.affecte
+            ? 'Lait déjà affecté à une fabrication. Annulez cette fabrication avant de corriger le volume.'
+            : undefined
       }
     >
       <input
         type="number"
         step="0.1"
         min="0"
-        max="100"
         value={v}
-        disabled={props.saving}
+        disabled={props.saving || props.affecte}
         onChange={(e) => setV(e.target.value)}
         onBlur={() => {
           const n = parseFloat(v)
@@ -1277,7 +1290,9 @@ function DialogCreationLot(props: { open: boolean; onOpenChange: (b: boolean) =>
   const submit = async () => {
     setSaving(true)
     try {
-      const res = await fetch("/api/elevage/lots-fromage", {
+      // Bilan matière du lait (2026-11-03) : du lait déjà vendu ou livré sur
+      // 7 jours demande confirmation avant d'être aussi transformé.
+      const envoi = await envoyerAvecConfirmationLait((confirmer) => fetch("/api/elevage/lots-fromage", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1293,13 +1308,15 @@ function DialogCreationLot(props: { open: boolean; onOpenChange: (b: boolean) =>
           numeroAgrement: form.numeroAgrement || null,
           notes: form.notes || null,
           collecteIds: Array.from(selection),
+          ...(confirmer ? { confirmerLaitIndisponible: true } : {}),
         }),
-      })
-      const json = await res.json()
+      }))
+      if (!envoi) return
+      const { res, json } = envoi
       if (!res.ok) {
         toast({ variant: "destructive", title: "Erreur", description: json.error || "Échec" })
       } else {
-        toast({ title: "Lot créé", description: json.data.numeroLot })
+        toast({ title: "Lot créé", description: String(json.data?.numeroLot ?? "") })
         props.onOpenChange(false)
         props.onCreated(parseInt(form.dateFabrication.slice(0, 4), 10) || new Date().getFullYear())
       }

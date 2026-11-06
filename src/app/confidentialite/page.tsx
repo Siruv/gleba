@@ -104,6 +104,18 @@ export default function ConfidentialitePage() {
           reproduction, productions, stocks, tâches et notes.
         </p>
 
+        <p>
+          Si vous configurez un connecteur de capteurs, Gleba reçoit les mesures que
+          votre serveur de réseau ou votre outil lui envoie : valeur, unité, date,
+          identifiant du capteur et, lorsqu&apos;ils sont transmis, position géographique,
+          batterie et qualité du signal. Le nom, le fuseau horaire, les règles de
+          décodage et le rattachement du capteur sont conservés dans votre exploitation.
+          Les mesures et positions restent privées à celle-ci et sont accessibles à
+          ses membres selon leurs droits. La connexion est facultative et peut être
+          désactivée ou supprimée depuis les paramètres. Le jeton du connecteur est
+          stocké sous forme d&apos;empreinte, jamais en clair.
+        </p>
+
         <h3>2.4 Données financières</h3>
         <ul>
           <li>
@@ -115,6 +127,13 @@ export default function ConfidentialitePage() {
             les renseignez pour les faire figurer sur vos factures. Elles servent
             uniquement à cet affichage : Gleba n&apos;exécute aucun paiement et
             n&apos;a accès à aucun moyen de paiement.
+          </li>
+          <li>
+            Relevés bancaires que vous importez au format CSV : leurs opérations
+            rejoignent votre comptabilité. Le fichier lui-même est conservé 30 jours
+            pour vous aider en cas d&apos;échec d&apos;import et améliorer sa lecture,
+            puis effacé automatiquement. Seul l&apos;administrateur de Gleba peut
+            l&apos;ouvrir, et uniquement pour l&apos;assistance.
           </li>
         </ul>
 
@@ -140,6 +159,41 @@ export default function ConfidentialitePage() {
           factures et préférences de livraison, sous la responsabilité du producteur.
         </p>
 
+        <h3>2.8 Forum et ancien salon</h3>
+        <p>
+          Les messages que vous publiez dans le salon de la page Communauté, avec
+          votre nom et leur date d&apos;envoi. Ils sont lisibles par tous les membres
+          connectés, jamais par les visiteurs ni depuis le compte de démonstration.
+          Vous pouvez supprimer chacun de vos messages à tout moment ; ils sont
+          effacés avec votre compte.
+        </p>
+
+        <p>
+          Le forum général est également réservé aux comptes personnels connectés.
+          Les sujets et réponses portent la signature publique que vous choisissez.
+          Vous pouvez retirer vos propres publications ; l’équipe peut modérer les
+          échanges. À la suppression du compte, vos sujets et réponses sont effacés,
+          ainsi que les réponses rattachées aux sujets que vous aviez ouverts.
+        </p>
+
+        <h3>2.9 Encyclopédie collaborative</h3>
+        <p>
+          Les discussions publiées sur une fiche végétale sont accessibles à tous,
+          avec la signature choisie, le texte et la date. Le formulaire le précise
+          avant l’envoi. Les avis terrain historiques restent réservés aux membres.
+          Les photos suivent leur propre procédure de proposition et de validation.
+        </p>
+        <p>
+          Une proposition documentaire comprend votre texte, ses sources, le motif
+          et une signature publique. Elle est visible par vous et par l’équipe de
+          relecture. Après validation, son texte et sa signature sont publiés sous
+          la licence CC BY 4.0 explicitement acceptée au formulaire, et conservés
+          dans l’historique des versions. La suppression du compte efface les
+          propositions et remplace la signature des versions publiées par
+          « Ancien membre » ; ces versions restent consultables pour préserver
+          l’histoire de la connaissance commune.
+        </p>
+
         <h2>3. Finalités</h2>
         <ul>
           <li>Fournir les fonctions de gestion agricole que vous utilisez.</li>
@@ -148,6 +202,7 @@ export default function ConfidentialitePage() {
           <li>Traiter les commandes et la facturation des boutiques.</li>
           <li>Vous envoyer les e-mails nécessaires au service (vérification d&apos;adresse, réinitialisation de mot de passe, confirmations).</li>
           <li>Vous adresser des informations sur le produit, uniquement si vous ne vous y êtes pas opposé, avec un lien de désabonnement en un clic dans chaque envoi.</li>
+          <li>Vous assister en cas de difficulté et corriger les défauts du service, par exemple un relevé bancaire que l&apos;import ne sait pas lire.</li>
           <li>Respecter les obligations légales, notamment comptables.</li>
         </ul>
         <p>
@@ -160,7 +215,7 @@ export default function ConfidentialitePage() {
           <li><strong>Exécution du contrat</strong> : compte, fonctionnalités, commandes.</li>
           <li><strong>Obligation légale</strong> : comptabilité, traçabilité, registres réglementaires.</li>
           <li><strong>Consentement</strong> : géolocalisation, notifications, cookies de mesure d&apos;audience, assistant IA.</li>
-          <li><strong>Intérêt légitime</strong> : sécurité du service et prévention des abus.</li>
+          <li><strong>Intérêt légitime</strong> : sécurité du service, prévention des abus, assistance et correction des défauts (fichiers de relevés bancaires conservés 30 jours).</li>
         </ul>
 
         <h2>5. Destinataires et sous-traitants</h2>
@@ -181,6 +236,14 @@ export default function ConfidentialitePage() {
             conditions et de sa politique de confidentialité. Si vous ne
             souhaitez pas ce transfert, n&apos;utilisez pas l&apos;assistant : le
             reste de l&apos;application fonctionne sans lui.
+            Si vous utilisez le micro, la dictée peut aussi transmettre votre
+            audio au service vocal de votre navigateur.
+            Les photos que vous choisissez de joindre sont également transmises
+            pour analyse visuelle. Elles sont redimensionnées et leurs
+            métadonnées EXIF (dont la position GPS) sont retirées avant cet envoi.
+            Elles restent privées dans votre conversation Gleba et sont
+            supprimées avec celle-ci. Évitez d&apos;y inclure des personnes ou
+            des documents personnels sans nécessité.
           </li>
           <li>
             <strong>Météo, sol et eau</strong> : les coordonnées de la parcelle
@@ -211,7 +274,15 @@ export default function ConfidentialitePage() {
         <h2>6. Durée de conservation</h2>
         <ul>
           <li>Compte et données d&apos;exploitation : tant que le compte existe, puis 3 ans après le dernier accès.</li>
+          <li>
+            Capteurs connectés : les mesures détaillées sont purgées par journées
+            complètes après le seuil de 90 jours, après conservation des agrégats
+            journaliers. Ceux-ci, ainsi que les réglages et la dernière position
+            transmise, restent jusqu&apos;à la suppression du capteur, du connecteur
+            ou des données de l&apos;exploitation.
+          </li>
           <li>Données comptables : 10 ans (Code de commerce, art. L123-22).</li>
+          <li>Fichiers de relevés bancaires importés : 30 jours, puis effacement automatique.</li>
           <li>Journaux de connexion : 12 mois.</li>
           <li>Consentement aux cookies : 13 mois au maximum (délibération CNIL 2020-091).</li>
         </ul>
@@ -289,7 +360,7 @@ export default function ConfidentialitePage() {
         </p>
 
         <p className="text-xs text-slate-500 mt-12">
-          Dernière mise à jour : 2026-10-10 — version 2.1.
+          Dernière mise à jour : 2026-11-01 — version 2.5.
         </p>
       </main>
     </div>

@@ -6,7 +6,6 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
 import { format, differenceInCalendarDays } from "date-fns"
 import { fr } from "date-fns/locale"
 import { ArrowLeft, BarChart3, Package, ShoppingCart, Euro, Trash2, AlertTriangle, Plus, RefreshCw, FileText, Clock, Timer } from "lucide-react"
@@ -42,14 +41,30 @@ import {
 import { Combobox } from "@/components/ui/combobox"
 import { useToast } from "@/hooks/use-toast"
 import { confirmDialog } from "@/lib/global-dialog"
+import { BoutonPartagerRecolte } from "@/components/avis/PartagerRecolte"
 import { AppHeader, PageToolbar } from "@/components/shell/AppHeader"
 import { libelleUniteQuantite, type UniteQuantite } from "@/lib/recolte/projection"
+import { formatMontantDevise } from "@/lib/format-utils"
+import { formatPrixUnitaire } from "@/lib/comptabilite/prix-unitaire"
+import {
+  libelleCourtValorisation,
+  libelleMethodesValorisation,
+  libelleValorisationLot,
+  prixProposeDeVente,
+  type ValorisationLot,
+} from "@/lib/recolte/valorisation"
 import {
   ajouterQuantite,
   formatQuantite,
   formatQuantiteParUnite,
   type QuantiteParUnite,
 } from "@/lib/recolte/quantites"
+import {
+  comparaisonADire,
+  lignesComparaison,
+  LIMITE_GESTION_STOCKS,
+  type ComparaisonStockLots,
+} from "@/lib/stocks/rapprochement-recoltes"
 
 /** Unité d'une ligne de récolte ; null = kg (lignes antérieures au 2026-08-20). */
 const uniteRecolte = (unite: string | null | undefined): UniteQuantite =>
@@ -69,6 +84,8 @@ interface RecolteWithRelations {
   cultureId: number
   date: string
   quantite: number
+  stockDisponibleCommercial?: number | null
+  produitsBoutique?: Array<{ id: number }>
   /** Unité figée à la saisie ; null = kg (lignes antérieures au 2026-08-20). */
   unite: string | null
   statut: string
@@ -80,6 +97,12 @@ interface RecolteWithRelations {
   factureId: number | null
   datePeremption: string | null
   notes: string | null
+  /**
+   * Valeur d'un lot en stock servie par `GET /api/recoltes` (règle unique
+   * `valoriserLot`, la même que Comptabilité > Stocks unifiés), source
+   * toujours dite (`aucune` = sans prix dans son unité) ; null = lot sorti.
+   */
+  valorisation?: ValorisationLot | null
   espece: {
     id: string
     prixKg: number | null
@@ -97,8 +120,16 @@ interface Client {
   nom: string
 }
 
+/**
+ * Lots d'une espèce comparés au stock de Gestion des stocks
+ * (`GET /api/stocks?type=recoltes`, champ `comparaisonLots`).
+ */
+interface StockEspece {
+  id: string
+  comparaisonLots: ComparaisonStockLots | null
+}
+
 export default function RecoltesPage() {
-  const router = useRouter()
   const { toast } = useToast()
   const [data, setData] = React.useState<RecolteWithRelations[]>([])
   const [clients, setClients] = React.useState<Client[]>([])
@@ -108,6 +139,8 @@ export default function RecoltesPage() {
   const [selectedAnnee, setSelectedAnnee] = React.useState<string>('all')
   const [selectedEspece, setSelectedEspece] = React.useState<string>('all')
   const [especes, setEspeces] = React.useState<{ id: string }[]>([])
+  // null = comparaison non chargée : l'écran n'affiche que ses lots.
+  const [stocksEspeces, setStocksEspeces] = React.useState<StockEspece[] | null>(null)
 
   // Dialog vente
   const [showVenteDialog, setShowVenteDialog] = React.useState(false)
@@ -153,7 +186,7 @@ export default function RecoltesPage() {
         const result = await clientsRes.json()
         setClients(result.data || [])
       }
-    } catch (error) {
+    } catch {
       toast({
         variant: "destructive",
         title: "Erreur",
@@ -168,8 +201,24 @@ export default function RecoltesPage() {
     fetchData()
   }, [fetchData])
 
+  // Ticket cmvnpe6ip — comparaison avec Gestion des stocks : toutes espèces
+  // et toutes années, filtrée ici ; chargée une fois, puis après chaque
+  // sortie ou suppression de lot, jamais au changement d'année ou d'espèce.
+  const chargerComparaisons = React.useCallback(async () => {
+    try {
+      const res = await fetch("/api/stocks?type=recoltes")
+      setStocksEspeces(res.ok ? ((await res.json()).data ?? null) : null)
+    } catch {
+      setStocksEspeces(null)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    chargerComparaisons()
+  }, [chargerComparaisons])
+
   // Filtrer par statut
-  const stockRecoltes = data.filter(r => !r.statut || r.statut === "en_stock")
+  const stockRecoltes = data.filter(r => (!r.statut || r.statut === "en_stock") && !r.produitsBoutique?.length && (r.stockDisponibleCommercial ?? r.quantite) > 0).map(r => ({ ...r, quantite: r.stockDisponibleCommercial ?? r.quantite }))
   const venduRecoltes = data.filter(r => r.statut === "vendu")
   // QA 2026-07-30 — L'auto-consommation était rangée avec les pertes : le KPI
   // annonçait « Pertes 0,8 kg » pour une récolte simplement consommée à la
@@ -215,9 +264,29 @@ export default function RecoltesPage() {
       {},
     )
   const stockParUnite = ventiler(stockRecoltes)
+  // Ticket cmvnpe6ip — « En stock » reste la somme des lots, ce qui se vend.
+  // Gestion des stocks repart d'un comptage daté : son écart avec les lots
+  // est dit espèce par espèce, jamais cumulé (un stock négatif en masquerait
+  // un autre), et seulement pour les espèces récoltées sur cet écran.
+  const especesRecoltees = new Set(especes.map((e) => e.id))
+  const comparaisons = (stocksEspeces ?? []).filter(
+    (s): s is StockEspece & { comparaisonLots: ComparaisonStockLots } =>
+      s.comparaisonLots != null &&
+      especesRecoltees.has(s.id) &&
+      (selectedEspece === 'all' || s.id === selectedEspece) &&
+      comparaisonADire(s.comparaisonLots)
+  )
   const venduParUnite = ventiler(venduRecoltes)
   const totalVentes = venduRecoltes.reduce((sum, r) => sum + (r.prixTotal || 0), 0)
-  const stockValeur = stockRecoltes.reduce((sum, r) => sum + (r.quantite * (r.espece?.prixKg || 0)), 0)
+  // Ticket cmvnvaal2 — la valeur d'un lot vient du serveur (`valoriserLot`),
+  // jamais de `quantité × Espece.prixKg` : ce prix de catalogue est en €/kg
+  // (dahlia à 30) et faisait valoir 30 € à une tige. Même règle et même
+  // chiffre que Comptabilité > Stocks unifiés, méthode dite à l'écran.
+  const stockValeur =
+    Math.round(stockRecoltes.reduce((sum, r) => sum + (r.valorisation?.valeur ?? 0), 0) * 100) / 100
+  const stockMethode = libelleMethodesValorisation(
+    stockRecoltes.flatMap((r) => (r.valorisation ? [r.valorisation] : [])),
+  )
 
   const handleDelete = async (id: number) => {
     if (!(await confirmDialog("Supprimer cette récolte ?"))) return
@@ -226,6 +295,7 @@ export default function RecoltesPage() {
       const response = await fetch(`/api/recoltes/${id}`, { method: "DELETE" })
       if (response.ok) {
         setData(data.filter(r => r.id !== id))
+        chargerComparaisons()
         toast({ title: "Récolte supprimée" })
       } else {
         const payload = await response.json().catch(() => null)
@@ -235,7 +305,7 @@ export default function RecoltesPage() {
           description: payload?.error || "La suppression a échoué",
         })
       }
-    } catch (error) {
+    } catch {
       toast({ variant: "destructive", title: "Erreur" })
     }
   }
@@ -245,7 +315,10 @@ export default function RecoltesPage() {
     setVenteData({
       clientId: "",
       clientNom: "",
-      prixKg: recolte.espece?.prixKg?.toString() || "",
+      // Prix proposé = prix de valorisation du lot DANS SON UNITÉ, limité aux
+      // sources admises pour une vente (`prixProposeDeVente`, la même liste que
+      // la boutique) : jamais le barème indicatif ni un prix au kilo pour des tiges.
+      prixKg: String(prixProposeDeVente(recolte.valorisation) ?? ""),
       quantiteVendue: recolte.quantite.toString(),
       creerFacture: false,
     })
@@ -324,6 +397,7 @@ export default function RecoltesPage() {
         // Une vente partielle scinde la récolte (reliquat en stock) → on
         // recharge la liste plutôt que de patcher la ligne localement.
         fetchData()
+        chargerComparaisons()
       } else {
         const payload = await res.json().catch(() => null)
         toast({
@@ -332,7 +406,7 @@ export default function RecoltesPage() {
           description: payload?.error || "La vente n'a pas pu être enregistrée",
         })
       }
-    } catch (err) {
+    } catch {
       toast({ title: "Erreur", variant: "destructive" })
     } finally {
       setVenteSubmitting(false)
@@ -352,6 +426,7 @@ export default function RecoltesPage() {
       if (res.ok) {
         const updated = await res.json()
         setData(data.map(r => r.id === updated.id ? updated : r))
+        chargerComparaisons()
         toast({ title: "Marqué comme perte" })
       } else {
         const payload = await res.json().catch(() => null)
@@ -361,7 +436,7 @@ export default function RecoltesPage() {
           description: payload?.error || "Le changement de statut a échoué",
         })
       }
-    } catch (err) {
+    } catch {
       toast({ title: "Erreur", variant: "destructive" })
     }
   }
@@ -379,6 +454,7 @@ export default function RecoltesPage() {
       if (res.ok) {
         const updated = await res.json()
         setData(data.map(r => r.id === updated.id ? updated : r))
+        chargerComparaisons()
         toast({ title: "Consommation perso enregistrée" })
       } else {
         const payload = await res.json().catch(() => null)
@@ -388,7 +464,7 @@ export default function RecoltesPage() {
           description: payload?.error || "Le changement de statut a échoué",
         })
       }
-    } catch (err) {
+    } catch {
       toast({ title: "Erreur", variant: "destructive" })
     }
   }
@@ -468,7 +544,10 @@ export default function RecoltesPage() {
               <p className="text-2xl font-bold text-green-800">
                 {formatQuantiteParUnite(stockParUnite)}
               </p>
-              <p className="text-xs text-green-600">Valeur: {stockValeur.toFixed(2)} €</p>
+              <p className="text-xs text-green-600">Valeur : {formatMontantDevise(stockValeur)}</p>
+              {stockMethode && (
+                <p className="text-[11px] text-green-700/80">{stockMethode}</p>
+              )}
               {(perimesCount > 0 || bientotPerimesCount > 0) && (
                 <div className="mt-1 flex gap-2 text-xs">
                   {perimesCount > 0 && (
@@ -499,7 +578,7 @@ export default function RecoltesPage() {
                 <Euro className="h-4 w-4 text-emerald-600" />
                 <p className="text-sm text-emerald-700">CA Ventes</p>
               </div>
-              <p className="text-2xl font-bold text-emerald-800">{totalVentes.toFixed(2)} €</p>
+              <p className="text-2xl font-bold text-emerald-800">{formatMontantDevise(totalVentes)}</p>
             </CardContent>
           </Card>
           <Card className="border-orange-200 bg-orange-50">
@@ -545,6 +624,39 @@ export default function RecoltesPage() {
                 <CardTitle className="text-base">Récoltes en stock</CardTitle>
               </CardHeader>
               <CardContent>
+                {/* Ticket cmvnpe6ip — par espèce : stock de Gestion des stocks,
+                    lots en stock, écart, et seulement les composantes que
+                    les données établissent ; aucune cause supposée. */}
+                {!isLoading && comparaisons.length > 0 && (
+                  <div
+                    role="note"
+                    className="mb-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900"
+                  >
+                    <p className="mb-2 font-medium">Comparaison avec Gestion des stocks (lots de toutes les années)</p>
+                    <ul className="space-y-2">
+                      {comparaisons.map((s) => {
+                        const { ligne, complements } = lignesComparaison(s.comparaisonLots)
+                        return (
+                          <li key={s.id}>
+                            <span className="font-medium">{s.id}</span> : {ligne}
+                            {complements.length > 0 && (
+                              <ul className="ml-5 list-disc">
+                                {complements.map((c) => (
+                                  <li key={c}>{c}</li>
+                                ))}
+                              </ul>
+                            )}
+                          </li>
+                        )
+                      })}
+                    </ul>
+                    <p className="mt-2 text-xs">{LIMITE_GESTION_STOCKS}</p>
+                    <Link href="/maraichage/stocks?tab=recoltes" className="mt-1 inline-block underline">
+                      Voir Gestion des stocks
+                    </Link>
+                  </div>
+                )}
+                {data.some((r) => r.produitsBoutique?.length) && <p className="mb-3 text-sm text-muted-foreground">Les récoltes mises en boutique sont suivies dans leur catalogue. <Link className="text-primary underline" href="/boutique?tab=produits">Voir les stocks boutique</Link></p>}
                 {isLoading ? (
                   <p className="text-muted-foreground">Chargement...</p>
                 ) : stockRecoltes.length === 0 ? (
@@ -618,21 +730,37 @@ export default function RecoltesPage() {
                               )}
                             </TableCell>
                             <TableCell className="text-right text-blue-600">
-                              {r.espece?.prixKg ? `${(r.quantite * r.espece.prixKg).toFixed(2)} €` : "-"}
+                              {r.valorisation && r.valorisation.source !== "aucune" ? (
+                                <span title={libelleValorisationLot(r.valorisation)}>
+                                  {formatMontantDevise(r.valorisation.valeur)}
+                                  <span className="block text-[10px] text-muted-foreground">
+                                    {formatPrixUnitaire(r.valorisation.prixUnitaire)} € / {libelleUniteQuantite(r.valorisation.unite, 1)}, {libelleCourtValorisation(r.valorisation)}
+                                  </span>
+                                </span>
+                              ) : (
+                                <span className="text-muted-foreground">
+                                  -
+                                  <span className="block text-[10px]">
+                                    sans prix en {libelleUniteQuantite(uniteRecolte(r.unite), 2)}
+                                  </span>
+                                </span>
+                              )}
                             </TableCell>
                             <TableCell className="text-right">
-                              <div className="flex justify-end gap-1">
-                                <Button variant="outline" size="sm" onClick={() => openVenteDialog(r)}>
+                              <Link className="block text-sm text-primary underline" href={`/comptabilite/factures?tab=livraisons&stock=recolte:${r.id}`}>Préparer un BL</Link>
+                              <div className="flex flex-wrap justify-end gap-1">
+                                <BoutonPartagerRecolte recolteId={r.id} />
+                                <Button variant="outline" size="sm" disabled={r.stockDisponibleCommercial != null} onClick={() => openVenteDialog(r)}>
                                   <Euro className="h-4 w-4 mr-1" />
                                   Vendre
                                 </Button>
-                                <Button variant="ghost" size="sm" onClick={() => handleConsommer(r)}>
+                                <Button variant="ghost" size="sm" disabled={r.stockDisponibleCommercial != null} onClick={() => handleConsommer(r)}>
                                   Conso perso
                                 </Button>
-                                <Button variant="ghost" size="sm" onClick={() => handleMarquerPerte(r)}>
+                                <Button variant="ghost" size="sm" disabled={r.stockDisponibleCommercial != null} onClick={() => handleMarquerPerte(r)}>
                                   Perte
                                 </Button>
-                                <Button variant="ghost" size="sm" onClick={() => handleDelete(r.id)}>
+                                <Button variant="ghost" size="sm" disabled={r.stockDisponibleCommercial != null} onClick={() => handleDelete(r.id)}>
                                   <Trash2 className="h-4 w-4 text-red-500" />
                                 </Button>
                               </div>
@@ -667,6 +795,7 @@ export default function RecoltesPage() {
                         <TableHead className="text-right">Total</TableHead>
                         <TableHead>Client</TableHead>
                         <TableHead>Facture</TableHead>
+                        <TableHead>Communauté</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -688,10 +817,10 @@ export default function RecoltesPage() {
                             {formatQuantite(r.quantite, uniteRecolte(r.unite))}
                           </TableCell>
                           <TableCell className="text-right">
-                            {r.prixKg ? `${r.prixKg.toFixed(2)} € / ${libelleUniteQuantite(uniteRecolte(r.unite), 1)}` : "-"}
+                            {r.prixKg ? `${formatPrixUnitaire(r.prixKg)} € / ${libelleUniteQuantite(uniteRecolte(r.unite), 1)}` : "-"}
                           </TableCell>
                           <TableCell className="text-right font-medium text-green-600">
-                            {r.prixTotal ? `${r.prixTotal.toFixed(2)} €` : "-"}
+                            {r.prixTotal ? formatMontantDevise(r.prixTotal) : "-"}
                           </TableCell>
                           <TableCell>{r.clientNom || "-"}</TableCell>
                           <TableCell>
@@ -703,6 +832,7 @@ export default function RecoltesPage() {
                               </Link>
                             ) : "-"}
                           </TableCell>
+                          <TableCell><BoutonPartagerRecolte recolteId={r.id} /></TableCell>
                         </TableRow>
                       ))}
                     </TableBody>
@@ -731,6 +861,7 @@ export default function RecoltesPage() {
                         <TableHead>Variété</TableHead>
                         <TableHead className="text-right">Quantité</TableHead>
                         <TableHead>Notes</TableHead>
+                        <TableHead>Communauté</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -750,6 +881,7 @@ export default function RecoltesPage() {
                             {formatQuantite(r.quantite, uniteRecolte(r.unite))}
                           </TableCell>
                           <TableCell className="text-muted-foreground">{r.notes || "-"}</TableCell>
+                          <TableCell><BoutonPartagerRecolte recolteId={r.id} /></TableCell>
                         </TableRow>
                       ))}
                     </TableBody>
@@ -816,7 +948,7 @@ export default function RecoltesPage() {
                   <div className="p-3 bg-blue-50 rounded-lg">
                     <p className="text-sm text-blue-700">
                       Total: <span className="font-bold">
-                        {(parseFloat(venteData.prixKg) * parseFloat(venteData.quantiteVendue)).toFixed(2)} €
+                        {formatMontantDevise(parseFloat(venteData.prixKg) * parseFloat(venteData.quantiteVendue))}
                       </span>
                     </p>
                   </div>

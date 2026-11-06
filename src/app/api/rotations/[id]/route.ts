@@ -10,6 +10,8 @@ import prisma from '@/lib/prisma'
 import { updateRotationSchema } from '@/lib/validations'
 import { requireAuthApi, requireAdminApi } from '@/lib/auth-utils'
 import { etapesRotationInvalides, messageEtapesInvalides } from '@/lib/rotations/itp-etapes'
+import { messageRefusSuppressionRotation } from '@/lib/rotations/suppression'
+import { masquerReferentielsEmbarques } from '@/lib/referentiel-embarque'
 
 type RouteParams = { params: Promise<{ id: string }> }
 
@@ -64,16 +66,18 @@ export async function GET(
 
     if (!rotation) {
       return NextResponse.json(
-        { error: `Rotation "${id}" non trouvee` },
+        { error: `Rotation « ${id} » introuvable` },
         { status: 404 }
       )
     }
 
-    return NextResponse.json(rotation)
+    // ITP et espèce de chaque étape : jamais l'id de l'auteur d'une entrée
+    // partagée par un autre compte (revue 2026-10-20).
+    return NextResponse.json(masquerReferentielsEmbarques(rotation, userId))
   } catch (error) {
     console.error('GET /api/rotations/[id] error:', error)
     return NextResponse.json(
-      { error: 'Erreur lors de la recuperation de la rotation' },
+      { error: 'Erreur lors de la récupération de la rotation' },
       { status: 500 }
     )
   }
@@ -95,7 +99,7 @@ export async function PUT(
     const validationResult = updateRotationSchema.safeParse(body)
     if (!validationResult.success) {
       return NextResponse.json(
-        { error: 'Donnees invalides', details: validationResult.error.flatten() },
+        { error: 'Données invalides', details: validationResult.error.flatten() },
         { status: 400 }
       )
     }
@@ -107,7 +111,7 @@ export async function PUT(
 
     if (!existing) {
       return NextResponse.json(
-        { error: `Rotation "${id}" non trouvee` },
+        { error: `Rotation « ${id} » introuvable` },
         { status: 404 }
       )
     }
@@ -203,11 +207,11 @@ export async function PUT(
       })
     })
 
-    return NextResponse.json(rotation)
+    return NextResponse.json(masquerReferentielsEmbarques(rotation, session!.user.id))
   } catch (error) {
     console.error('PUT /api/rotations/[id] error:', error)
     return NextResponse.json(
-      { error: 'Erreur lors de la mise a jour de la rotation' },
+      { error: 'Erreur lors de la mise à jour de la rotation' },
       { status: 500 }
     )
   }
@@ -218,13 +222,16 @@ export async function DELETE(
   request: NextRequest,
   { params }: RouteParams
 ) {
-  const { error } = await requireAdminApi()
+  const { error, session } = await requireAdminApi()
   if (error) return error
 
   try {
     const { id } = await params
+    const userId = session!.user.id
 
-    // Verifier existence et dependances
+    // Vérifier existence et dépendances. La rotation est un référentiel
+    // GLOBAL : le refus compte les planches de tous les comptes, mais ne nomme
+    // que celles du compte (les écrans n'en voient pas d'autres).
     const rotation = await prisma.rotation.findUnique({
       where: { id },
       include: {
@@ -238,25 +245,37 @@ export async function DELETE(
 
     if (!rotation) {
       return NextResponse.json(
-        { error: `Rotation "${id}" non trouvee` },
+        { error: `Rotation « ${id} » introuvable` },
         { status: 404 }
       )
     }
 
-    // Verifier si des planches utilisent cette rotation
+    // La route porte la règle et son message ; les écrans l'affichent tel
+    // quel (2026-10-20 : ils refusaient seuls, d'après les planches du compte).
     if (rotation._count.planches > 0) {
+      const planchesDuCompte = await prisma.planche.findMany({
+        where: { rotationId: id, userId },
+        select: { nom: true },
+        orderBy: { nom: 'asc' },
+      })
+      const usage = {
+        planchesDuCompte: planchesDuCompte.map((p) => p.nom),
+        planchesAutresComptes: Math.max(0, rotation._count.planches - planchesDuCompte.length),
+      }
       return NextResponse.json(
         {
-          error: `Impossible de supprimer la rotation "${id}" car elle est utilisee`,
+          error: messageRefusSuppressionRotation(id, usage),
           details: {
             planches: rotation._count.planches,
-          }
+            planchesDuCompte: usage.planchesDuCompte.length,
+            planchesAutresComptes: usage.planchesAutresComptes,
+          },
         },
         { status: 409 }
       )
     }
 
-    // Suppression (les details seront supprimes en cascade)
+    // Suppression (les étapes partent en cascade)
     await prisma.rotation.delete({
       where: { id },
     })

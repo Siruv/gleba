@@ -17,6 +17,7 @@ import {
   stockRestantLotOeufs,
 } from '@/lib/elevage/stock-oeufs'
 import { ciblesAffectees, floorDayUTC } from '@/lib/elevage/attente-lait'
+import { finJourLivraison } from '@/lib/commercial/dates-stock'
 
 type Db = Prisma.TransactionClient
 
@@ -89,12 +90,12 @@ export async function blocagesVetoPontes(
   return result
 }
 
-export async function computeStockOeufsParLots(userId: string, now = new Date()) {
+export async function computeStockOeufsParLots(userId: string, now = new Date(), db: Db = prisma) {
   // Pas de plafond : ce calcul est désormais LE stock physique (écran, assistant,
   // tableau de bord et valorisation comptable via `calculerStockOeufs`). Un
   // `take: 2000` en date croissante aurait écarté les pontes les plus récentes,
   // les seules encore en stock, dès qu'un compte dépasse 2 000 collectes.
-  const productions = await prisma.productionOeuf.findMany({
+  const toutes = await db.productionOeuf.findMany({
     where: { userId },
     orderBy: { date: "asc" },
     include: {
@@ -105,12 +106,34 @@ export async function computeStockOeufsParLots(userId: string, now = new Date())
       },
     },
   })
+  // Revue du 2026-11-01 — une ponte datée après le jour civil de `now` n'existe
+  // pas encore : `statutLotOeufs` la classait « commercialisable » et elle
+  // gonflait l'écran, le tableau de bord et la valorisation, alors que la vente
+  // FIFO (`synchroniserStockOeufsVente`, même borne `finJourLivraison`) la
+  // refuse. Elle sort du stock à date et reste signalée (souvent une faute de
+  // saisie sur la date) pour que l'éleveur puisse la corriger.
+  const finJour = finJourLivraison(now)
+  const productions = toutes.filter((production) => production.date.getTime() <= finJour.getTime())
+  const pontesFutures = toutes
+    .filter((production) => production.date.getTime() > finJour.getTime())
+    .map((production) => ({
+      id: production.id,
+      datePonte: production.date,
+      lot: production.lot,
+      oeufs: stockRestantLotOeufs({
+        quantite: production.quantite,
+        casses: production.casses,
+        sales: production.sales,
+        sorties: production.mouvementsStock,
+      }),
+    }))
+    .filter((ponte) => ponte.oeufs > 0)
   // Ticket cmsoeyhs5 — le statut de fraîcheur (J+21/J+28) était la seule
   // règle consultée : les délais d'attente œufs des soins faits sont désormais
   // croisés avec chaque ponte (une ponte du 11/08 sous Dectomax jusqu'au 04/09
   // était « commercialisable »).
   const blocages = await blocagesVetoPontes(
-    prisma,
+    db,
     userId,
     productions.map((production) => ({
       id: production.id,
@@ -141,6 +164,10 @@ export async function computeStockOeufsParLots(userId: string, now = new Date())
       limiteVente: dates.limiteVente,
       dcr: dates.dcr,
       statut: blocage ? ("bloque_attente_veto" as const) : statutFraicheur,
+      // Ticket cmv9dy2ow — ces œufs ne sont JAMAIS remis en vente : l'écran
+      // nomme la fin du délai qui les a écartés, pas la remise en vente (qui ne
+      // vaut que pour les pontes postérieures et se lisait « vendables dès »).
+      finAttenteVeto: blocage?.finAttenteOeufs ?? null,
       remiseEnVente: blocage?.remiseEnVente ?? null,
       mouvements: production.mouvementsStock,
     }
@@ -157,6 +184,9 @@ export async function computeStockOeufsParLots(userId: string, now = new Date())
       perimes: somme("perime"),
       bloquesVeto: somme("bloque_attente_veto"),
       stockPhysique: actifs.reduce((total, lot) => total + lot.restant, 0),
+      // Hors stock : pontes datées après aujourd'hui (voir plus haut).
+      aVenir: pontesFutures.reduce((total, ponte) => total + ponte.oeufs, 0),
     },
+    pontesFutures,
   }
 }

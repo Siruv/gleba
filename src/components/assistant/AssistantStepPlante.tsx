@@ -28,7 +28,6 @@ import {
   AlertCircle,
   RefreshCw,
   Check,
-  ChevronDown,
   Sparkles,
   Trees,
   CalendarDays,
@@ -43,7 +42,6 @@ import {
   CATEGORIES_ESPECES,
   NIVEAUX_DIFFICULTE,
   formatSemaine,
-  getSemaineDepuisDate,
 } from "@/lib/assistant-helpers"
 import type { EspeceData, ITPData, VarieteData, CultureData } from "./AssistantDialog"
 import { nomAffichableItp } from "@/lib/itp-label"
@@ -447,12 +445,6 @@ export function AssistantStepPlante({
     })
   }
 
-  const handleVarieteClear = () => {
-    setAutoSelectedVariete(false)
-    onVarieteChange(null)
-    onCultureChange({ varieteId: null, variete: null })
-  }
-
   const handleSkipChange = (checked: boolean) => {
     onSkipVarieteChange(checked)
     if (checked) {
@@ -615,7 +607,7 @@ export function AssistantStepPlante({
 
         {/* Summary */}
         <div className="text-xs text-muted-foreground text-center">
-          {filteredEspeces.length} espece(s){" "}
+          {filteredEspeces.length} espèce(s){" "}
           {search || typeFilter !== "all" ? "filtrée(s)" : ""}
         </div>
       </section>
@@ -866,7 +858,7 @@ export function AssistantStepPlante({
                     )}
 
                     <p className="text-sm text-muted-foreground">
-                      {varietes.length} variete(s) disponible(s).
+                      {varietes.length} variété(s) disponible(s).
                     </p>
 
                     <ScrollArea className="h-[240px] pr-4">
@@ -982,8 +974,8 @@ export function AssistantStepPlante({
             {/* Advice */}
             <div className="p-3 bg-muted/50 rounded-lg">
               <p className="text-xs text-muted-foreground">
-                <strong>Conseil :</strong> Choisir une variete permet de suivre
-                votre stock de semences. Si vous n'avez pas encore décidé, vous
+                <strong>Conseil :</strong> Choisir une variété permet de suivre
+                votre stock de semences. Si vous n&apos;avez pas encore décidé, vous
                 pourrez modifier ce choix plus tard.
               </p>
             </div>

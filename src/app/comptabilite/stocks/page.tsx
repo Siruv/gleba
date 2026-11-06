@@ -15,6 +15,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Skeleton } from "@/components/ui/skeleton"
 import { Badge } from "@/components/ui/badge"
 import { useToast } from "@/hooks/use-toast"
+import { updateDashboardSearchParams } from "@/lib/dashboard-navigation"
 
 interface StockItem {
   id: string
@@ -26,6 +27,8 @@ interface StockItem {
   stockMin: number | null
   alerteBas: boolean
   valeur: number | null
+  /** Méthode de la valeur (récoltes en stock, cultures en cours), cf. `valorisation.ts`. */
+  valeurMethode?: string | null
 }
 
 const MODULE_ICONS: Record<string, React.ReactNode> = {
@@ -60,6 +63,17 @@ export default function StocksPage() {
   const [stats, setStats] = React.useState<StocksStats | null>(null)
   const [reconciliation, setReconciliation] = React.useState<Reconciliation | null>(null)
   const [selectedModule, setSelectedModule] = React.useState<string>("all")
+  const [alertesSeulement, setAlertesSeulement] = React.useState(false)
+
+  React.useEffect(() => {
+    const lire = () => setAlertesSeulement(new URLSearchParams(window.location.search).get('alerte') === 'bas')
+    lire(); window.addEventListener('popstate', lire)
+    return () => window.removeEventListener('popstate', lire)
+  }, [])
+
+  React.useEffect(() => {
+    if (!isLoading && window.location.hash === '#stocks-bas') document.getElementById('stocks-bas')?.scrollIntoView({ block: 'start' })
+  }, [isLoading])
 
   const fetchData = React.useCallback(async () => {
     setIsLoading(true)
@@ -85,9 +99,9 @@ export default function StocksPage() {
     return new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR' }).format(value)
   }
 
-  const filteredStocks = selectedModule && selectedModule !== 'all'
-    ? stocks.filter(s => s.module === selectedModule)
-    : stocks
+  const filteredStocks = stocks.filter(s =>
+    (selectedModule === 'all' || s.module === selectedModule) && (!alertesSeulement || s.alerteBas))
+  const alertesAffichees = alertes.filter(s => selectedModule === 'all' || s.module === selectedModule)
 
   // Grouper par categorie
   const stocksByCategory = React.useMemo(() => {
@@ -136,6 +150,7 @@ export default function StocksPage() {
                 <SelectItem value="potager">Maraîchage</SelectItem>
                 <SelectItem value="verger">Verger</SelectItem>
                 <SelectItem value="elevage">Élevage</SelectItem>
+                <SelectItem value="autre">Autres stocks</SelectItem>
               </SelectContent>
             </Select>
             <Button variant="outline" size="sm" onClick={fetchData}><RefreshCw className="h-4 w-4" /></Button>
@@ -144,6 +159,12 @@ export default function StocksPage() {
       </header>
 
       <div className="container mx-auto px-4 py-6">
+        <label className="mb-4 flex items-center gap-2 text-sm"><input type="checkbox" className="h-4 w-4" checked={alertesSeulement} onChange={(e) => {
+          const actif = e.target.checked; setAlertesSeulement(actif)
+          const q = new URLSearchParams(window.location.search)
+          if (actif) q.set('alerte', 'bas'); else q.delete('alerte')
+          updateDashboardSearchParams(q, 'replace')
+        }} />Uniquement les stocks bas</label>
         {/* Stats */}
         {stats && (
           <div className="grid gap-4 md:grid-cols-4 mb-6">
@@ -179,7 +200,7 @@ export default function StocksPage() {
                   <p className="text-[10px] text-muted-foreground mt-1">
                     M {formatEuro(stats.valeurParModule.potager || 0)} ·
                     V {formatEuro(stats.valeurParModule.verger || 0)} ·
-                    E {formatEuro(stats.valeurParModule.elevage || 0)}
+                    E {formatEuro(stats.valeurParModule.elevage || 0)}{stats.valeurParModule.autre != null && <> · Autres {formatEuro(stats.valeurParModule.autre)}</>}
                   </p>
                 )}
               </CardContent>
@@ -198,17 +219,17 @@ export default function StocksPage() {
         )}
 
         {/* Alertes */}
-        {alertes.length > 0 && (
-          <Card className="mb-6 border-orange-200 bg-orange-50">
+        {alertesAffichees.length > 0 && (
+          <Card id="stocks-bas" className="mb-6 scroll-mt-28 border-orange-200 bg-orange-50">
             <CardHeader>
               <CardTitle className="text-orange-700 flex items-center gap-2">
                 <AlertTriangle className="h-5 w-5" />
-                Stocks bas ({alertes.length})
+                Stocks bas ({alertesAffichees.length})
               </CardTitle>
             </CardHeader>
             <CardContent>
               <div className="grid gap-2 md:grid-cols-2 lg:grid-cols-3">
-                {alertes.map(a => (
+                {alertesAffichees.map(a => (
                   <div key={a.id} className="flex items-center justify-between bg-white rounded-lg p-3 shadow-sm">
                     <div className="flex items-center gap-2">
                       {MODULE_ICONS[a.module]}
@@ -260,6 +281,7 @@ export default function StocksPage() {
           </Card>
         )}
 
+        {stats && !isLoading && alertesSeulement && filteredStocks.length === 0 && <p className="rounded-lg border bg-white p-5 text-sm text-muted-foreground">Aucun article sous le seuil minimum pour ce filtre.</p>}
         {/* Stocks par categorie */}
         {isLoading ? (
           <div className="space-y-4">{[...Array(3)].map((_, i) => <Skeleton key={i} className="h-48 w-full" />)}</div>
@@ -300,6 +322,11 @@ export default function StocksPage() {
                           </TableCell>
                           <TableCell className="text-right">
                             {item.valeur !== null ? formatEuro(item.valeur) : '-'}
+                            {/* Ticket cmvnvaal2 — la méthode est dite, comme sur
+                                Récoltes > Stock qui applique la même règle. */}
+                            {item.valeurMethode && (
+                              <span className="block text-[10px] text-muted-foreground">{item.valeurMethode}</span>
+                            )}
                           </TableCell>
                           <TableCell>
                             {item.alerteBas ? (

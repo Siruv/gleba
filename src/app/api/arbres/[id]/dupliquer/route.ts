@@ -1,12 +1,17 @@
 /**
- * POST /api/arbres/:id/dupliquer   body: { nombre?: number }  (1 à 20)
+ * POST /api/arbres/:id/dupliquer   body: { nombre?: number, recopierAchat?: boolean }  (1 à 20)
  *
  * Crée `nombre` copies de l'arbre : mêmes caractéristiques (type, espèce,
- * variété, porte-greffe, conduite, plantation, achat, parcelle, envergure),
+ * variété, porte-greffe, conduite, plantation, parcelle, envergure),
  * noms numérotés depuis le nom de base, positions alignées à droite de la
  * source sur le plan. Ce qui est propre à un individu n'est pas copié : GPS,
  * circonférence, notes, état, historique. Chaque copie reçoit son calendrier
  * d'entretien comme à la création (même geste que POST /api/arbres).
+ *
+ * L'achat (prix, date) n'est recopié que sur demande explicite
+ * (`recopierAchat: true`) : chaque copie porte alors sa propre dépense
+ * d'achat. Revue du 2026-10-29 : « Dupliquer ×10 » créait sans un mot dix
+ * dépenses datées de l'achat de l'arbre source.
  *
  * Une seule route pour le plan du jardin et la liste du verger : voir
  * `src/lib/verger/duplication-arbre.ts` pour l'origine (friction 2026-10-05).
@@ -14,6 +19,10 @@
 
 import { NextRequest, NextResponse } from "next/server"
 import prisma from "@/lib/prisma"
+import { createDepenseFromAchatArbre } from "@/lib/auto-compta"
+import { verrouillerStockCommercial } from "@/lib/stocks/verrou-commercial"
+import { ErreurReglement } from "@/lib/comptabilite/monnaie"
+import { invalidateKpi } from "@/lib/kpi/cache"
 import { requireAuthApi } from "@/lib/auth-utils"
 import { genererCalendrierEntretien } from "@/lib/verger/creation-arbre"
 import { planCopiesArbre } from "@/lib/verger/duplication-arbre"
@@ -41,6 +50,10 @@ export async function POST(
         { status: 400 }
       )
     }
+    const recopierAchat = body?.recopierAchat ?? false
+    if (typeof recopierAchat !== "boolean") {
+      return NextResponse.json({ error: "recopierAchat attend oui ou non" }, { status: 400 })
+    }
 
     const source = await prisma.arbre.findFirst({ where: { id: arbreId, userId } })
     if (!source) {
@@ -54,9 +67,12 @@ export async function POST(
       existants.map((a) => a.nom)
     )
 
-    const creees = await prisma.$transaction(
-      plan.map((copie) =>
-        prisma.arbre.create({
+    const { creees, calendriers } = await prisma.$transaction(async tx => {
+      await verrouillerStockCommercial(tx, userId)
+      const creees = []
+      let calendriers = 0
+      for (const copie of plan) {
+        const arbre = await tx.arbre.create({
           data: {
             userId,
             nom: copie.nom,
@@ -69,8 +85,8 @@ export async function POST(
             portGreffe: source.portGreffe,
             porteGreffeId: source.porteGreffeId,
             fournisseur: source.fournisseur,
-            dateAchat: source.dateAchat,
-            prixAchat: source.prixAchat,
+            dateAchat: recopierAchat ? source.dateAchat : null,
+            prixAchat: recopierAchat ? source.prixAchat : null,
             datePlantation: source.datePlantation,
             age: source.age,
             envergure: source.envergure,
@@ -98,19 +114,24 @@ export async function POST(
             parcelleGeoId: source.parcelleGeoId,
           },
         })
-      )
-    )
-
-    let calendriers = 0
-    for (const arbre of creees) {
-      if (await genererCalendrierEntretien(arbre, userId)) calendriers++
-    }
+        if (await genererCalendrierEntretien(arbre, userId, tx)) calendriers++
+        if (recopierAchat) await createDepenseFromAchatArbre(userId, arbre, tx)
+        creees.push(arbre)
+      }
+      return { creees, calendriers }
+    }, { timeout: 30000 })
+    invalidateKpi(userId)
 
     return NextResponse.json(
-      { arbres: creees.map((a) => ({ id: a.id, nom: a.nom })), calendriers },
+      {
+        arbres: creees.map((a) => ({ id: a.id, nom: a.nom })),
+        calendriers,
+        achatsRecopies: recopierAchat && (source.prixAchat ?? 0) > 0 ? creees.length : 0,
+      },
       { status: 201 }
     )
   } catch (err) {
+    if (err instanceof ErreurReglement) return NextResponse.json({ error: err.message }, { status: err.status })
     console.error("POST /api/arbres/[id]/dupliquer error:", err)
     return NextResponse.json({ error: "Erreur lors de la duplication de l'arbre" }, { status: 500 })
   }

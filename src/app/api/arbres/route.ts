@@ -6,6 +6,10 @@
 
 import { NextRequest, NextResponse } from "next/server"
 import prisma from "@/lib/prisma"
+import { createDepenseFromAchatArbre } from "@/lib/auto-compta"
+import { verrouillerStockCommercial } from "@/lib/stocks/verrou-commercial"
+import { ErreurReglement } from "@/lib/comptabilite/monnaie"
+import { invalidateKpi } from "@/lib/kpi/cache"
 import { requireAuthApi } from "@/lib/auth-utils"
 import { productifParDefaut } from "@/lib/tree-care-calendar"
 import { genererCalendrierEntretien } from "@/lib/verger/creation-arbre"
@@ -16,15 +20,13 @@ import { trouverParcelleGpsProche } from "@/lib/parcelle-gps-utils"
 import { messageErreurCoordonnees } from "@/lib/geolocation"
 import { normaliserLibelle } from "@/lib/libelle-libre"
 import { parcelleParDefautArbre, resoudreEspeceArbre } from "@/lib/verger/espece-arbre"
+import { chargerPeriodesRecolteVarietes } from "@/lib/verger/saison-recolte-arbre"
+import { porteGreffeAccessible } from "@/lib/verger/porte-greffe-accessible"
 import { normaliserDateApi } from "@/lib/validations/date-api"
+import { estTypeArbre, messageTypeArbreInvalide } from "@/lib/verger/types-arbre"
 
-// Types d'arbres disponibles
-export const TYPES_ARBRES = [
-  { value: "fruitier", label: "Arbre fruitier", color: "#22c55e" },
-  { value: "petit_fruit", label: "Petit fruit", color: "#ef4444" },
-  { value: "ornement", label: "Ornement", color: "#a855f7" },
-  { value: "haie", label: "Haie", color: "#84cc16" },
-]
+// Types d'arbres disponibles : src/lib/verger/types-arbre.ts (liste unique,
+// QA 2026-10-19). L'ancienne copie locale ignorait forestier et liane.
 
 // GET /api/arbres?parcelle=ID|all|none
 export async function GET(request: NextRequest) {
@@ -105,6 +107,12 @@ export async function GET(request: NextRequest) {
       : []
     const etalementParEspece = new Map(etalements.map((e) => [e.id, e.etalement]))
 
+    // QA cmvkoxe5o (2026-10-23) — période de récolte de la variété, pour que
+    // l'encart « hors saison » du formulaire de récolte applique la même règle
+    // que la route (`alerteSaisonRecolteArbre`) au lieu du seul calendrier de
+    // l'espèce. Une requête pour toute la liste.
+    const periodesRecolte = await chargerPeriodesRecolteVarietes(prisma, session!.user.id, arbres)
+
     return NextResponse.json(
       arbres.map((a) => ({
         ...a,
@@ -112,12 +120,13 @@ export async function GET(request: NextRequest) {
           (a.especeId ? etalementParEspece.get(a.especeId) : undefined) ??
           (a.espece ? etalementParEspece.get(a.espece) : undefined) ??
           null,
+        periodeRecolteVariete: periodesRecolte.get(a) ?? null,
       }))
     )
   } catch (err) {
     console.error("GET /api/arbres error:", err)
     return NextResponse.json(
-      { error: "Erreur lors de la recuperation des arbres" },
+      { error: "Erreur lors de la récupération des arbres" },
       { status: 500 }
     )
   }
@@ -144,6 +153,11 @@ export async function POST(request: NextRequest) {
         { error: "Le type est requis" },
         { status: 400 }
       )
+    }
+    // La route porte la liste des types (QA 2026-10-19) : un type hors liste
+    // créait un arbre absent de tous les onglets et de tous les filtres.
+    if (!estTypeArbre(body.type)) {
+      return NextResponse.json({ error: messageTypeArbreInvalide(body.type) }, { status: 400 })
     }
 
     // Bug #2 — Date plantation requise (audit Marc 2026-05-14).
@@ -204,6 +218,12 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: "Zone non trouvée" }, { status: 404 })
       }
     }
+    // Revue du 2026-10-23 : un porte-greffe visé par id doit être visible du
+    // compte, sinon son nom fuitait par la liste et la fiche.
+    if (body.porteGreffeId && !(await porteGreffeAccessible(session!.user.id, String(body.porteGreffeId)))) {
+      return NextResponse.json({ error: "Porte-greffe introuvable", champ: "porteGreffeId" }, { status: 400 })
+    }
+
     // Espèce rattachée au catalogue quand la saisie le désigne (casse, accents
     // et tirets près) ; repli explicite hors catalogue — voir espece-arbre.ts.
     const especeResolue = await resoudreEspeceArbre(prisma, session!.user.id, String(body.espece))
@@ -252,7 +272,9 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const arbre = await prisma.arbre.create({
+    const { arbre, calendrierGenere } = await prisma.$transaction(async tx => {
+      await verrouillerStockCommercial(tx, session!.user.id)
+      const arbre = await tx.arbre.create({
       data: {
         userId: session!.user.id,
         nom: body.nom.trim(),
@@ -331,13 +353,18 @@ export async function POST(request: NextRequest) {
 
     // Geste partagé avec l'outil `create_arbre` de l'assistant : voir
     // `src/lib/verger/creation-arbre.ts`.
-    const calendrierGenere = await genererCalendrierEntretien(arbre, session!.user.id)
+      const calendrierGenere = await genererCalendrierEntretien(arbre, session!.user.id, tx)
+      await createDepenseFromAchatArbre(session!.user.id, arbre, tx)
+      return { arbre, calendrierGenere }
+    })
+    invalidateKpi(session!.user.id)
 
     // Avertissement d'adéquation géographique (non bloquant) : ex. planter un
     // fruitier à besoin de froid en zone tropicale. Renvoyé pour affichage
     // (toast) — couvre le plan du jardin, le chat et les imports, qui passent
     // tous par cette route. Le catalogue officiel a id = nom (rattachement direct).
     let avertissementZone: string | null = null
+    try {
     if (arbre.espece) {
       const espece = await prisma.espece.findFirst({
         where: { AND: [{ id: arbre.espece }, visibiliteReferentiel(session!.user.id)] },
@@ -353,6 +380,10 @@ export async function POST(request: NextRequest) {
         if (statut === "peu_adaptee") avertissementZone = raison
       }
     }
+    } catch (cause) {
+      console.warn('Contrôle de zone indisponible après création d’un arbre', cause instanceof Error ? cause.message : 'Erreur')
+      avertissementZone = 'L’arbre est enregistré ; le contrôle d’adéquation au climat est temporairement indisponible.'
+    }
 
     return NextResponse.json(
       {
@@ -365,9 +396,10 @@ export async function POST(request: NextRequest) {
       { status: 201 }
     )
   } catch (err) {
+    if (err instanceof ErreurReglement) return NextResponse.json({ error: err.message }, { status: err.status })
     console.error("POST /api/arbres error:", err)
     return NextResponse.json(
-      { error: "Erreur lors de la creation de l'arbre" },
+      { error: "Erreur lors de la création de l'arbre" },
       { status: 500 }
     )
   }

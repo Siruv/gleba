@@ -3,18 +3,21 @@ import Link from "next/link"
 
 import { dateMidiLocal } from "@/lib/accueil/classement"
 import type { PhraseFenetre } from "@/lib/accueil/fenetre-travail"
-import { cn } from "@/lib/utils"
+import { PageEntete } from "@/components/shell/PageEntete"
 
 import { CLASSES_BOUTON, CLASSES_BOUTON_PRINCIPAL } from "./boutons"
 
 /**
- * En-tête de l'accueil v2 : la date en Fraunces, la fenêtre de travail en une
- * ligne, deux actions (Noter, + Récolte). Le bouton « Personnaliser » arrive
- * avec la livraison L3.
+ * En-tête commun du carnet : date locale et fenêtre de travail en métadonnées,
+ * avec les actions Noter, Récolte et Personnaliser.
  */
 export interface AccueilEnTeteProps {
-  /** Jour civil local AAAA-MM-JJ. */
-  date: string
+  /**
+   * Jour civil local AAAA-MM-JJ ; `null` tant qu'il n'est pas connu (prérendu
+   * du build et hydratation) : sa place est réservée sans calcul de date au
+   * rendu serveur. Le titre Aujourd'hui reste toujours présent.
+   */
+  date: string | null
   fenetre: PhraseFenetre | null
   /** Météo en cours de lecture : la ligne reste réservée, sans texte inventé. */
   chargementFenetre?: boolean
@@ -34,12 +37,19 @@ export function libelleDate(dateIso: string): string {
 
 export function AccueilEnTete({ date, fenetre, chargementFenetre = false, temperature, actions, className }: AccueilEnTeteProps) {
   return (
-    <div className={cn("flex flex-wrap items-end justify-between gap-x-6 gap-y-3", className)}>
-      <div className="min-w-0">
-        <h1 className="font-display text-3xl font-medium leading-tight tracking-tight text-encre sm:text-[34px]">
-          {libelleDate(date)}
-        </h1>
-        <p className="mt-1 text-sm text-ardoise" aria-live="polite">
+    <PageEntete id="aujourdhui" className={className} description={<div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="min-h-6 font-medium text-encre">
+          {date ? (
+            <time dateTime={date}>{libelleDate(date)}</time>
+          ) : (
+            <>
+              {/* L'espace garde la hauteur de la ligne, le texte masqu\u00e9 donne un nom au titre. */}
+              <span aria-hidden>{"\u00a0"}</span>
+            </>
+          )}
+        </span>
+        <span aria-hidden>·</span>
+        <span aria-live="polite">
           {typeof temperature === "number" && (
             <span className="font-semibold text-encre lg:hidden">
               {Math.round(temperature)} °C<span aria-hidden> · </span>
@@ -60,9 +70,8 @@ export function AccueilEnTete({ date, fenetre, chargementFenetre = false, temper
           ) : (
             <span>Fenêtre de travail : indisponible sans parcelle géolocalisée.</span>
           )}
-        </p>
-      </div>
-      <div className="flex shrink-0 gap-2">
+        </span>
+      </div>} actions={<>
         <Link href="/taches" className={CLASSES_BOUTON}>
           Noter
         </Link>
@@ -70,7 +79,6 @@ export function AccueilEnTete({ date, fenetre, chargementFenetre = false, temper
           + Récolte
         </Link>
         {actions}
-      </div>
-    </div>
+      </>} />
   )
 }

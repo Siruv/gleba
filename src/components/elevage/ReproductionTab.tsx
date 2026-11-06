@@ -57,6 +57,7 @@ import { BarChart, Bar, XAxis, YAxis, Legend } from "recharts"
 import { ResponsiveContainer } from "@/components/ui/responsive-container"
 import { todayLocalISO } from '@/lib/format-utils'
 import { merePresenteALaNaissance } from "@/lib/elevage/sortie-animal"
+import { jourCivilStocke } from "@/lib/jour-civil"
 
 // ============================================================
 // Types
@@ -857,7 +858,9 @@ function NaissancesSubTab({ initialOpen = false, year }: { initialOpen?: boolean
       pereIdentifiant: n.pereIdentifiant ?? "",
       identifiantsProvisoires: n.identifiantsProvisoires ?? "",
       identifiantsDefinitifs: n.identifiantsDefinitifs ?? "",
-      date: n.date.split('T')[0],
+      // Jour civil, celui que la route compare : `split('T')` lisait la veille
+      // d'une naissance saisie entre minuit et 2 h (heure de Paris).
+      date: jourCivilStocke(n.date) ?? "",
       nombreNes: n.nombreNes.toString(),
       nombreVivants: n.nombreVivants.toString(),
       nombreMales: n.nombreMales != null ? n.nombreMales.toString() : "",
@@ -2011,7 +2014,9 @@ function SailliesSubTab({ year }: { year?: number } = {}) {
                 Alerte consanguinité au moment de la création.
               </CardDescription>
             </div>
-            <div className="flex items-end gap-2">
+            {/* Revue du 2026-11-01 — à 390 px ce groupe débordait (page de
+                472 px) : il passe à la ligne. */}
+            <div className="flex flex-wrap items-end gap-2">
               <select
                 className="h-9 rounded-md border border-slate-300 px-2 bg-white text-sm"
                 value={filtreStatut}

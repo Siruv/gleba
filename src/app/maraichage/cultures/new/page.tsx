@@ -48,6 +48,7 @@ import { AppHeader, PageToolbar } from "@/components/shell/AppHeader"
 import { cultureFormSchema, type CreateCultureInput } from "@/lib/validations"
 import type { AjustementOccupation } from "@/lib/planche-validation"
 import { estimerNombrePlantsStrict } from "@/lib/assistant-helpers"
+import { AIDE_QUANTITE_PLANTS, libelleQuantitePlants, useQuantiteManuelle } from "@/hooks/use-quantite-manuelle"
 import { RotationAdviceCompact } from "@/components/planche"
 import { EspeceCombobox, type EspeceOption } from "@/components/especes/EspeceCombobox"
 import { AdjacenceAdvisor } from "@/components/cultures/AdjacenceAdvisor"
@@ -62,6 +63,7 @@ import { badgeOrigine } from "@/lib/referentiel-communaute"
 import { datesDepuisItp, recolteApresDebut, semaineSemisEffective } from "@/lib/cultures/dates-itp"
 import { Checkbox } from "@/components/ui/checkbox"
 import { cocherApresSaisieManuelle, etapeDejaRealisable } from "@/lib/cultures/deja-fait"
+import { alerteSaisonCulture } from "@/lib/cultures/saison-culture"
 
 // Bug #1 — payload de violation renvoyé par POST /api/cultures (status 409).
 type RotationViolation = {
@@ -96,6 +98,8 @@ interface ITPData {
   espacementRangs: number | null
   /** Conduite imposée (« Sous abri », « Plein champ ») ou null (ticket cmv4z6yhg). */
   typePlanche: string | null
+  /** Opération d'implantation de la source (« Plantation », « Semis »), pour l'alerte de saison. */
+  implantation?: string | null
 }
 
 const CHAMPS_DATE = ["dateSemis", "datePlantation", "dateRecolte"] as const
@@ -173,6 +177,15 @@ function cycleItpPropose(itp: ITPData, year: number, today: Date) {
   return { dateSemis, datePlantation, dateRecolte, info }
 }
 
+/** Alerte de saison sous un champ de date : informative, jamais bloquante. */
+function EncartSaison({ message }: { message: string }) {
+  return (
+    <p role="status" className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-1">
+      {message} Vous pouvez enregistrer quand même.
+    </p>
+  )
+}
+
 export default function NewCulturePage() {
   const { data: session } = useSession()
   const currentUserId = (session?.user as { id?: string } | undefined)?.id ?? null
@@ -184,6 +197,12 @@ export default function NewCulturePage() {
   const [itps, setItps] = React.useState<ITPData[]>([])
   const [planches, setPlanches] = React.useState<{ id: string; nom?: string; longueur: number | null; type?: string | null }[]>([])
   const [isSubmitting, setIsSubmitting] = React.useState(false)
+  // Quantité saisie à la main : plus de recalcul (ticket cmvnpkkhp, revue).
+  const {
+    manuelle: quantiteManuelle,
+    estManuelle: quantiteEstManuelle,
+    saisir: saisirQuantite,
+  } = useQuantiteManuelle()
   // QA cmsp5927v — un refus d'occupation de planche n'existait que dans un toast
   // de 5 s : l'utilisateur revoyait un formulaire vide sans savoir pourquoi.
   const [submitError, setSubmitError] = React.useState<string | null>(null)
@@ -560,6 +579,18 @@ export default function NewCulturePage() {
   // bouge, tant qu'elle lui reste postérieure (QA cmv2qzhkf).
   const watchedDateSemis = form.watch("dateSemis")
   const watchedDatePlantation = form.watch("datePlantation")
+  // 2026-10-25 — une aubergine (fenêtre S16–S18) partait plantée un 25 octobre :
+  // la date d'implantation hors de la fenêtre de l'ITP est dite sous le champ,
+  // par la règle de la route (`alerteSaisonCulture`), sans bloquer.
+  const alerteSaison = React.useMemo(
+    () =>
+      alerteSaisonCulture({
+        itp: itps.find((i) => i.id === selectedItp) ?? null,
+        dateSemis: watchedDateSemis,
+        datePlantation: watchedDatePlantation,
+      }),
+    [itps, selectedItp, watchedDateSemis, watchedDatePlantation]
+  )
   React.useEffect(() => {
     // Valeurs COURANTES du formulaire, pas celles du rendu : quand un autre
     // effet du même passage vient de poser la plantation (complétion depuis
@@ -614,15 +645,17 @@ export default function NewCulturePage() {
     }
   }, [selectedPlanche, planches, form])
 
-  // Auto-calculer la quantité de plants (BUG-10 : null si inputs incomplets).
+  // Auto-calculer la quantité de plants (BUG-10 : null si inputs incomplets),
+  // sauf si elle a été saisie à la main.
   React.useEffect(() => {
+    if (quantiteEstManuelle()) return
     const quantite = estimerNombrePlantsStrict(
       watchedLongueur ?? null,
       watchedNbRangs ?? null,
       watchedEspacement ?? null
     )
     form.setValue("quantite", quantite)
-  }, [watchedNbRangs, watchedLongueur, watchedEspacement, form])
+  }, [watchedNbRangs, watchedLongueur, watchedEspacement, form, quantiteEstManuelle])
 
   /**
    * Bug #1 — Soumission avec gestion du 409 rotationViolation.
@@ -1036,6 +1069,7 @@ export default function NewCulturePage() {
                             )}
                           />
                         )}
+                        {alerteSaison?.champ === "dateSemis" && <EncartSaison message={alerteSaison.message} />}
                         <FormMessage />
                       </FormItem>
                     )}
@@ -1077,6 +1111,7 @@ export default function NewCulturePage() {
                             )}
                           />
                         )}
+                        {alerteSaison?.champ === "datePlantation" && <EncartSaison message={alerteSaison.message} />}
                         <FormMessage />
                       </FormItem>
                     )}
@@ -1223,11 +1258,8 @@ export default function NewCulturePage() {
                     name="quantite"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel
-                          title="Formule : nbRangs × ⌊longueur (cm) ÷ espacement⌋. Si vous modifiez ce champ, la valeur n'est plus recalculée."
-                          className="cursor-help"
-                        >
-                          Quantité / plants (auto) ⓘ
+                        <FormLabel title={AIDE_QUANTITE_PLANTS} className="cursor-help">
+                          {libelleQuantitePlants(quantiteManuelle)} ⓘ
                         </FormLabel>
                         <FormControl>
                           <Input
@@ -1235,11 +1267,11 @@ export default function NewCulturePage() {
                             step="0.1"
                             {...field}
                             value={field.value ?? ""}
-                            onChange={(e) =>
-                              field.onChange(
-                                e.target.value ? parseFloat(e.target.value) : null
-                              )
-                            }
+                            onChange={(e) => {
+                              const valeur = e.target.value ? parseFloat(e.target.value) : null
+                              saisirQuantite(valeur)
+                              field.onChange(valeur)
+                            }}
                           />
                         </FormControl>
                         {/* Bug #2 — formule active pour rendre transparent
@@ -1248,7 +1280,7 @@ export default function NewCulturePage() {
                         {watchedLongueur && watchedNbRangs && watchedEspacement && watchedEspacement > 0 && (
                           <p className="text-xs text-slate-500">
                             = {watchedNbRangs} rang(s) × ⌊{watchedLongueur} m ÷ {watchedEspacement} cm⌋
-                            = {Math.floor((watchedLongueur * 100) / watchedEspacement) * watchedNbRangs}
+                            = {estimerNombrePlantsStrict(watchedLongueur, watchedNbRangs, watchedEspacement)}
                           </p>
                         )}
                         <FormMessage />

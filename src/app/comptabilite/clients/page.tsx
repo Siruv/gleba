@@ -38,7 +38,8 @@ interface Client {
   exonererTVA: boolean
   notes: string | null
   actif: boolean
-  _count?: { ventesManuelles: number; factures: number }
+  /** Ventes rattachées à la fiche (écritures et factures), calculé par l'API. */
+  nbVentes?: number
 }
 
 const TYPE_LABELS: Record<string, string> = {
@@ -55,11 +56,19 @@ const TYPE_ICONS: Record<string, React.ReactNode> = {
   amap: <ShoppingBag className="h-4 w-4" />,
 }
 
+/** Compteurs renvoyés par GET /api/comptabilite/clients. */
+interface ClientsStats {
+  total: number
+  actifs: number
+  inactifs: number
+  parType: Record<string, number>
+}
+
 export default function ClientsPage() {
   const { toast } = useToast()
   const [isLoading, setIsLoading] = React.useState(true)
   const [clients, setClients] = React.useState<Client[]>([])
-  const [stats, setStats] = React.useState<any>(null)
+  const [stats, setStats] = React.useState<ClientsStats | null>(null)
   const [search, setSearch] = React.useState("")
   const [showInactifs, setShowInactifs] = React.useState(false)
   const [dialogOpen, setDialogOpen] = React.useState(false)
@@ -352,13 +361,18 @@ export default function ClientsPage() {
                         />
                       </div>
                       <div>
-                        <Label>SIREN</Label>
+                        <Label>SIREN{formData.type === 'professionnel' ? ' *' : ''}</Label>
                         <Input
                           value={formData.siren}
                           onChange={(e) => setFormData({ ...formData, siren: e.target.value })}
                           placeholder="123 456 789"
                           maxLength={11}
                         />
+                        {formData.type === 'professionnel' && (
+                          <p className="text-xs text-muted-foreground mt-1">
+                            Requis : identifiant de l&apos;acheteur sur une facture électronique.
+                          </p>
+                        )}
                       </div>
                       <div>
                         <Label>N° TVA intracom.</Label>
@@ -536,7 +550,7 @@ export default function ClientsPage() {
                       </TableCell>
                       <TableCell>
                         <span className="text-sm text-muted-foreground">
-                          {client._count?.ventesManuelles || 0} ventes
+                          {client.nbVentes ?? 0} vente{(client.nbVentes ?? 0) > 1 ? "s" : ""}
                         </span>
                       </TableCell>
                       <TableCell>

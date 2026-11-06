@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { Suspense } from "react";
 import { estTypeVerger } from "@/lib/validations/espece";
 import { libellePeriodeSemaines } from "@/lib/semaines-lisibles";
 import Link from "next/link";
@@ -6,14 +7,21 @@ import Image from "next/image";
 import { notFound } from "next/navigation";
 import { ArrowLeft, CalendarDays, Droplets, Leaf, MapPin, Ruler, Sprout, TreeDeciduous } from "lucide-react";
 
-import { MarketingShell } from "@/components/seo/MarketingShell";
-import { PhotoContributionForm } from "@/components/referentiel/PhotoContributionForm";
+import { ReferentielShell } from "@/components/referentiel/ReferentielShell";
+import { AjouterPhoto } from "@/components/encyclopedie/AjouterPhoto";
+import { ModifierItem, CorrectionsItem } from "@/components/encyclopedie/CorrectionItem";
+import { ancreCorrection } from "@/components/encyclopedie/correction-liens";
+import { FicheCommunaute } from "@/components/encyclopedie/FicheCommunaute";
+import { ReferenceSource } from "@/components/encyclopedie/ReferenceSource";
+import { ErreurEncyclopedie, lireCommunauteVegetal } from "@/lib/encyclopedie/service";
+import type { CommunauteVegetalVue } from "@/lib/encyclopedie/types";
 import prisma from "@/lib/prisma";
 import { ZONE_CLIMAT_LABEL, type ZoneClimat } from "@/lib/terroir";
 import { nomPublic, originePublique, visibiliteEnfantPublic, visibiliteReferentielPublic } from "@/lib/referentiel-public";
 import { nomAffichableItp } from "@/lib/itp-label";
 import { dureeCycleItpJours } from "@/lib/cultures/dates-itp";
 import { ogBase } from "@/lib/seo/og";
+import { valeurRenseignee } from "@/lib/referentiel-valeur";
 
 export const dynamic = "force-dynamic";
 
@@ -49,7 +57,7 @@ async function getEspece(id: string) {
         // compris, avec des semaines que la base a ramenées dans 1–52 — donc un
         // titre qui contredit ses propres valeurs.
         where: { AND: [{ actif: true }, visibiliteEnfantPublic()] },
-        select: { id: true, nom: true, userId: true, zoneClimat: true, typePlanche: true, modeDemarrage: true, semaineSemis: true, semainePlantation: true, semaineRecolte: true, semaineImplantationDebut: true, dureeCulture: true, delaiPremiereRecolteAnnees: true, statutValidation: true, espacement: true, sourceReference: true },
+        select: { id: true, nom: true, userId: true, zoneClimat: true, typePlanche: true, modeDemarrage: true, semaineSemis: true, semainePlantation: true, semaineRecolte: true, semaineImplantationDebut: true, dureeCulture: true, delaiPremiereRecolteAnnees: true, statutValidation: true, espacement: true, sourceReference: true, sourceUrl: true, sourceLicence: true, sourceVersion: true },
         orderBy: [{ zoneClimat: "asc" }, { nom: "asc" }],
         take: 24,
       },
@@ -68,7 +76,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   const espece = await getEspece(decodeURIComponent(id));
   if (!espece) return { title: "Végétal introuvable" };
   const name = nomPublic(espece);
-  const description = espece.description || `Fiche agricole de ${name} : variétés, exigences et itinéraires techniques selon le terroir.`;
+  const description = valeurRenseignee(espece.description) || `Fiche agricole de ${name} : variétés, exigences et itinéraires techniques selon le terroir.`;
   const url = `https://gleba.fr/referentiel/vegetaux/${encodeURIComponent(espece.id)}`;
   return { title: `${name} — Variétés, culture et terroirs`, description, alternates: { canonical: url }, openGraph: { ...ogBase, title: `${name} — Référentiel Gleba`, description, url, type: "article" } };
 }
@@ -125,11 +133,12 @@ function faitsVariete(variete: {
 }): string[] {
   const floraison = libellePeriodeSemaines(variete.semaineFloraison, variete.dureeFloraison);
   const recolte = libellePeriodeSemaines(variete.semaineRecolte, variete.dureeRecolte);
+  const groupe = valeurRenseignee(variete.groupePollinisation);
   return [
     floraison && `Floraison ${floraison}`,
     recolte && `Récolte ${recolte}`,
-    variete.groupePollinisation && `Groupe de floraison ${variete.groupePollinisation}`,
-    variete.ploidie,
+    groupe && `Groupe de floraison ${groupe}`,
+    valeurRenseignee(variete.ploidie),
   ].filter((fait): fait is string => Boolean(fait));
 }
 
@@ -155,53 +164,70 @@ export default async function FicheVegetalPage({ params }: PageProps) {
   if (!espece) notFound();
   const name = nomPublic(espece);
   const isTree = estTypeVerger(espece.type);
-  const zones = espece.zonesAdaptees?.split(",").map((zone) => zone.trim()).filter(Boolean) ?? [];
+  const zones = espece.zonesAdaptees?.split(",").map((zone) => valeurRenseignee(zone)).filter((zone): zone is string => zone !== null) ?? [];
+  // Ticket QA cmvnu7ad8 — une sentinelle d'import (« NON_TROUVE ») se lit absente.
+  const descriptionEspece = valeurRenseignee(espece.description);
+  const besoinFroid = valeurRenseignee(espece.besoinFroid);
+  let communaute: CommunauteVegetalVue;
+  try {
+    communaute = await lireCommunauteVegetal(espece.id);
+  } catch (error) {
+    if (error instanceof ErreurEncyclopedie && error.status === 404) notFound();
+    throw error;
+  }
 
   return (
-    <MarketingShell>
+    <ReferentielShell>
       <article className="mx-auto max-w-6xl px-4 pb-12 pt-8 sm:px-6 sm:pt-12">
         <Link href="/referentiel" className="inline-flex items-center gap-2 text-sm font-medium text-emerald-700 hover:text-emerald-900"><ArrowLeft className="h-4 w-4" /> Retour au référentiel</Link>
-        <header className="mt-6 rounded-3xl border border-emerald-100 bg-gradient-to-br from-emerald-50 to-white p-6 sm:p-9">
+        <header id={ancreCorrection("ESPECE", espece.id)} className="mt-6 scroll-mt-8 rounded-xl border border-lin bg-craie p-6 sm:p-9">
           <div className="flex flex-col gap-5 sm:flex-row sm:items-start">
             <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl bg-emerald-700 text-white">{isTree ? <TreeDeciduous className="h-8 w-8" /> : <Leaf className="h-8 w-8" />}</div>
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2"><span className="rounded-full bg-white px-2.5 py-1 text-xs font-medium text-emerald-800 shadow-sm">{originePublique(espece)}</span>{espece.vivace && <span className="rounded-full bg-white px-2.5 py-1 text-xs text-slate-600 shadow-sm">Vivace</span>}</div>
-              <h1 className="mt-3 text-4xl font-bold tracking-tight text-slate-950 sm:text-5xl">{name}</h1>
+              <div className="mt-3 flex flex-wrap items-start justify-between gap-3"><h1 className="font-display text-4xl font-normal tracking-tight text-foret sm:text-5xl">{name}</h1><ModifierItem cibleType="ESPECE" refId={espece.id} titre={name} champs={["nom", "nomLatin", "description"]} ariaLabel={`Modifier la présentation de ${name}`} /></div>
               {espece.nomLatin && <p className="mt-2 text-lg italic text-slate-500">{espece.nomLatin}</p>}
-              {espece.description && <p className="mt-5 max-w-3xl text-base leading-7 text-slate-700">{espece.description}</p>}
+              {descriptionEspece && <p className="mt-5 max-w-3xl text-base leading-7 text-slate-700">{descriptionEspece}</p>}
+              <CorrectionsItem cibleType="ESPECE" refId={espece.id} champs={["nom", "nomLatin", "description"]} corrections={communaute.corrections ?? []} />
             </div>
           </div>
         </header>
 
-        <section className="mt-8">
-          <h2 className="text-2xl font-bold text-slate-900">Images documentaires</h2>
+        <Suspense fallback={<p className="py-6 text-sm text-ardoise">Chargement de la fiche…</p>}>
+        <FicheCommunaute especeId={espece.id} nom={name} description={descriptionEspece} initialData={communaute}>
+        <section id="images-documentaires" className="mt-8 scroll-mt-8">
+          <div className="flex flex-wrap items-center justify-between gap-3"><h2 className="font-display text-2xl text-foret">Images documentaires</h2><AjouterPhoto especeId={espece.id} nom={name} /></div>
           {espece.medias.length ? (
             <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {espece.medias.map((media) => <figure key={media.id} className="overflow-hidden rounded-2xl border border-slate-200 bg-white"><div className="relative aspect-[4/3] bg-slate-100"><Image src={media.url} alt={`${name} — ${media.organe}`} fill sizes="(max-width: 640px) 100vw, (max-width: 1024px) 50vw, 33vw" className="object-cover" /></div><figcaption className="p-4 text-xs leading-5 text-slate-600"><div className="font-medium text-slate-800">{media.organe}{media.description ? ` — ${media.description}` : ""}</div><div className="mt-1">{media.citation}</div><div className="mt-1 flex flex-wrap gap-3"><a href={media.urlLicence} target="_blank" rel="noopener noreferrer" className="text-emerald-700 hover:underline">{media.licence}</a>{media.urlOrigine && <a href={media.urlOrigine} target="_blank" rel="noopener noreferrer" className="text-emerald-700 hover:underline">Voir l’original</a>}</div></figcaption></figure>)}
             </div>
           ) : <Empty>Aucune image validée pour le moment. Vous pouvez proposer votre propre photo.</Empty>}
-          <PhotoContributionForm especeId={espece.id} nom={name} />
         </section>
 
-        <section className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <Fact icon={Sprout} label="Famille" value={espece.famille?.nomFr || espece.famille?.id || "À documenter"} />
-          <Fact icon={Droplets} label="Besoin en eau" value={espece.besoinEau ? `${espece.besoinEau}/5` : espece.irrigation || "À documenter"} />
+        <section className="mt-8 scroll-mt-8" id={`${ancreCorrection("ESPECE", espece.id)}-caracteristiques`}>
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><h2 className="font-display text-2xl text-foret">Caractéristiques</h2><ModifierItem cibleType="ESPECE" refId={espece.id} titre={name} champs={["besoinEau", "irrigation", "densite", "joursLevee", "temperatureGerm", "vivace"]} ariaLabel={`Modifier les caractéristiques de ${name}`} /></div>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <Fact icon={Sprout} label="Famille" value={valeurRenseignee(espece.famille?.nomFr) ?? valeurRenseignee(espece.famille?.id) ?? "À documenter"} />
+          <Fact icon={Droplets} label="Besoin en eau" value={espece.besoinEau ? `${espece.besoinEau}/5` : valeurRenseignee(espece.irrigation) ?? "À documenter"} />
           <Fact icon={Ruler} label="Densité indicative" value={espece.densite ? `${espece.densite} plants/m²` : "À documenter"} />
-          <Fact icon={CalendarDays} label="Levée" value={espece.joursLevee ? `${espece.joursLevee} jours` : espece.temperatureGerm || "À documenter"} />
+          <Fact icon={CalendarDays} label="Levée" value={espece.joursLevee ? `${espece.joursLevee} jours` : valeurRenseignee(espece.temperatureGerm) ?? "À documenter"} />
+          </div>
+          <CorrectionsItem cibleType="ESPECE" refId={espece.id} champs={["vivace", "besoinEau", "irrigation", "densite", "joursLevee", "temperatureGerm"]} />
         </section>
 
         <section className="mt-10">
-          <div className="flex items-center gap-3"><MapPin className="h-6 w-6 text-emerald-700" /><div><h2 className="text-2xl font-bold text-slate-900">Enveloppe climatique</h2><p className="text-sm text-slate-500">Repères généraux à affiner avec le sol et le microclimat de chaque parcelle.</p></div></div>
+          <div className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-3"><MapPin className="h-6 w-6 text-emerald-700" /><div><h2 className="text-2xl font-bold text-slate-900">Enveloppe climatique</h2><p className="text-sm text-slate-500">Repères généraux à affiner avec le sol et le microclimat de chaque parcelle.</p></div></div><ModifierItem cibleType="ESPECE" refId={espece.id} titre={name} champs={["zonesAdaptees", "besoinFroid"]} ariaLabel={`Modifier le contexte climatique de ${name}`} /></div>
           <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-5">
             <div className="flex flex-wrap gap-2">{zones.length ? zones.map((zone) => <span key={zone} className="rounded-full bg-emerald-50 px-3 py-1.5 text-sm text-emerald-800">{zoneLabel(zone)}</span>) : <span className="text-sm text-slate-500">Zones adaptées encore non documentées.</span>}</div>
-            {espece.besoinFroid && <p className="mt-4 text-sm text-slate-600">Besoin de froid : <strong>{espece.besoinFroid}</strong></p>}
+            {besoinFroid && <p className="mt-4 text-sm text-slate-600">Besoin de froid : <strong>{besoinFroid}</strong></p>}
           </div>
+          <CorrectionsItem cibleType="ESPECE" refId={espece.id} champs={["zonesAdaptees", "besoinFroid"]} />
         </section>
 
         <section className="mt-10">
           <h2 className="text-2xl font-bold text-slate-900">Itinéraires techniques par contexte</h2>
           <p className="mt-1 text-sm text-slate-500">Ces calendriers sont des références contextualisées, pas des garanties de réussite.</p>
-          {espece.itps.length ? <div className="mt-4 grid gap-4 md:grid-cols-2">{espece.itps.map((itp) => <div key={itp.id} className="rounded-2xl border border-slate-200 bg-white p-5"><div className="flex flex-wrap items-start justify-between gap-2"><h3 className="font-semibold text-slate-900">{nomAffichableItp(itp)}</h3><div className="flex flex-wrap items-center gap-2"><QualiteBadge statut={itp.statutValidation} /><span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{itp.zoneClimat ? zoneLabel(itp.zoneClimat) : "Référence générale"}</span></div></div><dl className="mt-4 grid grid-cols-2 gap-3 text-sm"><MiniFact label="Conduite" value={itp.typePlanche || "Non précisée"} /><MiniFact label="Démarrage" value={itp.modeDemarrage || "Non précisé"} /><MiniFact label="Semis" value={week(itp.semaineSemis)} /><MiniFact label="Plantation" value={week(itp.semainePlantation)} /><MiniFact label="Récolte" value={week(itp.semaineRecolte)} /><MiniFact label="Cycle" value={cycleLisible(itp)} /></dl>{itp.sourceReference && <p className="mt-4 border-t border-slate-100 pt-3 text-xs text-slate-500">Source déclarée : {itp.sourceReference}</p>}</div>)}</div> : <Empty>Les itinéraires contextualisés de ce végétal restent à documenter.</Empty>}
+          {espece.itps.length ? <div className="mt-4 grid gap-4 md:grid-cols-2">{espece.itps.map((itp) => <div key={itp.id} id={ancreCorrection("ITP", itp.id)} className="scroll-mt-8 rounded-2xl border border-slate-200 bg-white p-5"><div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><h3 className="break-words font-semibold text-slate-900">{nomAffichableItp(itp)}</h3></div><ModifierItem cibleType="ITP" refId={itp.id} titre={nomAffichableItp(itp)} ariaLabel={`Modifier l’itinéraire ${nomAffichableItp(itp)}`} /><div className="flex flex-wrap items-center gap-2"><QualiteBadge statut={itp.statutValidation} /><span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{itp.zoneClimat ? zoneLabel(itp.zoneClimat) : "Référence générale"}</span></div></div><dl className="mt-4 grid grid-cols-2 gap-3 text-sm"><MiniFact label="Conduite" value={valeurRenseignee(itp.typePlanche) ?? "Non précisée"} /><MiniFact label="Démarrage" value={valeurRenseignee(itp.modeDemarrage) ?? "Non précisé"} /><MiniFact label="Semis" value={week(itp.semaineSemis)} /><MiniFact label="Plantation" value={week(itp.semainePlantation)} /><MiniFact label="Récolte" value={week(itp.semaineRecolte)} /><MiniFact label="Cycle" value={cycleLisible(itp)} /></dl>{(valeurRenseignee(itp.sourceReference) || valeurRenseignee(itp.sourceUrl) || valeurRenseignee(itp.sourceLicence) || valeurRenseignee(itp.sourceVersion)) && <div className="mt-4 space-y-1 border-t border-lin pt-3 text-xs leading-5 text-ardoise">{valeurRenseignee(itp.sourceReference) && <p>Source déclarée : {valeurRenseignee(itp.sourceReference)}</p>}{valeurRenseignee(itp.sourceUrl) && <p><ReferenceSource source={valeurRenseignee(itp.sourceUrl)!} /></p>}{valeurRenseignee(itp.sourceVersion) && <p>Version : {valeurRenseignee(itp.sourceVersion)}</p>}{valeurRenseignee(itp.sourceLicence) && <p>Licence : {valeurRenseignee(itp.sourceLicence)}</p>}</div>}<CorrectionsItem cibleType="ITP" refId={itp.id} /></div>)}</div> : <Empty>Les itinéraires contextualisés de ce végétal restent à documenter.</Empty>}
           {espece._count.itps > espece.itps.length && (
             <p className="mt-4 text-sm text-slate-500">
               {espece.itps.length} itinéraires affichés sur {espece._count.itps} publiés pour ce
@@ -212,12 +238,14 @@ export default async function FicheVegetalPage({ params }: PageProps) {
 
         <section className="mt-10">
           <h2 className="text-2xl font-bold text-slate-900">Variétés</h2>
-          {espece.varietes.length ? <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{espece.varietes.map((variete) => <div key={variete.id} className="rounded-xl border border-slate-200 bg-white p-4"><div className="flex items-start justify-between gap-2"><h3 className="font-medium text-slate-900">{nomPublic(variete)}</h3><span className="text-xs text-slate-400">{originePublique(variete)}</span></div>{faitsVariete(variete).length > 0 && <p className="mt-2 text-xs text-slate-500">{faitsVariete(variete).join(" · ")}</p>}</div>)}</div> : <Empty>Aucune variété publique n’est encore rattachée à cette fiche.</Empty>}
+          {espece.varietes.length ? <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{espece.varietes.map((variete) => <div key={variete.id} id={ancreCorrection("VARIETE", variete.id)} className="scroll-mt-8 rounded-xl border border-slate-200 bg-white p-4"><div className="flex items-start justify-between gap-2"><h3 className="font-medium text-slate-900">{nomPublic(variete)}</h3><div className="flex flex-wrap items-center gap-2"><span className="text-xs text-slate-400">{originePublique(variete)}</span><ModifierItem cibleType="VARIETE" refId={variete.id} titre={nomPublic(variete)} ariaLabel={`Modifier la variété ${nomPublic(variete)}`} /></div></div>{faitsVariete(variete).length > 0 && <p className="mt-2 text-xs text-slate-500">{faitsVariete(variete).join(" · ")}</p>}<CorrectionsItem cibleType="VARIETE" refId={variete.id} /></div>)}</div> : <Empty>Aucune variété publique n’est encore rattachée à cette fiche.</Empty>}
         </section>
 
-        <aside className="mt-12 rounded-2xl border border-amber-200 bg-amber-50 p-5 text-sm leading-6 text-amber-950"><strong>Repères à vérifier localement.</strong> Les informations affichées proviennent du catalogue Gleba et des contributions explicitement partagées. Une source n’est affichée que lorsqu’elle est effectivement renseignée sur l’itinéraire technique.</aside>
+        <aside className="mt-8 rounded-xl border border-lin bg-papier p-5 text-sm leading-6 text-ardoise"><strong className="text-encre">Repères à vérifier localement.</strong> Les itinéraires et les caractéristiques du catalogue gardent leur provenance. Les textes communautaires sont relus et conservent leurs sources ; les retours du terrain décrivent une expérience dans son contexte.</aside>
+        </FicheCommunaute>
+        </Suspense>
       </article>
-    </MarketingShell>
+    </ReferentielShell>
   );
 }
 

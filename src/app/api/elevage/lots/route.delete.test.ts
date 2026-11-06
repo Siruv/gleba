@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   lotFindFirst: vi.fn(),
   lotDelete: vi.fn(),
   animalCount: vi.fn(),
+  mouvementCount: vi.fn(),
   animalFindMany: vi.fn(),
   animalUpdateMany: vi.fn(),
   soinFindMany: vi.fn(),
@@ -31,6 +32,8 @@ vi.mock('@/lib/auto-compta', () => ({
 }))
 vi.mock('@/lib/prisma', () => {
   const tx = {
+    // Verrou des règlements pris en tête de transaction (`verrouillerReglements`).
+    $executeRaw: vi.fn(),
     animal: { findMany: mocks.animalFindMany, updateMany: mocks.animalUpdateMany },
     consommationAliment: { findMany: mocks.consoFindMany, deleteMany: mocks.consoDeleteMany },
     soinAnimal: { findMany: mocks.soinFindMany, deleteMany: mocks.soinDeleteMany },
@@ -42,6 +45,7 @@ vi.mock('@/lib/prisma', () => {
       $transaction: (callback: (t: unknown) => unknown) => callback(tx),
       lotAnimaux: { findFirst: mocks.lotFindFirst },
       animal: { count: mocks.animalCount },
+      mouvementCheptel: { count: mocks.mouvementCount },
     },
   }
 })
@@ -54,7 +58,10 @@ const lot = (count: Record<string, number>, over: Record<string, unknown> = {}) 
   id: 77,
   nom: 'naissance 2024',
   prixAchatTotal: null,
-  _count: { animaux: 0, abattages: 0, productionsOeufs: 0, soins: 0, consommations: 0, naissances: 0, ...count },
+  _count: {
+    animaux: 0, abattages: 0, productionsOeufs: 0, productionsRuche: 0, collectesLait: 0,
+    soins: 0, consommations: 0, naissances: 0, statutsSanitairesStructures: 0, ...count,
+  },
   ...over,
 })
 
@@ -65,6 +72,7 @@ describe('DELETE /api/elevage/lots — lot dont tous les animaux sont sortis', (
     mocks.soinFindMany.mockResolvedValue([])
     mocks.consoFindMany.mockResolvedValue([])
     mocks.animalFindMany.mockResolvedValue([{ id: 1 }, { id: 2 }])
+    mocks.mouvementCount.mockResolvedValue(0)
   })
 
   it('détache les animaux sortis, tient leur historique, puis supprime le lot', async () => {
@@ -126,5 +134,70 @@ describe('DELETE /api/elevage/lots — lot dont tous les animaux sont sortis', (
     expect(mocks.animalCount).not.toHaveBeenCalled()
     expect(mocks.animalUpdateMany).not.toHaveBeenCalled()
     expect(mocks.lotDelete).toHaveBeenCalled()
+  })
+
+  // 2026-10-23 — un lot COLLECTIF (aucune fiche nominative, cas des volailles)
+  // se supprimait en effaçant ses soins et consommations et en détruisant ses
+  // mouvements de cheptel en cascade.
+  it('garde un lot collectif qui porte des soins et consommations, sans rien effacer', async () => {
+    mocks.lotFindFirst.mockResolvedValue(lot({ soins: 3, consommations: 2 }))
+
+    const res = await supprimer()
+
+    expect(res.status).toBe(409)
+    const corps = await res.json()
+    expect(corps.error).toContain("3 soins et 2 consommations d'aliment")
+    expect(corps.error).toContain('Clôturez le lot')
+    expect(mocks.soinDeleteMany).not.toHaveBeenCalled()
+    expect(mocks.consoDeleteMany).not.toHaveBeenCalled()
+    expect(mocks.lotDelete).not.toHaveBeenCalled()
+  })
+
+  it('garde un lot déplacé au pâturage (mouvement saisi), sans proposer de supprimer le mouvement', async () => {
+    mocks.lotFindFirst.mockResolvedValue(lot({}))
+    // 3 mouvements dont 2 écrits par la fiche (mise en place, correction de parcelle).
+    mocks.mouvementCount.mockResolvedValueOnce(3).mockResolvedValueOnce(2)
+
+    const res = await supprimer()
+
+    expect(res.status).toBe(409)
+    const erreur = (await res.json()).error
+    expect(erreur).toContain('1 mouvement de cheptel')
+    expect(erreur).not.toContain('supprimez')
+    expect(mocks.mouvementCount).toHaveBeenLastCalledWith({
+      where: { userId: 'user-1', lotId: 77, motif: { in: ['Mise en place du lot', 'Modification de la fiche lot'] } },
+    })
+    expect(mocks.lotDelete).not.toHaveBeenCalled()
+  })
+
+  // Revue du 2026-10-23 : corriger la parcelle d'un lot créé par erreur écrit
+  // « Modification de la fiche lot » ; ce reflet ne doit pas le retenir.
+  it('supprime un lot créé par erreur dont la parcelle a été corrigée', async () => {
+    mocks.lotFindFirst.mockResolvedValue(lot({}))
+    mocks.mouvementCount.mockResolvedValueOnce(2).mockResolvedValueOnce(2)
+
+    const res = await supprimer()
+
+    expect(res.status).toBe(200)
+    expect(mocks.lotDelete).toHaveBeenCalled()
+  })
+
+  it('supprime un lot créé par erreur sur une parcelle (seule la mise en place automatique)', async () => {
+    mocks.lotFindFirst.mockResolvedValue(lot({}))
+    mocks.mouvementCount.mockResolvedValueOnce(1).mockResolvedValueOnce(1)
+
+    const res = await supprimer()
+
+    expect(res.status).toBe(200)
+    expect(mocks.lotDelete).toHaveBeenCalledWith({ where: { id: 77 } })
+  })
+
+  it('garde un lot qui porte des collectes de lait ou une production de ruche', async () => {
+    mocks.lotFindFirst.mockResolvedValue(lot({ collectesLait: 4 }))
+
+    const res = await supprimer()
+
+    expect(res.status).toBe(409)
+    expect(mocks.lotDelete).not.toHaveBeenCalled()
   })
 })

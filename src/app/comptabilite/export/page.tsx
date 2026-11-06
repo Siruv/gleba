@@ -11,6 +11,8 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
 import { useToast } from '@/hooks/use-toast'
+import { formatNombre } from '@/lib/format-utils'
+import { formatMontantFec } from '@/lib/comptabilite/fec-affichage'
 
 interface ValidationFec {
   exercice: number
@@ -89,8 +91,8 @@ export default function ExportPage() {
         {exploitationOk === false && (
           <Card className="border-amber-200 bg-amber-50">
             <CardContent className="p-4 text-sm text-amber-900">
-              ⚠ Identité légale non configurée. L'export FEC requiert le SIRET et le SIREN
-              de l'exploitation pour respecter la nomenclature du fichier (
+              ⚠ Identité légale non configurée. L&apos;export FEC requiert le SIRET et le SIREN
+              de l&apos;exploitation pour respecter la nomenclature du fichier (
               <code className="bg-amber-100 px-1 rounded text-xs">&lt;SIREN&gt;FECAAAAMMJJ.txt</code>).{' '}
               <Link href="/parametres/exploitation" className="underline font-medium">
                 Configurer maintenant →
@@ -104,7 +106,7 @@ export default function ExportPage() {
             <CardTitle>Fichier des Écritures Comptables (FEC)</CardTitle>
             <CardDescription>
               Génère le FEC de votre exercice au format normalisé (arrêté du 29/07/2013).
-              Ce fichier est l'élément central d'un contrôle fiscal (art. L47 A-I LPF) pour les
+              Ce fichier est l&apos;élément central d&apos;un contrôle fiscal (art. L47 A-I LPF) pour les
               entreprises au réel.
             </CardDescription>
           </CardHeader>
@@ -125,7 +127,7 @@ export default function ExportPage() {
               </div>
               <Button onClick={lancerCheck} disabled={loading} variant="outline">
                 {loading ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-2" />}
-                Vérifier l'équilibre
+                Vérifier l&apos;équilibre
               </Button>
               <Button onClick={telecharger} disabled={exploitationOk === false}>
                 <Download className="h-4 w-4 mr-2" />
@@ -151,17 +153,17 @@ export default function ExportPage() {
                   </div>
                   <div className="grid grid-cols-2 gap-4 text-xs text-slate-700">
                     <div>
-                      <div>Écritures : <strong>{check.nbEcritures}</strong></div>
-                      <div>Lignes : <strong>{check.nbLignes}</strong></div>
+                      <div>Écritures : <strong>{formatNombre(check.nbEcritures)}</strong></div>
+                      <div>Lignes : <strong>{formatNombre(check.nbLignes)}</strong></div>
                     </div>
                     <div className="text-right">
-                      <div>Total Débit : <strong>{check.validation.totalDebit.toFixed(2)} €</strong></div>
-                      <div>Total Crédit : <strong>{check.validation.totalCredit.toFixed(2)} €</strong></div>
-                      <div>Écart : <strong>{check.validation.ecart.toFixed(2)} €</strong></div>
+                      <div>Total Débit : <strong>{formatMontantFec(check.validation.totalDebit)}</strong></div>
+                      <div>Total Crédit : <strong>{formatMontantFec(check.validation.totalCredit)}</strong></div>
+                      <div>Écart : <strong>{formatMontantFec(check.validation.ecart)}</strong></div>
                     </div>
                   </div>
                   <div className="mt-3 text-xs text-slate-600">
-                    {check.ventilation.factures} facture(s), {check.ventilation.ventes} vente(s) manuelle(s), {check.ventilation.depenses} dépense(s) manuelle(s).
+                    {formatNombre(check.ventilation.factures)} facture(s), {formatNombre(check.ventilation.ventes)} vente(s) manuelle(s), {formatNombre(check.ventilation.depenses)} dépense(s) manuelle(s).
                   </div>
                   {!check.validation.equilibre && check.validation.erreursParEcriture.length > 0 && (
                     <div className="mt-3 text-xs">
@@ -169,11 +171,11 @@ export default function ExportPage() {
                       <ul className="list-disc ml-5 mt-1 text-red-700">
                         {check.validation.erreursParEcriture.slice(0, 10).map((e) => (
                           <li key={e.ecriture}>
-                            #{e.ecriture} : D={e.debit.toFixed(2)} C={e.credit.toFixed(2)} (écart {e.ecart.toFixed(2)})
+                            #{e.ecriture} : débit {formatMontantFec(e.debit)}, crédit {formatMontantFec(e.credit)} (écart {formatMontantFec(e.ecart)})
                           </li>
                         ))}
                         {check.validation.erreursParEcriture.length > 10 && (
-                          <li>… et {check.validation.erreursParEcriture.length - 10} autres</li>
+                          <li>… et {formatNombre(check.validation.erreursParEcriture.length - 10)} autres</li>
                         )}
                       </ul>
                     </div>
@@ -190,8 +192,8 @@ export default function ExportPage() {
           </CardHeader>
           <CardContent className="text-sm text-blue-900 space-y-2">
             <p>
-              <strong>Cet export FEC est généré à des fins d'aide.</strong> Le contrôle de
-              conformité reste de la responsabilité de l'expert-comptable. Vérifiez l'équilibre
+              <strong>Cet export FEC est généré à des fins d&apos;aide.</strong> Le contrôle de
+              conformité reste de la responsabilité de l&apos;expert-comptable. Vérifiez l&apos;équilibre
               Débit = Crédit avant transmission, et faites valider le mapping du plan comptable
               avec votre comptable.
             </p>

@@ -429,7 +429,8 @@ function profilCompatibleAvecTypeArbre(profile: TreeCareProfile, typeArbre: stri
  * Recherche fuzzy d'un profil d'entretien par nom d'espece.
  *
  * `typeArbre` (optionnel) : type de l'ARBRE ("fruitier", "petit_fruit",
- * "forestier", "ornement", "haie"). Quand il est fourni, un profil
+ * "liane", "forestier", "ornement", "haie" : src/lib/verger/types-arbre.ts).
+ * Une liane fruitière reçoit les profils de production. Quand il est fourni, un profil
  * incompatible avec la conduite de l'arbre n'est jamais retourné
  * (cf. cmsofzh0w) : un Châtaignier forestier rend `null`, pas le
  * calendrier fruitier.
@@ -731,6 +732,10 @@ export function checkOperationSaison(
   date: Date | string | null | undefined,
   variete?: string | null
 ): SaisonWarning | null {
+  // Paramètre de l'API publique, sans effet ici : la récolte d'un arbre se
+  // contrôle sur la période de SA variété par `alerteSaisonRecolteArbre`
+  // (`src/lib/verger/saison-recolte-arbre.ts`), qui ne retombe ici qu'à défaut.
+  void variete
   if (!espece || !type || !date) return null
   const d = typeof date === "string" ? new Date(date) : date
   if (Number.isNaN(d.getTime())) return null

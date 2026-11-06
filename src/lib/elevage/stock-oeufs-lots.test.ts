@@ -79,6 +79,24 @@ describe("stock d'œufs par lots — délai d'attente vétérinaire (cmsoeyhs5)"
     expect(stock.stats.bloquesVeto).toBe(0)
   })
 
+  // Ticket cmv9dy2ow : le 15/10, des pontes du 10/10 sous un délai fini le
+  // 13/10 s'affichaient « vendables dès le 14/10 ». Elles restent écartées
+  // après la fin du délai, et le lot porte la fin du délai qui les a écartées.
+  it("garde écartée une ponte faite pendant le délai une fois le délai passé", async () => {
+    mocks.productionFindMany.mockResolvedValue([ponte(3, "2026-10-10T00:00:00Z")])
+    mocks.soinFindMany.mockResolvedValue([soinLot54({
+      date: new Date("2026-10-10T00:00:00Z"),
+      finAttenteOeufs: new Date("2026-10-13T00:00:00Z"),
+    })])
+
+    const stock = await computeStockOeufsParLots("user-1", new Date("2026-10-15T12:00:00Z"))
+
+    expect(stock.data[0].statut).toBe("bloque_attente_veto")
+    expect(stock.data[0].finAttenteVeto?.toISOString().slice(0, 10)).toBe("2026-10-13")
+    expect(stock.stats.commercialisables).toBe(0)
+    expect(stock.stats.bloquesVeto).toBe(12)
+  })
+
   it("ignore les soins non faits : le filtre fait=true est poussé dans la requête", async () => {
     mocks.productionFindMany.mockResolvedValue([ponte(3, "2026-08-11T00:00:00Z")])
 
@@ -115,5 +133,52 @@ describe("stock d'œufs par lots — délai d'attente vétérinaire (cmsoeyhs5)"
     expect(stock.data[0].statut).toBe("perime")
     expect(stock.stats.perimes).toBe(12)
     expect(stock.stats.bloquesVeto).toBe(0)
+  })
+})
+
+// Revue du 2026-11-01 — une ponte datée de la fin du mois était comptée
+// commercialisable dès le 1er : stock et valorisation étaient surestimés.
+describe("stock d'œufs par lots — pontes futures (revue 2026-11-01)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.soinFindMany.mockResolvedValue([])
+    mocks.animalFindFirst.mockResolvedValue(null)
+    mocks.animalFindMany.mockResolvedValue([])
+  })
+
+  it("exclut du stock à date une ponte datée après aujourd'hui et la signale", async () => {
+    mocks.productionFindMany.mockResolvedValue([
+      ponte(10, "2026-10-30T00:00:00Z"),
+      ponte(11, "2026-11-28T00:00:00Z"),
+    ])
+
+    const stock = await computeStockOeufsParLots("user-1", new Date("2026-11-01T10:00:00Z"))
+
+    expect(stock.data.map((lot) => lot.id)).toEqual([10])
+    expect(stock.stats.commercialisables).toBe(12)
+    expect(stock.stats.stockPhysique).toBe(12)
+    expect(stock.stats.aVenir).toBe(12)
+    expect(stock.pontesFutures).toEqual([
+      expect.objectContaining({ id: 11, oeufs: 12, datePonte: new Date("2026-11-28T00:00:00Z") }),
+    ])
+  })
+
+  it("garde une ponte du jour même saisie avant minuit (heure de Paris)", async () => {
+    // 2026-11-01 23:30 à Paris = 22:30 UTC ; ponte datée du jour civil.
+    mocks.productionFindMany.mockResolvedValue([ponte(12, "2026-11-01T00:00:00Z")])
+
+    const stock = await computeStockOeufsParLots("user-1", new Date("2026-11-01T22:30:00Z"))
+
+    expect(stock.stats.commercialisables).toBe(12)
+    expect(stock.stats.aVenir).toBe(0)
+  })
+
+  it("ne croise pas les pontes futures avec les délais vétérinaires", async () => {
+    mocks.productionFindMany.mockResolvedValue([ponte(13, "2026-11-28T00:00:00Z")])
+
+    const stock = await computeStockOeufsParLots("user-1", new Date("2026-11-01T10:00:00Z"))
+
+    expect(stock.data).toHaveLength(0)
+    expect(mocks.soinFindMany).not.toHaveBeenCalled()
   })
 })

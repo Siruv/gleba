@@ -3,6 +3,7 @@
  */
 
 import { auth } from "@/lib/auth"
+import { urlConnexion } from "@/lib/auth-retour"
 import {
   estSurfaceAdministration,
   motifInterdictionConsultation,
@@ -89,6 +90,8 @@ export default auth((req) => {
   // pour les visiteurs anonymes (avant connexion).
   const isCookieConsentApi = pathname === "/api/cookie-consent"
   const isPushVapidApi = pathname === "/api/notifications/push/vapid-public-key"
+  // Mesures des capteurs : authentifiées par le jeton du connecteur, pas par une session.
+  const isCapteursIngestionApi = pathname === "/api/capteurs/ingestion"
 
   // Boutiques publiques : /boutique/[slug] (pas /boutique seul qui est admin)
   // et /api/boutique/public/*
@@ -114,7 +117,7 @@ export default auth((req) => {
   }
 
   // Si route publique ou API auth/MCP/feedback, laisser passer
-  if (isPublicRoute || isAuthApi || isMcpApi || isFeedbackTokenApi || isUnsubscribeApi || isCookieConsentApi || isPushVapidApi || isPublicBoutiquePage || isPublicBoutiqueApi || isPublicApi) {
+  if (isPublicRoute || isAuthApi || isMcpApi || isFeedbackTokenApi || isUnsubscribeApi || isCookieConsentApi || isPushVapidApi || isCapteursIngestionApi || isPublicBoutiquePage || isPublicBoutiqueApi || isPublicApi) {
     // Si connecté et sur login, rediriger vers home
     if (isLoggedIn && (pathname === "/login" || pathname === "/register")) {
       return NextResponse.redirect(new URL("/", req.nextUrl))
@@ -131,9 +134,9 @@ export default auth((req) => {
     if (pathname.startsWith("/api/")) {
       return NextResponse.json({ error: "Non authentifié" }, { status: 401 })
     }
-    const loginUrl = new URL("/login", req.nextUrl)
-    loginUrl.searchParams.set("callbackUrl", pathname)
-    return NextResponse.redirect(loginUrl)
+    // QA cmvnout4y — le lien profond garde sa requête (`?tab=…&sub=…`) à
+    // travers la connexion : chemin + requête, jamais le chemin seul.
+    return NextResponse.redirect(new URL(urlConnexion(pathname + req.nextUrl.search), req.nextUrl))
   }
 
   if (isAdminRoute && req.auth?.user?.role !== "ADMIN") {

@@ -17,6 +17,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { visibiliteReferentiel } from '@/lib/referentiel-communaute'
 
 const TAKE = 8
 
@@ -39,15 +40,23 @@ export async function GET(request: NextRequest) {
   const userId = session.user.id
   const like = { contains: q, mode: 'insensitive' as const }
 
-  const [cultures, varietes, arbres, animaux, lots, clients, factures, parcelles, soins, recoltes, produitsBout] = await Promise.all([
+  const [cultures, varietes, arbres, animaux, lots, clients, factures, documents, parcelles, soins, recoltes, produitsBout] = await Promise.all([
     prisma.culture.findMany({
       where: { userId, OR: [{ varieteId: like }, { especeId: like }] },
       take: TAKE,
       orderBy: { id: 'desc' },
       select: { id: true, especeId: true, varieteId: true, plancheId: true, annee: true, espece: { select: { nom: true } }, variete: { select: { nom: true } } },
     }),
+    // Variétés que le compte voit, comme GET /api/varietes (règle cascadée sur
+    // l'espèce) : la recherche listait les variétés privées des autres comptes.
     prisma.variete.findMany({
-      where: { OR: [{ id: like }, { nomNormalise: like }] },
+      where: {
+        AND: [
+          { OR: [{ id: like }, { nomNormalise: like }] },
+          visibiliteReferentiel(userId),
+          { espece: visibiliteReferentiel(userId) },
+        ],
+      },
       take: TAKE,
       orderBy: { id: 'asc' },
       select: { id: true, nom: true, nomNormalise: true, especeId: true },
@@ -81,6 +90,12 @@ export async function GET(request: NextRequest) {
       take: TAKE,
       orderBy: { date: 'desc' },
       select: { id: true, numero: true, clientNom: true, totalTTC: true, statut: true },
+    }),
+    prisma.documentCommercial.findMany({
+      where: { userId, OR: [{ numero: like }, { clientNom: like }, { objet: like }] },
+      take: TAKE,
+      orderBy: { date: 'desc' },
+      select: { id: true, numero: true, clientNom: true, type: true, statut: true },
     }),
     prisma.parcelleGeo.findMany({
       where: { userId, nom: like },
@@ -157,6 +172,13 @@ export async function GET(request: NextRequest) {
       sub: `${f.clientNom || ''} · ${f.totalTTC.toFixed(2)} €${f.statut ? ` · ${f.statut}` : ''}`,
       type: 'Facture',
       href: `/comptabilite/factures`,
+    })),
+    ...documents.map((d): SearchItem => ({
+      id: `document-${d.id}`,
+      label: d.statut === 'brouillon' ? `Brouillon · ${d.clientNom}` : d.numero,
+      sub: d.clientNom,
+      type: d.type === 'devis' ? 'Devis' : 'Bon de livraison',
+      href: `/comptabilite/factures?tab=${d.type === 'devis' ? 'devis' : 'livraisons'}&document=${encodeURIComponent(d.id)}`,
     })),
     ...parcelles.map((p): SearchItem => ({
       id: `parcelle-${p.id}`,

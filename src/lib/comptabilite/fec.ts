@@ -17,7 +17,6 @@
 import {
   COMPTES_BILAN,
   COMPTES_VENTES,
-  COMPTES_ACHATS,
   JOURNAUX,
   compteTresorerie,
   compteVente,
@@ -79,6 +78,7 @@ export interface FecInputVente {
   montantTVA: number | null
   clientNom: string | null
   paye: boolean
+  reglementDetaille?: boolean
 }
 
 export interface FecInputDepense {
@@ -94,6 +94,34 @@ export interface FecInputDepense {
   montantTVA: number | null
   fournisseurNom: string | null
   paye: boolean
+  reglementDetaille?: boolean
+}
+
+/**
+ * Contrepartie d'une vente ou d'une dépense : trésorerie (512 banque, 531
+ * caisse) seulement si elle est RÉGLÉE, sinon le tiers (411 client, 401
+ * fournisseur). Revue du 2026-10-20 (ticket cmvgdzsf7) : le compte suivait le
+ * seul mode de règlement, si bien que choisir « Virement » sur un solde de
+ * réservation impayé déplaçait la créance en banque. Le journal suit le compte :
+ * une écriture sans mouvement de trésorerie part au journal des ventes ou des
+ * achats, pas en banque.
+ */
+export function contrepartieReglement(
+  paye: boolean,
+  modeReglement: string | null,
+  sens: 'vente' | 'depense',
+): { compteNum: string; compteLib: string; journal: string } {
+  const tresorerie = paye ? compteTresorerie(modeReglement) : null
+  if (tresorerie === COMPTES_BILAN.caisse) return { compteNum: tresorerie, compteLib: 'Caisse', journal: 'CA' }
+  if (tresorerie === COMPTES_BILAN.banque) return { compteNum: tresorerie, compteLib: 'Banque', journal: 'BQ' }
+  const tiers =
+    sens === 'vente'
+      ? { compteNum: COMPTES_BILAN.clients, compteLib: 'Créances clients', journal: 'VE' }
+      : { compteNum: COMPTES_BILAN.fournisseurs, compteLib: 'Dettes fournisseurs', journal: 'AC' }
+  // Réglée sans mode connu : contrepartie tiers, journal historique (banque)
+  // conservé tant que le mode n'est pas « À crédit ».
+  if (paye && modeReglement !== 'À crédit') return { ...tiers, journal: 'BQ' }
+  return tiers
 }
 
 function ymd(d: Date): string {
@@ -103,9 +131,18 @@ function ymd(d: Date): string {
   return `${y}${m}${day}`
 }
 
-function fmtMontant(n: number): string {
+/**
+ * Montant en centimes entiers, arrondi au plus proche (demi-centime vers le
+ * haut sur la valeur décimale voulue : 20,825 € donne 2083 et non 2082, que
+ * donnerait la représentation binaire 20,82499…).
+ */
+export function versCentimes(n: number): number {
+  return Math.round(Number((n * 100).toFixed(6)))
+}
+
+function fmtCentimes(centimes: number): string {
   // FEC : virgule décimale, pas de séparateur de milliers
-  return n.toFixed(2).replace('.', ',')
+  return (centimes / 100).toFixed(2).replace('.', ',')
 }
 
 function ecritureBase(
@@ -131,7 +168,7 @@ function ecritureBase(
   }
 }
 
-function line(base: Partial<FecLine>, compteNum: string, compteLib: string, debit: number, credit: number, tiers?: { num: string; lib: string }): FecLine {
+function line(base: Partial<FecLine>, compteNum: string, compteLib: string, debitCentimes: number, creditCentimes: number, tiers?: { num: string; lib: string }): FecLine {
   return {
     JournalCode: base.JournalCode!,
     JournalLib: base.JournalLib!,
@@ -144,8 +181,8 @@ function line(base: Partial<FecLine>, compteNum: string, compteLib: string, debi
     PieceRef: base.PieceRef!,
     PieceDate: base.PieceDate!,
     EcritureLib: base.EcritureLib!,
-    Debit: fmtMontant(debit),
-    Credit: fmtMontant(credit),
+    Debit: fmtCentimes(debitCentimes),
+    Credit: fmtCentimes(creditCentimes),
     EcritureLet: base.EcritureLet || '',
     DateLet: base.DateLet || '',
     ValidDate: base.ValidDate!,
@@ -189,10 +226,26 @@ export interface FecInputFacture {
   }>
 }
 
+export interface FecInputReglement {
+  id: string; date: Date; montant: number; sens: string; modeReglement: string
+  piece: string; libelle: string; tiers?: { num: string; lib: string }
+  compteTresorerie?: { num: string; lib: string }
+  annuleLe: Date | null
+}
+export interface FecInputMouvementInterne {
+  id: string; date: Date; montant: number; sens: 'sortie' | 'entree'; piece: string
+  compteTresorerie: { num: string; lib: string }
+}
+export function auxiliaireClient(clientId: number | null, nom: string) {
+  return clientId ? '411' + String(clientId).padStart(6, '0').slice(-6) : '411A' + (nom || 'ANONYME').replace(/[^A-Z0-9]/gi, '').slice(0, 6).toUpperCase().padEnd(6, 'X')
+}
 export function genererFec(input: {
   ventes: FecInputVente[]
   depenses: FecInputDepense[]
   factures: FecInputFacture[]
+  reglements?: FecInputReglement[]
+  mouvementsInternes?: FecInputMouvementInterne[]
+  exercice?: number
   // Exploitation hors champ TVA française (franchise 293B, non-assujetti,
   // TGC) : aucune ligne de TVA ne doit apparaître au FEC et le HT = TTC.
   // Sans ce gate, les écritures auto/manuelles (tauxTVA 5,5/20 par défaut)
@@ -258,9 +311,7 @@ export function genererFec(input: {
     // pour permettre le lettrage et le suivi de balance âgée.
     // Si clientId est null (client anonyme), on utilise un hash stable du nom
     // pour préserver le regroupement par nom.
-    const tiersNum = f.clientId
-      ? `411${String(f.clientId).padStart(6, '0').slice(-6)}`
-      : `411A${(f.clientNom || 'ANONYME').replace(/[^A-Z0-9]/gi, '').slice(0, 6).toUpperCase().padEnd(6, 'X')}`
+    const tiersNum = auxiliaireClient(f.clientId, f.clientNom)
     const tiers = { num: tiersNum, lib: f.clientNom || 'Client anonyme' }
 
     // Débit client (créance) = TTC
@@ -308,23 +359,17 @@ export function genererFec(input: {
 
   // ============ VENTES MANUELLES (non auto) ============
   for (const v of input.ventes) {
-    const journal = v.modeReglement === 'Espèces' ? 'CA' : v.modeReglement === 'À crédit' ? 'VE' : 'BQ'
+    const { compteNum: compteTreso, compteLib: libTreso, journal } = contrepartieReglement(v.reglementDetaille ? false : v.paye, v.reglementDetaille ? 'À crédit' : v.modeReglement, 'vente')
     const pieceRef = v.numeroPiece || `VM-${v.id}`
     const libelle = `${v.description}${v.clientNom ? ' — ' + v.clientNom : ''}`
 
-    const compteTreso = compteTresorerie(v.modeReglement) || COMPTES_BILAN.clients
     const compteV = compteVente(v.categorie)
     const ht = sansTva ? v.montant : (v.montantHT ?? (v.montant / (1 + v.tauxTVA / 100)))
     const tva = sansTva ? 0 : (v.montantTVA ?? (v.montant - ht))
 
     const lignes: LigneTmp[] = []
     // Débit trésorerie (ou client si à crédit) = TTC
-    lignes.push({
-      compteNum: compteTreso,
-      compteLib: compteTreso === COMPTES_BILAN.caisse ? 'Caisse' : compteTreso === COMPTES_BILAN.banque ? 'Banque' : 'Créances clients',
-      debit: v.montant,
-      credit: 0,
-    })
+    lignes.push({ compteNum: compteTreso, compteLib: libTreso, debit: v.montant, credit: 0 })
     // Crédit vente HT
     if (ht !== 0) lignes.push({ compteNum: compteV.num, compteLib: compteV.lib, debit: 0, credit: ht })
     // Crédit TVA collectée
@@ -335,11 +380,10 @@ export function genererFec(input: {
 
   // ============ DÉPENSES MANUELLES (auto incluses — SSOT dépenses) ============
   for (const d of input.depenses) {
-    const journal = d.modeReglement === 'Espèces' ? 'CA' : d.modeReglement === 'À crédit' ? 'AC' : 'BQ'
+    const { compteNum: compteTreso, compteLib: libTreso, journal } = contrepartieReglement(d.reglementDetaille ? false : d.paye, d.reglementDetaille ? 'À crédit' : d.modeReglement, 'depense')
     const pieceRef = d.numeroPiece || `DM-${d.id}`
     const libelle = `${d.description}${d.fournisseurNom ? ' — ' + d.fournisseurNom : ''}`
 
-    const compteTreso = compteTresorerie(d.modeReglement) || COMPTES_BILAN.fournisseurs
     const compteA = compteAchat(d.categorie)
     const ht = sansTva ? d.montant : (d.montantHT ?? (d.montant / (1 + d.tauxTVA / 100)))
     const tva = sansTva ? 0 : (d.montantTVA ?? (d.montant - ht))
@@ -350,14 +394,40 @@ export function genererFec(input: {
     // Débit TVA déductible
     if (tva !== 0) lignes.push({ compteNum: COMPTES_BILAN.tvaDeductibleBiens, compteLib: 'TVA déductible', debit: tva, credit: 0 })
     // Crédit trésorerie (ou fournisseur si à crédit)
-    lignes.push({
-      compteNum: compteTreso,
-      compteLib: compteTreso === COMPTES_BILAN.caisse ? 'Caisse' : compteTreso === COMPTES_BILAN.banque ? 'Banque' : 'Dettes fournisseurs',
-      debit: 0,
-      credit: d.montant,
-    })
+    lignes.push({ compteNum: compteTreso, compteLib: libTreso, debit: 0, credit: d.montant })
 
     ecritures.push({ journal, date: d.date, pieceRef, libelle, lignes })
+  }
+
+  // Les règlements soldent le tiers : ils ne recréent ni produit ni TVA.
+  for (const r of input.reglements ?? []) {
+    const encaissement = r.sens === 'encaissement'
+    const contrepartie = contrepartieReglement(true, r.modeReglement, encaissement ? 'vente' : 'depense')
+    const tresorerie = r.compteTresorerie ?? { num: contrepartie.compteNum, lib: contrepartie.compteLib }
+    const journal = r.modeReglement === 'Espèces' && !r.compteTresorerie ? 'CA' : 'BQ'
+    const tiersCompte = encaissement ? COMPTES_BILAN.clients : COMPTES_BILAN.fournisseurs
+    const ajouter = (date: Date, montant: number, annulation: boolean) => {
+      if (input.exercice && date.getFullYear() !== input.exercice) return
+      const entre = encaissement ? montant > 0 : montant < 0
+      const somme = Math.abs(montant)
+      ecritures.push({ journal, date, pieceRef: r.piece || 'REG-' + r.id,
+        libelle: (annulation ? 'Annulation de saisie · ' : '') + 'Règlement · ' + r.libelle,
+        lignes: [
+          { compteNum: tresorerie.num, compteLib: tresorerie.lib, debit: entre ? somme : 0, credit: entre ? 0 : somme },
+          { compteNum: tiersCompte, compteLib: encaissement ? 'Créances clients' : 'Dettes fournisseurs', debit: entre ? 0 : somme, credit: entre ? somme : 0, tiers: r.tiers },
+        ] })
+    }
+    ajouter(r.date, r.montant, false)
+    if (r.annuleLe) ajouter(r.annuleLe, -r.montant, true)
+  }
+  for (const m of input.mouvementsInternes ?? []) {
+    if (input.exercice && m.date.getFullYear() !== input.exercice) continue
+    const sortie = m.sens === 'sortie', montant = Math.abs(m.montant)
+    ecritures.push({ journal: 'BQ', date: m.date, pieceRef: m.piece, libelle: 'Virement entre comptes · ' + m.compteTresorerie.lib,
+      lignes: [
+        { compteNum: m.compteTresorerie.num, compteLib: m.compteTresorerie.lib, debit: sortie ? 0 : montant, credit: sortie ? montant : 0 },
+        { compteNum: '580000', compteLib: 'Virements internes', debit: sortie ? montant : 0, credit: sortie ? 0 : montant },
+      ] })
   }
 
   // ============ TRI CHRONOLOGIQUE + NUMÉROTATION PAR JOURNAL ============
@@ -367,10 +437,50 @@ export function genererFec(input: {
   for (const e of triees) {
     numParJournal[e.journal] = (numParJournal[e.journal] ?? 0) + 1
     const base = ecritureBase(e.journal, numParJournal[e.journal], e.date, e.pieceRef, e.libelle)
-    for (const l of e.lignes) {
-      out.push(line(base, l.compteNum, l.compteLib, l.debit, l.credit, l.tiers))
+    for (const l of equilibrerArrondis(e.lignes)) {
+      out.push(line(base, l.compteNum, l.compteLib, l.debitCentimes, l.creditCentimes, l.tiers))
     }
   }
+  return out
+}
+
+/**
+ * Comptes qui portent un montant calculé (HT en charge, produit ou
+ * immobilisation, TVA), par opposition aux flux réels : tiers (40x, 41x) et
+ * trésorerie ou virements internes (5x).
+ */
+const estCompteCalcule = (compteNum: string) => !/^(40|41|5)/.test(compteNum)
+
+/**
+ * Revue du 2026-11-01 — chaque ligne était arrondie séparément : une dépense de
+ * 24,99 € TTC à 20 % donnait 20,82 € HT + 4,16 € de TVA au débit contre 24,99 €
+ * au crédit, et le contrôle tolérait ce centime. Les lignes passent en
+ * centimes ; quand les montants d'origine s'équilibrent aux arrondis près
+ * (un demi-centime par ligne calculée), l'écart est porté par la TVA (sinon la
+ * plus grosse charge ou le plus gros produit), comme on calcule TVA = TTC − HT.
+ * Les comptes de trésorerie et de tiers gardent le montant réellement payé. Un
+ * déséquilibre plus large des montants d'origine n'est jamais absorbé :
+ * `validerEquilibre` le refuse.
+ */
+function equilibrerArrondis<T extends { compteNum: string; debit: number; credit: number }>(
+  lignes: T[],
+): Array<T & { debitCentimes: number; creditCentimes: number }> {
+  const out = lignes.map((l) => ({ ...l, debitCentimes: versCentimes(l.debit), creditCentimes: versCentimes(l.credit) }))
+  // Écart des montants d'origine toléré comme arrondi : un demi-centime par
+  // ligne calculée (HT 20,82 + TVA 4,16 déjà arrondis séparément pour 24,99 TTC).
+  const nbCalculees = lignes.filter((l) => estCompteCalcule(l.compteNum)).length
+  const brut = lignes.reduce((ecart, l) => ecart + l.debit - l.credit, 0)
+  if (Math.abs(brut) > 0.005 * Math.max(1, nbCalculees) + 1e-9) return out
+  const ecart = out.reduce((total, l) => total + l.debitCentimes - l.creditCentimes, 0)
+  if (ecart === 0) return out
+  const montant = (l: (typeof out)[number]) => l.debitCentimes + l.creditCentimes
+  const candidates = out
+    .filter((l) => estCompteCalcule(l.compteNum) && montant(l) > Math.abs(ecart))
+    .sort((a, b) => Number(b.compteNum.startsWith('445')) - Number(a.compteNum.startsWith('445')) || montant(b) - montant(a))
+  const cible = candidates[0]
+  if (!cible) return out
+  if (cible.debitCentimes > 0) cible.debitCentimes -= ecart
+  else cible.creditCentimes += ecart
   return out
 }
 
@@ -381,7 +491,11 @@ export function serialiserFec(lines: FecLine[]): string {
   return [header, ...rows].join('\n') + '\n'
 }
 
-/** Valide l'équilibre Débit = Crédit par écriture et au global. */
+/**
+ * Valide l'équilibre Débit = Crédit par écriture et au global, au centime
+ * exact (revue du 2026-11-01 : la tolérance d'un centime laissait télécharger
+ * un FEC déséquilibré annoncé « équilibré »).
+ */
 export function validerEquilibre(lines: FecLine[]): {
   equilibre: boolean
   ecart: number
@@ -389,12 +503,13 @@ export function validerEquilibre(lines: FecLine[]): {
   totalCredit: number
   erreursParEcriture: Array<{ ecriture: string; debit: number; credit: number; ecart: number }>
 } {
+  const centimes = (montant: string) => versCentimes(parseFloat(montant.replace(',', '.')) || 0)
   const parEcr: Record<string, { debit: number; credit: number }> = {}
   let totalD = 0
   let totalC = 0
   for (const l of lines) {
-    const d = parseFloat(l.Debit.replace(',', '.'))
-    const c = parseFloat(l.Credit.replace(',', '.'))
+    const d = centimes(l.Debit)
+    const c = centimes(l.Credit)
     totalD += d
     totalC += c
     // EcritureNum est séquentiel PAR JOURNAL : la clé d'écriture inclut le journal.
@@ -405,17 +520,15 @@ export function validerEquilibre(lines: FecLine[]): {
   }
   const erreurs: Array<{ ecriture: string; debit: number; credit: number; ecart: number }> = []
   for (const [num, t] of Object.entries(parEcr)) {
-    const ecart = Math.round((t.debit - t.credit) * 100) / 100
-    if (Math.abs(ecart) > 0.01) {
-      erreurs.push({ ecriture: num, debit: t.debit, credit: t.credit, ecart })
+    if (t.debit !== t.credit) {
+      erreurs.push({ ecriture: num, debit: t.debit / 100, credit: t.credit / 100, ecart: (t.debit - t.credit) / 100 })
     }
   }
-  const globalEcart = Math.round((totalD - totalC) * 100) / 100
   return {
-    equilibre: erreurs.length === 0 && Math.abs(globalEcart) <= 0.01,
-    ecart: globalEcart,
-    totalDebit: Math.round(totalD * 100) / 100,
-    totalCredit: Math.round(totalC * 100) / 100,
+    equilibre: erreurs.length === 0 && totalD === totalC,
+    ecart: (totalD - totalC) / 100,
+    totalDebit: totalD / 100,
+    totalCredit: totalC / 100,
     erreursParEcriture: erreurs,
   }
 }

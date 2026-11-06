@@ -7,8 +7,12 @@
 import { NextRequest, NextResponse } from "next/server"
 import prisma from "@/lib/prisma"
 import { requireAuthApi } from "@/lib/auth-utils"
-import { snapshotStatutBio } from "@/lib/statut-bio"
-import { genererNumeroLot } from "@/lib/recolte/lot"
+import { creerRecolteFruit } from "@/lib/verger/creation-recolte"
+import { ErreurVerger } from "@/lib/verger/erreur"
+import { chargerAvertissementsDarFruits } from "@/lib/verger/dar"
+import { chargerSuiviDesLignes } from "@/lib/comptabilite/suivi-ecriture"
+import { chargerSuiviCommercialVerger } from "@/lib/verger/suivi-commercial"
+import { lotVergerFige } from "@/lib/verger/sortie-stock"
 
 // GET /api/arbres/recoltes
 export async function GET(request: NextRequest) {
@@ -45,6 +49,9 @@ export async function GET(request: NextRequest) {
     const recoltes = await prisma.recolteArbre.findMany({
       where,
       include: {
+        mouvementsCommerciaux: { where: { userId, nature: { not: 'livraison' } },
+          select: { id: true, nature: true, quantite: true, unite: true, date: true, notes: true }, orderBy: { date: 'desc' } },
+        _count: { select: { mouvementsCommerciaux: { where: { userId, nature: 'livraison' } } } },
         arbre: {
           select: {
             id: true,
@@ -57,7 +64,14 @@ export async function GET(request: NextRequest) {
       orderBy: { date: "desc" },
     })
 
-    return NextResponse.json(recoltes)
+    const warnings = await chargerAvertissementsDarFruits(prisma, userId, recoltes)
+    const suivi = await chargerSuiviDesLignes(userId, recoltes.filter(r => r.statut === 'vendu').map(r => ({ id: String(r.id), source: 'RecolteArbre', sourceId: r.id, factureId: r.factureId })))
+    const commercial = await chargerSuiviCommercialVerger(userId, 'fruit', recoltes.filter(r => r.stockDisponibleCommercial != null).map(r => r.id))
+    // `figeCommercial` : seul un BL ou une facture interdit de corriger ou de
+    // supprimer le lot ; ses pertes et usages internes s'annulent un à un.
+    return NextResponse.json(recoltes.map(r => ({ ...r, warnings: warnings.get(r.id), ecriture: suivi.get(String(r.id))?.ecriture,
+      ventesCommerciales: commercial.get(r.id) ?? [],
+      figeCommercial: lotVergerFige({ quantite: r.quantite, unite: 'kg' }, r.stockDisponibleCommercial, r.mouvementsCommerciaux, r._count.mouvementsCommerciaux) })))
   } catch (err) {
     console.error("GET /api/arbres/recoltes error:", err)
     return NextResponse.json(
@@ -71,210 +85,11 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const { error, session } = await requireAuthApi()
   if (error) return error
-
   try {
-    const userId = session!.user.id
-    const body = await request.json()
-
-    // Validation
-    if (!body.arbreId) {
-      return NextResponse.json(
-        { error: "L'arbre est requis" },
-        { status: 400 }
-      )
-    }
-
-    if (typeof body.quantite !== "number" || !isFinite(body.quantite) || body.quantite < 0) {
-      return NextResponse.json(
-        { error: "La quantité doit être positive" },
-        { status: 400 }
-      )
-    }
-
-    // Vérifier que l'arbre appartient à l'utilisateur.
-    // PROMPT 12 — on charge la zone et la parcelle pour snapshoter le statut Bio.
-    // DEV3 #4 — on charge aussi parcelleGeo.nom pour le N° de lot.
-    // Feedback Marc 2026-05-16 — Bug 08 : on charge aussi variete +
-    // espece pour valider la cohérence saison de récolte.
-    const arbre = await prisma.arbre.findFirst({
-      where: { id: body.arbreId, userId },
-      include: {
-        zone: { select: { statutBio: true, dateDebutConversion: true } },
-        parcelleGeo: { select: { id: true, nom: true, statutBio: true, dateDebutConversion: true } },
-      },
-    })
-
-    // Feedback Marc 2026-05-16 — Bug 08 : alerte si la date de récolte
-    // est hors saison agronomique de la variété (ex: Pommier Golden
-    // récolté en mai alors que la récolte standard est semaine 38-42).
-    const recolteWarnings: string[] = []
-    if (arbre) {
-      const dateRecolteForCheck = body.date ? new Date(body.date) : new Date()
-      const varieteAvecRecolte = arbre.variete
-        ? await prisma.variete.findFirst({
-            where: { id: arbre.variete, especeId: arbre.espece ?? undefined },
-            select: { id: true, semaineRecolte: true, dureeRecolte: true },
-          })
-        : null
-      if (varieteAvecRecolte?.semaineRecolte) {
-        const start = new Date(dateRecolteForCheck.getFullYear(), 0, 1)
-        const diffJours = (dateRecolteForCheck.getTime() - start.getTime()) / 86_400_000
-        const semaineSaisie = Math.min(53, Math.max(1, Math.ceil((diffJours + start.getDay() + 1) / 7)))
-        const semaineDebut = varieteAvecRecolte.semaineRecolte
-        const semaineFin = semaineDebut + (varieteAvecRecolte.dureeRecolte ?? 4)
-        const toleranceSemaines = 3
-        // Fenêtre à cheval sur deux années (semaineFin > 53) : elle couvre
-        // [semaineDebut..53] ∪ [1..semaineFin-53]. La semaine saisie étant
-        // toujours ≤ 53, on teste l'appartenance aux deux segments.
-        const horsSaison =
-          semaineFin > 53
-            ? semaineSaisie < semaineDebut - toleranceSemaines &&
-              semaineSaisie > semaineFin - 53 + toleranceSemaines
-            : semaineSaisie < semaineDebut - toleranceSemaines ||
-              semaineSaisie > semaineFin + toleranceSemaines
-        if (horsSaison) {
-          recolteWarnings.push(
-            `Hors saison : ${arbre.espece ?? "espèce"} ${arbre.variete} se récolte normalement semaines ${semaineDebut}-${semaineFin} (saisie semaine ${semaineSaisie}).`
-          )
-        }
-      }
-    }
-
-    if (!arbre) {
-      return NextResponse.json(
-        { error: "Arbre non trouvé" },
-        { status: 404 }
-      )
-    }
-
-    // Statut Bio : priorité à la zone verger, sinon parcelle géo.
-    const sourceBio = arbre.zone ?? arbre.parcelleGeo
-    const dateRecolte = body.date ? new Date(body.date) : new Date()
-    // DEV3 #4 — statut Bio surchargeable depuis le formulaire (auto-rempli
-    // depuis la parcelle d'origine par défaut).
-    const statutBioSnapshot =
-      body.statutBioSnapshot ||
-      (sourceBio
-        ? snapshotStatutBio(sourceBio.statutBio, sourceBio.dateDebutConversion, dateRecolte)
-        : null)
-
-    // DEV3 #4 — parcelle d'origine : par défaut celle de l'arbre, surchargeable.
-    // Bug traçabilité AB : le front envoyait `parcelleId: null` (champ absent du
-    // formulaire), ce qui court-circuitait le défaut et produisait des lots "-NA-".
-    // On prend donc le défaut quand la valeur est null OU undefined.
-    const parcelleId = body.parcelleId ?? arbre.parcelleGeo?.id ?? null
-
-    // Avertissements de saisie (rendus au client, PAS persistés dans les notes
-    // contrairement aux alertes de saison). Deux cas vus en production le
-    // 2026-09-04 sur un même compte verger :
-    //  - l'arbre n'est rattaché à aucune parcelle → lot « NA », statut bio non
-    //    déduit, traçabilité incomplète sans que rien ne le dise ;
-    //  - la même récolte (même arbre, même quantité) saisie deux fois à une
-    //    minute d'écart, seule la date différant — une correction faite par
-    //    re-saisie faute de pouvoir modifier la première.
-    const avertissements: string[] = []
-    if (!parcelleId) {
-      avertissements.push(
-        "Cet arbre n'est rattaché à aucune parcelle : le lot est numéroté « NA » et le statut bio n'a pas été déduit. Rattachez l'arbre à sa parcelle (fiche de l'arbre) ou choisissez la parcelle d'origine dans le formulaire."
-      )
-    }
-    const doublonRecent = await prisma.recolteArbre.findFirst({
-      where: {
-        userId,
-        arbreId: body.arbreId,
-        quantite: body.quantite,
-        createdAt: { gte: new Date(Date.now() - 15 * 60 * 1000) },
-      },
-      orderBy: { createdAt: "desc" },
-      select: { date: true, createdAt: true },
-    })
-    if (doublonRecent) {
-      const minutes = Math.max(1, Math.round((Date.now() - doublonRecent.createdAt.getTime()) / 60_000))
-      avertissements.push(
-        `Une récolte identique (${body.quantite} kg sur le même arbre, datée du ${doublonRecent.date.toLocaleDateString("fr-FR")}) a été enregistrée il y a ${minutes} min. Si celle-ci la corrige, modifiez ou supprimez la première depuis la liste du stock.`
-      )
-    }
-
-    // DEV3 #4 — Numéro de lot auto YYYYMMDD-PARCELLE-ESPECE-NN si non fourni.
-    // Pour le séquentiel NN, on compte le nb de lots du jour + même parcelle + même espèce.
-    let numLot = body.numLot || null
-    if (!numLot) {
-      const parcelleNom = parcelleId
-        ? (await prisma.parcelleGeo.findUnique({ where: { id: parcelleId }, select: { nom: true } }))?.nom
-        : null
-      const dayStart = new Date(dateRecolte)
-      dayStart.setHours(0, 0, 0, 0)
-      const dayEnd = new Date(dateRecolte)
-      dayEnd.setHours(23, 59, 59, 999)
-      const sameDayCount = await prisma.recolteArbre.count({
-        where: {
-          userId,
-          date: { gte: dayStart, lte: dayEnd },
-          ...(parcelleId ? { parcelleId } : {}),
-          arbre: { espece: arbre.espece },
-        },
-      })
-      numLot = genererNumeroLot({
-        date: dateRecolte,
-        parcelleNom: parcelleNom ?? null,
-        espece: arbre.espece,
-        numeroSequence: sameDayCount + 1,
-      })
-    }
-
-    // Feedback testeur cmpky7zmy — Si récolte hors saison, on persiste
-    // l'avertissement dans le champ notes pour qu'il reste visible sur
-    // la fiche/liste, et pas seulement dans le toast éphémère lors de
-    // la création (le testeur n'avait aucun indice visuel a posteriori
-    // qu'une Belle de Boskoop avait été récoltée 5 mois trop tôt).
-    const notesAvecWarning = recolteWarnings.length > 0
-      ? `⚠️ ${recolteWarnings.join(' ')}${body.notes ? `\n${body.notes}` : ''}`
-      : body.notes || null
-
-    const recolte = await prisma.recolteArbre.create({
-      data: {
-        userId,
-        arbreId: body.arbreId,
-        date: dateRecolte,
-        quantite: body.quantite,
-        qualite: body.qualite || null,
-        prixKg: body.prixKg || null,
-        statut: "en_stock",
-        datePeremption: body.datePeremption ? new Date(body.datePeremption) : null,
-        notes: notesAvecWarning,
-        statutBioSnapshot,
-        // DEV3 #4
-        parcelleId,
-        numLot,
-        categorieCommerciale: body.categorieCommerciale || null,
-        destinationCommerce: body.destinationCommerce || null,
-        conditionnement: body.conditionnement || null,
-      },
-      include: {
-        arbre: {
-          select: {
-            id: true,
-            nom: true,
-            type: true,
-          },
-        },
-        parcelle: { select: { id: true, nom: true } },
-      },
-    })
-
-    return NextResponse.json(
-      {
-        ...recolte,
-        ...(recolteWarnings.length > 0 ? { warnings: recolteWarnings } : {}),
-        ...(avertissements.length > 0 ? { avertissements } : {}),
-      },
-      { status: 201 }
-    )
+    return NextResponse.json(await creerRecolteFruit(session!.user.id, await request.json()), { status: 201 })
   } catch (err) {
+    if (err instanceof ErreurVerger) return NextResponse.json({ error: err.message, champ: err.champ }, { status: err.status })
     console.error("POST /api/arbres/recoltes error:", err)
-    return NextResponse.json(
-      { error: "Erreur lors de la création de la récolte" },
-      { status: 500 }
-    )
+    return NextResponse.json({ error: "Erreur lors de la création de la récolte" }, { status: 500 })
   }
 }

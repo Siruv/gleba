@@ -2,12 +2,16 @@
  * API Routes pour une Culture spécifique
  * GET /api/cultures/[id] - Détail d'une culture
  * PUT /api/cultures/[id] - Modifier une culture
- * DELETE /api/cultures/[id] - Supprimer une culture
+ * DELETE /api/cultures/[id] - Supprimer une culture sans récolte vendue
+ *   (sinon 409, cf. `src/lib/cultures/suppression.ts`)
  */
 
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
-import { updateCultureSchema, normalizeCultureDateFields } from '@/lib/validations'
+import { updateCultureSchema, normalizeCultureDateFields, retenirDatesCulture } from '@/lib/validations'
+import { jourCivilStocke } from '@/lib/jour-civil'
+import { erreurFinRecolte, fenetreRecolteIncoherente, finRecolteApresModification } from '@/lib/cultures/fenetre-recolte'
+import type { AlerteSaisonCulture } from '@/lib/cultures/saison-culture'
 import { validateCultureDates } from '@/lib/validations/date-validation'
 import { requireAuthApi } from '@/lib/auth-utils'
 import { irrigationCache } from '@/lib/irrigation-cache'
@@ -26,10 +30,42 @@ import {
 import type { ChampDateEtape, ChampEtape } from '@/lib/cultures/execution'
 import { whereItpUtilisable } from '@/lib/itp-acces'
 import { visibiliteReferentiel } from '@/lib/referentiel-communaute'
+import { masquerReferentielsEmbarques } from '@/lib/referentiel-embarque'
 import { appliquerDecalageItp, decalageItpPourLecteur } from '@/lib/calendrier-climat'
 import { zoneEffectiveUser } from '@/lib/terroir'
+import { aDesVentes, compterVentesRecoltesCulture, messageSuppressionCultureRefusee } from '@/lib/cultures/suppression'
+import { quantiteCultureApresModification } from '@/lib/cultures/quantite-plants'
 
 type RouteParams = { params: Promise<{ id: string }> }
+
+/**
+ * ITP d'une culture tel que son propriétaire le voit : visible et en service,
+ * semaines transposées vers la zone de son exploitation (le référentiel des
+ * dates que les écrans préremplissent), avec sa fenêtre d'implantation et sa
+ * durée de récolte.
+ */
+async function lireItpCalibre(itpId: string, userId: string) {
+  const itpBrut = await prisma.iTP.findFirst({
+    where: { AND: [{ id: itpId }, whereItpUtilisable(userId)] },
+    select: {
+      userId: true,
+      zoneClimat: true,
+      semaineSemis: true,
+      semainePlantation: true,
+      semaineRecolte: true,
+      semaineImplantationDebut: true,
+      semaineImplantationFin: true,
+      implantation: true,
+      semaineRecolteFin: true,
+      dureeRecolte: true,
+    },
+  })
+  if (!itpBrut) return null
+  return appliquerDecalageItp(
+    itpBrut,
+    decalageItpPourLecteur(itpBrut, await zoneEffectiveUser(prisma, userId), userId)
+  )
+}
 
 // GET /api/cultures/[id]
 export async function GET(
@@ -60,7 +96,9 @@ export async function GET(
           include: { famille: true },
         },
         variete: {
-          include: { fournisseur: true },
+          // Aucun écran ne lit le fournisseur de la variété ; la ligne
+          // complète emportait ses coordonnées et son bloc bancaire.
+          include: { fournisseur: { select: { id: true } } },
         },
         itp: true,
         planche: {
@@ -106,7 +144,9 @@ export async function GET(
       totalRecolteParUnite: arrondirQuantites(recolteParUnite),
     }
 
-    return NextResponse.json(cultureWithComputed)
+    // Espèce, variété et ITP embarqués : jamais l'id de l'auteur d'une entrée
+    // partagée par un autre compte (revue 2026-10-20).
+    return NextResponse.json(masquerReferentielsEmbarques(cultureWithComputed, session!.user.id))
   } catch (error) {
     console.error('GET /api/cultures/[id] error:', error)
     return NextResponse.json(
@@ -173,6 +213,31 @@ export async function PUT(
     }
 
     const data = validationResult.data
+    // Ticket QA cmvnulry1 (2026-10-25) — une date de culture est un JOUR : même
+    // jour civil que la date stockée → instant stocké gardé ; autre jour →
+    // minuit UTC de ce jour (règle `dateSoinRetenue` de l'élevage).
+    retenirDatesCulture(data, existing)
+
+    if (data.plancheId) {
+      const planche = await prisma.planche.findFirst({
+        where: { id: data.plancheId, userId: session!.user.id },
+        select: { id: true },
+      })
+      if (!planche) return NextResponse.json(
+        { error: 'Planche introuvable pour votre exploitation.', champ: 'plancheId' },
+        { status: 400 },
+      )
+    }
+    if (data.especeId && data.especeId !== existing.especeId) {
+      const espece = await prisma.espece.findFirst({
+        where: { AND: [{ id: data.especeId }, visibiliteReferentiel(session!.user.id)] },
+        select: { id: true },
+      })
+      if (!espece) return NextResponse.json(
+        { error: 'Espèce indisponible pour votre exploitation.', champ: 'especeId' },
+        { status: 400 },
+      )
+    }
 
     // Changer l'ITP d'une culture est une écriture : l'itinéraire visé doit être
     // visible par ce membre ET encore en service, comme à la création. Sans ce
@@ -240,34 +305,27 @@ export async function PUT(
     // Audit Marc 2026-05-14 — Bug 04 : valider les dates contre l'ITP en
     // modification également (warnings non bloquants remontés au client).
     const dateWarnings: string[] = []
-    if (data.dateSemis || data.datePlantation || data.dateRecolte) {
+    let alerteSaison: AlerteSaisonCulture | null = null
+    const datesTouchees = Boolean(data.dateSemis || data.datePlantation || data.dateRecolte)
+    const itpChange = data.itpId !== undefined && (data.itpId ?? null) !== (existing.itpId ?? null)
+    // ITP final de la culture, lu une fois : validation des dates, alerte de
+    // saison et durée de récolte de la fenêtre (2026-10-25).
+    let itp: Awaited<ReturnType<typeof lireItpCalibre>> = null
+    // Fenêtre de récolte à refaire depuis l'ITP : itinéraire changé, ou fenêtre
+    // stockée incohérente (réparée au prochain enregistrement).
+    const fenetreARefaire =
+      Boolean(data.dateRecolte ?? existing.dateRecolte) && (itpChange || fenetreRecolteIncoherente(existing))
+    let itpLu = false
+    if (itpFinal && (datesTouchees || fenetreARefaire)) {
       try {
-        const itpId = data.itpId ?? existing.itpId
-        const itpBrut = itpId
-          ? await prisma.iTP.findFirst({
-              where: { AND: [{ id: itpId }, whereItpUtilisable(session!.user.id)] },
-              select: {
-                userId: true,
-                zoneClimat: true,
-                semaineSemis: true,
-                semainePlantation: true,
-                semaineRecolte: true,
-              },
-            })
-          : null
-        // Même référentiel que celui affiché : semaines transposées vers la zone
-        // de l'exploitation, sinon l'écart de calage franchit la tolérance et
-        // fabrique un avertissement sur des dates que l'écran a préremplies.
-        const itp = itpBrut
-          ? appliquerDecalageItp(
-              itpBrut,
-              decalageItpPourLecteur(
-                itpBrut,
-                await zoneEffectiveUser(prisma, session!.user.id),
-                session!.user.id
-              )
-            )
-          : null
+        itp = await lireItpCalibre(itpFinal, session!.user.id)
+        itpLu = true
+      } catch (e) {
+        console.warn('ITP non lu pour la modification de culture :', e)
+      }
+    }
+    if (datesTouchees) {
+      try {
         const annee = data.annee ?? existing.annee ?? new Date().getFullYear()
         const v = validateCultureDates({
           dateSemis: data.dateSemis ?? existing.dateSemis,
@@ -285,10 +343,27 @@ export async function PUT(
           )
         }
         dateWarnings.push(...v.warnings)
+        alerteSaison = v.alerteSaison
       } catch (e) {
         console.warn('Date validation PUT skipped:', e)
       }
     }
+
+    // La fenêtre de récolte suit son début (2026-10-25) : changer l'ITP ou la
+    // date de récolte sans toucher la fin laissait une fenêtre d'un autre
+    // itinéraire (ail récolté S29 2026, fin au 9 août 2027). Une fin modifiée
+    // par l'utilisateur fait foi.
+    const finSuivante = finRecolteApresModification({
+      avant: existing,
+      dateRecolte:
+        data.dateRecolte !== undefined ? ((data.dateRecolte as Date | null) ?? null) : existing.dateRecolte,
+      finSoumise: data.finRecolte as Date | null | undefined,
+      itpChange,
+      // Sans ITP : null (une fin héritée d'un autre itinéraire ne survit pas) ;
+      // ITP non lu : inconnu, rien n'est effacé.
+      itp: !itpFinal ? null : itpLu ? itp : undefined,
+    })
+    if (finSuivante !== undefined) data.finRecolte = finSuivante
 
     // Bug testeur 2026-05-31 — Longueur de culture > longueur de planche : la
     // création (POST) bloque déjà via peutAjouterCulture(), mais l'édition ne
@@ -336,9 +411,12 @@ export async function PUT(
     for (const champEtape of ETAPES) {
       const champDate = CHAMP_DATE_ETAPE[champEtape]
       const soumise = dateSoumise[champEtape]
+      // Date modifiée = autre JOUR civil (cmvnulry1) : un même jour renvoyé
+      // sous une autre forme (« AAAA-MM-JJ » d'un instant horodaté, minuit
+      // Paris d'une culture ancienne) n'est pas une nouvelle date de plan.
       if (
         soumise !== undefined &&
-        (soumise?.getTime() ?? null) !== (existing[champDate]?.getTime() ?? null)
+        jourCivilStocke(soumise) !== jourCivilStocke(existing[champDate])
       ) {
         Object.assign(ecrituresEtapes, ecrituresDatePlanRedefinie(champEtape))
         continue
@@ -350,10 +428,27 @@ export async function PUT(
       }
     }
 
+    // Ticket QA cmvnpkkhp (2026-10-25) — « Quantité / plants (auto) » suit les
+    // rangs, la longueur et l'espacement, par la règle de la création. Le
+    // formulaire d'édition renvoyait vide la quantité d'une culture née sans
+    // elle ; une quantité saisie à la main reste intacte.
+    const quantiteAuto = quantiteCultureApresModification(existing, data)
+    const ecritureQuantite = quantiteAuto === undefined ? {} : { quantite: quantiteAuto }
+
+    const datesFinales = { ...existing, ...data, ...ecrituresEtapes }
+    // Une ancienne incohérence ne doit pas empêcher de corriger une note.
+    // Contrôler la paire lorsqu'un de ses jours change, après tous les recalages.
+    if ((['dateRecolte', 'finRecolte'] as const).some(champ =>
+      jourCivilStocke(datesFinales[champ]) !== jourCivilStocke(existing[champ]),
+    )) {
+      const erreurFin = erreurFinRecolte(datesFinales)
+      if (erreurFin) return NextResponse.json({ error: erreurFin, champ: 'finRecolte' }, { status: 400 })
+    }
+
     // Mise à jour
     const culture = await prisma.culture.update({
       where: { id: cultureId },
-      data: { ...validationResult.data, ...ecrituresEtapes },
+      data: { ...validationResult.data, ...ecritureQuantite, ...ecrituresEtapes },
       include: {
         espece: true,
         variete: true,
@@ -364,9 +459,12 @@ export async function PUT(
 
     invalidateKpi(session!.user.id)
 
-    return NextResponse.json(
-      dateWarnings.length > 0 ? { ...culture, warnings: dateWarnings } : culture
-    )
+    const reponse = masquerReferentielsEmbarques(culture, session!.user.id)
+    return NextResponse.json({
+      ...reponse,
+      ...(dateWarnings.length > 0 ? { warnings: dateWarnings } : {}),
+      ...(alerteSaison ? { alerteSaison } : {}),
+    })
   } catch (error) {
     console.error('PUT /api/cultures/[id] error:', error)
     return NextResponse.json(
@@ -410,7 +508,7 @@ export async function PATCH(
 
     if (!existing) {
       return NextResponse.json(
-        { error: `Culture #${id} non trouvee` },
+        { error: `Culture #${id} non trouvée` },
         { status: 404 }
       )
     }
@@ -552,6 +650,19 @@ export async function PATCH(
     // bouton « Annuler le semis fait » de /maraichage/cultures passe ici : sans
     // restitution, cocher puis décocher laissait la date d'exécution en place et
     // le plan était perdu.
+    // La fenêtre de récolte suit une date de récolte déplacée par l'appel
+    // (règle de la modification et du report, `finRecolteApresModification`).
+    // Avant le recalage d'exécution : marquer une récolte faite ne déplace pas
+    // la fenêtre.
+    if (updateData.dateRecolte !== undefined) {
+      const fin = finRecolteApresModification({
+        avant: existing,
+        dateRecolte: updateData.dateRecolte as Date | null,
+        finSoumise: 'finRecolte' in updateData ? (updateData.finRecolte as Date | null) : undefined,
+      })
+      if (fin !== undefined) updateData.finRecolte = fin
+    }
+
     for (const [champEtape, champDate] of Object.entries(CHAMP_DATE_ETAPE) as Array<
       [ChampEtape, ChampDateEtape]
     >) {
@@ -567,6 +678,18 @@ export async function PATCH(
       } else if (updateData[champEtape] === false) {
         Object.assign(updateData, ecrituresRetourANonFait(existing, champEtape))
       }
+    }
+
+    const datesFinales = {
+      dateRecolte: updateData.dateRecolte !== undefined
+        ? (updateData.dateRecolte as Date | null) : existing.dateRecolte,
+      finRecolte: updateData.finRecolte !== undefined
+        ? (updateData.finRecolte as Date | null) : existing.finRecolte,
+    }
+    if (jourCivilStocke(datesFinales.dateRecolte) !== jourCivilStocke(existing.dateRecolte)
+      || jourCivilStocke(datesFinales.finRecolte) !== jourCivilStocke(existing.finRecolte)) {
+      const erreurFin = erreurFinRecolte(datesFinales)
+      if (erreurFin) return NextResponse.json({ error: erreurFin, champ: 'finRecolte' }, { status: 400 })
     }
 
     const culture = await prisma.culture.update({
@@ -586,7 +709,7 @@ export async function PATCH(
   } catch (error) {
     console.error('PATCH /api/cultures/[id] error:', error)
     return NextResponse.json(
-      { error: 'Erreur lors de la mise a jour de la culture' },
+      { error: 'Erreur lors de la mise à jour de la culture' },
       { status: 500 }
     )
   }
@@ -626,9 +749,21 @@ export async function DELETE(
       )
     }
 
-    // Audit compta 2026-06 : les récoltes partent en cascade DB, mais leurs
-    // écritures auto-compta et leur part d'inventaire ne suivent pas — il
-    // restait des VenteManuelle orphelines comptées à vie dans le KPI.
+    if (await prisma.mouvementStockCommercial.count({ where: { userId: session.user.id, recolte: { cultureId } } })) return NextResponse.json({ error: 'Cette culture possède des lots liés à des bons ou factures. Conservez-la pour garder leur traçabilité.' }, { status: 409 })
+
+    // Audit 2026-10-08 — une récolte vendue retient la culture : la cascade
+    // effaçait ses ventes de la comptabilité, exercice déjà déclaré compris.
+    const ventes = await compterVentesRecoltesCulture(prisma, cultureId, session!.user.id)
+    if (aDesVentes(ventes)) {
+      return NextResponse.json(
+        { error: messageSuppressionCultureRefusee(culture, ventes), details: ventes },
+        { status: 409 }
+      )
+    }
+
+    // Audit compta 2026-06 : les récoltes partent en cascade DB. Depuis la
+    // garde ci-dessus, aucune ne porte plus de vente ; la purge des écritures
+    // auto reste en filet contre une ligne orpheline.
     const recoltes = await prisma.recolte.findMany({
       where: { cultureId, userId: session!.user.id },
       select: { id: true, especeId: true, quantite: true, statut: true },
@@ -638,6 +773,7 @@ export async function DELETE(
       if (recoltes.length > 0) {
         await tx.venteManuelle.deleteMany({
           where: {
+            userId: session!.user.id,
             sourceType: 'recolte',
             sourceId: { in: recoltes.map((r) => r.id) },
             auto: true,

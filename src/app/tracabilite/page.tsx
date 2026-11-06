@@ -6,22 +6,25 @@
  */
 
 import * as React from "react"
-import Link from "next/link"
-import Image from "next/image"
+import { flushSync } from "react-dom"
 import { getAvailableYears } from "@/components/year-selector"
 import { useSession } from "next-auth/react"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
-import { UserMenu } from "@/components/auth/UserMenu"
+import { AppHeader } from "@/components/shell/AppHeader"
 import { libelleTypeIntervention } from "@/lib/interventions/types"
+import { libelleTypeSoin, optionsFiltreTypeSoin } from "@/lib/elevage/types-soin"
 import {
-  Sprout,
-  TreeDeciduous,
+  REGISTRE_PAR_DEFAUT,
+  lireEtatTracabilite,
+  urlTracabilite,
+  type EtatTracabilite,
+  type RegistreTracabilite,
+} from "@/lib/tracabilite/registre-url"
+import {
   Bird,
-  Wallet,
-  Settings,
   FileText,
   Shield,
   Leaf,
@@ -221,14 +224,15 @@ interface RegistreElevageData {
 // TABS
 // ============================================================
 
-const TABS = [
+// `id` = valeur du paramètre d'URL `registre` (`src/lib/tracabilite/registre-url.ts`).
+const TABS: readonly { id: RegistreTracabilite; label: string; icon: typeof Shield; shortLabel: string }[] = [
   { id: "phyto", label: "Registre phytosanitaire", icon: Shield, shortLabel: "Phyto" },
   { id: "culture", label: "Registre de culture", icon: Leaf, shortLabel: "Cultures" },
   { id: "sanitaire", label: "Carnet sanitaire", icon: Bird, shortLabel: "Sanitaire" },
   { id: "elevage", label: "Registre d'élevage", icon: FileText, shortLabel: "Élevage" },
-] as const
+]
 
-type TabId = (typeof TABS)[number]["id"]
+type TabId = RegistreTracabilite
 
 // QA Camille 2026-05-15 — bonus : plage factorisée [N+1 … N-4]
 const currentYearNow = new Date().getFullYear()
@@ -242,6 +246,8 @@ const availableYears = getAvailableYears()
 // dates « jour seul » stockées à minuit UTC. On les formate en UTC pour éviter
 // le décalage d'un jour en Outre-mer (offset négatif) et rester cohérent avec
 // l'agrégation serveur (toISOString().slice(0,10)) et l'export PDF.
+// Le Registre de culture reçoit déjà des jours civils « AAAA-MM-JJ »
+// (`jourCivilStocke`, ticket cmvnulry1) : lus minuit UTC, ils gardent leur jour.
 function formatDate(iso: string | null): string {
   if (!iso) return "-"
   return new Date(iso).toLocaleDateString("fr-FR", {
@@ -297,8 +303,33 @@ export default function TraçabilitéPage() {
 
 function TraçabilitéContent() {
   const { data: session } = useSession()
-  const [activeTab, setActiveTab] = React.useState<TabId>("phyto")
+  const [activeTab, setActiveTab] = React.useState<TabId>(REGISTRE_PAR_DEFAUT)
   const [selectedYear, setSelectedYear] = React.useState(currentYearNow)
+  // Ticket QA cmvntzwng — registre et année vivent dans l'URL
+  // (`?registre=culture&annee=2027`) pour survivre à un rechargement ou à un
+  // lien partagé. Lus APRÈS le montage : la page est prérendue au build, une
+  // lecture de `window.location` au rendu ferait diverger l'hydratation. La
+  // première lecture des données attend cette restauration, sinon le registre
+  // phytosanitaire de l'année courante se chargeait avant le bon.
+  const [etatRestaure, setEtatRestaure] = React.useState(false)
+  React.useEffect(() => {
+    const etat = lireEtatTracabilite(window.location.search, {
+      annees: availableYears,
+      anneeParDefaut: currentYearNow,
+    })
+    setActiveTab(etat.registre)
+    setSelectedYear(etat.annee)
+    setEtatRestaure(true)
+  }, [])
+  // Un choix de registre ou d'année réécrit l'URL sans entrée d'historique.
+  // API History et état `null` (motif 7) : `router.replace` sur le même chemin
+  // est ignoré après préchargement, et avec l'état de Next le routeur
+  // réécrirait l'URL sans le paramètre à sa prochaine mise à jour.
+  const afficherRegistre = (etat: EtatTracabilite) => {
+    setActiveTab(etat.registre)
+    setSelectedYear(etat.annee)
+    window.history.replaceState(null, "", urlTracabilite(window.location, etat))
+  }
 
   // Data states
   const [phytoData, setPhytoData] = React.useState<PhytoData | null>(null)
@@ -317,6 +348,18 @@ function TraçabilitéContent() {
   // on confirme explicitement avant l'export (registre incomplet =
   // non opposable lors d'un contrôle HVE/AB/DDPP).
   const [pendingExport, setPendingExport] = React.useState<string | null>(null)
+  // Date d'édition de l'en-tête imprimé, lue APRÈS le montage : la page est
+  // prérendue au build, un `new Date()` au rendu y figeait le jour du build et
+  // l'hydratation échouait sur ce texte dès le lendemain (React #418,
+  // 2026-10-25). Relue juste avant l'impression, le jour ayant pu changer.
+  const [dateEdition, setDateEdition] = React.useState<string | null>(null)
+  React.useEffect(() => {
+    const dater = () => new Date().toLocaleDateString("fr-FR")
+    setDateEdition(dater())
+    const avantImpression = () => flushSync(() => setDateEdition(dater()))
+    window.addEventListener("beforeprint", avantImpression)
+    return () => window.removeEventListener("beforeprint", avantImpression)
+  }, [])
 
   const handlePhytoExport = React.useCallback(
     (format: "pdf" | "csv") => {
@@ -332,7 +375,7 @@ function TraçabilitéContent() {
 
   // Fetch data when tab or year changes
   React.useEffect(() => {
-    if (!session?.user) return
+    if (!session?.user || !etatRestaure) return
 
     const fetchData = async () => {
       setLoading(true)
@@ -358,7 +401,7 @@ function TraçabilitéContent() {
     }
 
     fetchData()
-  }, [activeTab, selectedYear, session?.user])
+  }, [activeTab, selectedYear, session?.user, etatRestaure])
 
   const toggleCulture = (id: number) => {
     setExpandedCultures((prev) => {
@@ -384,7 +427,7 @@ function TraçabilitéContent() {
           {activeTab === "elevage" && `Registre d'Élevage - Année ${selectedYear}`}
         </h1>
         <p style={{ textAlign: "center", fontSize: "10pt", color: "#666", marginBottom: "12pt" }}>
-          Document généré le {new Date().toLocaleDateString("fr-FR")} - Gleba
+          {dateEdition ? `Document généré le ${dateEdition} - Gleba` : "\u00a0"}
         </p>
         <hr style={{ borderTop: "2px solid #333", marginBottom: "12pt" }} />
       </div>
@@ -392,65 +435,12 @@ function TraçabilitéContent() {
       {/* ============================================================ */}
       {/* HEADER */}
       {/* ============================================================ */}
-      <header className="border-b bg-white/80 backdrop-blur-sm sticky top-0 z-50 no-print">
-        <div className="container mx-auto px-4 py-2.5 flex items-center justify-between max-w-[1600px]">
-          <Link href="/" className="flex items-center hover:opacity-90 transition-opacity">
-            <Image
-              src="/gleba-logo.png"
-              alt="Gleba"
-              width={120}
-              height={80}
-              className="h-10 w-auto rounded-lg"
-              priority
-            />
-          </Link>
-          <div className="flex items-center gap-2">
-            {session?.user && (
-              <div className="flex items-center border rounded-lg overflow-hidden">
-                <Link href="/">
-                  <Button variant="ghost" size="sm" className="rounded-none text-green-700 hover:text-green-800 hover:bg-green-50 border-r">
-                    <Sprout className="h-4 w-4 mr-1" />
-                    <span className="hidden sm:inline">Maraîchage</span>
-                  </Button>
-                </Link>
-                <Link href="/verger">
-                  <Button variant="ghost" size="sm" className="rounded-none text-lime-700 hover:text-lime-800 hover:bg-lime-50 border-r">
-                    <TreeDeciduous className="h-4 w-4 mr-1" />
-                    <span className="hidden sm:inline">Verger</span>
-                  </Button>
-                </Link>
-                <Link href="/elevage">
-                  <Button variant="ghost" size="sm" className="rounded-none text-amber-700 hover:text-amber-800 hover:bg-amber-50 border-r">
-                    <Bird className="h-4 w-4 mr-1" />
-                    <span className="hidden sm:inline">Élevage</span>
-                  </Button>
-                </Link>
-                <Link href="/comptabilite">
-                  <Button variant="ghost" size="sm" className="rounded-none text-blue-700 hover:text-blue-800 hover:bg-blue-50 border-r">
-                    <Wallet className="h-4 w-4 mr-1" />
-                    <span className="hidden sm:inline">Compta</span>
-                  </Button>
-                </Link>
-                <Button variant="ghost" size="sm" className="rounded-none bg-indigo-50 text-indigo-700">
-                  <FileText className="h-4 w-4 mr-1" />
-                  <span className="hidden sm:inline">Traçabilité</span>
-                </Button>
-              </div>
-            )}
-            <Link href="/parametres">
-              <Button variant="ghost" size="sm">
-                <Settings className="h-4 w-4" />
-              </Button>
-            </Link>
-            {session?.user && <UserMenu user={session.user} />}
-          </div>
-        </div>
-      </header>
+      <AppHeader className="no-print" />
 
       {/* ============================================================ */}
       {/* NAV TABS + YEAR SELECTOR */}
       {/* ============================================================ */}
-      <nav className="border-b bg-white sticky top-[61px] z-40 no-print">
+      <nav className="border-b bg-white sticky top-[var(--app-header-h,61px)] z-40 no-print">
         <div className="container mx-auto px-4 max-w-[1600px]">
           <div className="flex items-center justify-between">
             <div className="flex items-center -mb-px overflow-x-auto">
@@ -459,7 +449,7 @@ function TraçabilitéContent() {
                 return (
                   <button
                     key={tab.id}
-                    onClick={() => setActiveTab(tab.id)}
+                    onClick={() => afficherRegistre({ registre: tab.id, annee: selectedYear })}
                     className={`flex items-center gap-1.5 px-4 py-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
                       isActive
                         ? "border-indigo-600 text-indigo-700"
@@ -511,7 +501,7 @@ function TraçabilitéContent() {
               )}
               <select
                 value={selectedYear}
-                onChange={(e) => setSelectedYear(parseInt(e.target.value))}
+                onChange={(e) => afficherRegistre({ registre: activeTab, annee: parseInt(e.target.value, 10) })}
                 className="h-8 px-2 text-sm border rounded-md bg-white"
               >
                 {availableYears.map((year) => (
@@ -563,7 +553,7 @@ function TraçabilitéContent() {
         description={
           <span>
             {phytoData?.stats.nbIncomplets ?? 0} traitement(s) ont des champs obligatoires
-            manquants (N° AMM, dose ou DAR). Un registre incomplet n&apos;est{" "}
+            manquants (N° AMM, dose, surface ou DAR). Un registre incomplet n&apos;est{" "}
             <strong>pas opposable</strong> lors d&apos;un contrôle (HVE, AB, DDPP). Complétez les
             fiches signalées « Non conforme » avant l&apos;export, ou exportez quand même pour un
             usage interne.
@@ -742,18 +732,22 @@ function PhytoTab({
                   <td className="p-2">
                     {entry.nuisibleCible || <MissingFieldOptional />}
                   </td>
+                  {/* Revue cmvgeltj1 — « Manquant » en rouge seulement quand la
+                      règle de conformité de la ligne exige le champ (un
+                      traitement de biocontrôle du verger n'exige ni AMM ni
+                      surface) ; sinon « - ». */}
                   <td className="p-2">
                     {entry.produit ? (
                       <span className="font-medium">{entry.produit}</span>
                     ) : (
-                      <MissingField />
+                      <ChampAbsent requis={entry.champsManquants.includes("produitPhyto")} />
                     )}
                   </td>
                   <td className="p-2">
                     {entry.numAMM ? (
                       <code className="text-xs bg-slate-100 px-1 rounded">{entry.numAMM}</code>
                     ) : (
-                      <MissingField />
+                      <ChampAbsent requis={entry.champsManquants.includes("numAMM")} />
                     )}
                   </td>
                   <td className="p-2 whitespace-nowrap">
@@ -762,7 +756,7 @@ function PhytoTab({
                         {entry.doseAppliquee} {entry.uniteDose || ""}
                       </>
                     ) : (
-                      <MissingField />
+                      <ChampAbsent requis={entry.champsManquants.includes("doseAppliquee")} />
                     )}
                   </td>
                   <td className="p-2 whitespace-nowrap">
@@ -778,14 +772,14 @@ function PhytoTab({
                             })} m²`}
                       </>
                     ) : (
-                      <MissingField />
+                      <ChampAbsent requis={entry.champsManquants.includes("surfaceTraitee")} />
                     )}
                   </td>
                   <td className="p-2">
                     {entry.dar !== null ? (
                       <span>{entry.dar} j</span>
                     ) : (
-                      <MissingField />
+                      <ChampAbsent requis={entry.champsManquants.includes("dar")} />
                     )}
                   </td>
                   <td className="p-2 whitespace-nowrap">
@@ -825,6 +819,11 @@ function MissingField() {
 
 function MissingFieldOptional() {
   return <span className="text-slate-400 text-xs">-</span>
+}
+
+/** Champ vide : « Manquant » s'il est exigé de cette ligne, sinon « - ». */
+function ChampAbsent({ requis }: { requis: boolean }) {
+  return requis ? <MissingField /> : <MissingFieldOptional />
 }
 
 // ============================================================
@@ -952,7 +951,7 @@ function CultureTab({
                               <span>Planche: {culture.identification.planche}</span>
                             )}
                             {culture.identification.surface && (
-                              <span>{culture.identification.surface} m²</span>
+                              <span>{culture.identification.surface.toLocaleString("fr-FR", { maximumFractionDigits: 2 })} m²</span>
                             )}
                             {culture.identification.bio && (
                               <span className="text-green-600 font-medium">BIO</span>
@@ -1037,6 +1036,13 @@ function CultureTab({
 // TAB 3 - CARNET SANITAIRE
 // ============================================================
 
+// Couleur de pastille par clé de type de soin (`cleTypeSoin`).
+const COULEUR_TYPE_SOIN: Record<string, string> = {
+  Vaccination: "bg-blue-100 text-blue-700",
+  Vermifuge: "bg-purple-100 text-purple-700",
+  "Traitement vétérinaire": "bg-red-100 text-red-700",
+}
+
 function SanitaireTab({
   data,
   loading,
@@ -1075,8 +1081,16 @@ function SanitaireTab({
     )
   }
 
+  // `type` est la clé de `cleTypeSoin` (API) : filtre, résumé et colonne
+  // partagent la table unique des types de soin (`src/lib/elevage/types-soin.ts`).
   const filteredEntries =
     filter === "all" ? data.carnet : data.carnet.filter((e) => e.type === filter)
+  // Le type filtré reste proposé même absent de l'année affichée : sinon le
+  // sélecteur afficherait « Tous les types » sur une liste filtrée et vide.
+  const optionsType = optionsFiltreTypeSoin([
+    ...data.carnet.map((e) => e.type),
+    ...(filter !== "all" ? [filter] : []),
+  ])
 
   return (
     <div className="space-y-4">
@@ -1121,14 +1135,7 @@ function SanitaireTab({
                   key={type}
                   className="inline-flex items-center text-xs px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700"
                 >
-                  {type === "vaccination"
-                    ? "Vacc."
-                    : type === "vermifuge"
-                    ? "Verm."
-                    : type === "traitement"
-                    ? "Trait."
-                    : type}
-                  : {count}
+                  {libelleTypeSoin(type)} : {count}
                 </span>
               ))}
             </div>
@@ -1147,15 +1154,15 @@ function SanitaireTab({
             <div className="flex items-center gap-2 no-print">
               <Filter className="h-4 w-4 text-slate-400" />
               <select
+                aria-label="Filtrer par type de soin"
                 value={filter}
                 onChange={(e) => setFilter(e.target.value)}
                 className="text-sm border rounded-md px-2 py-1 bg-white"
               >
                 <option value="all">Tous les types</option>
-                <option value="vaccination">Vaccination</option>
-                <option value="vermifuge">Vermifuge</option>
-                <option value="traitement">Traitement</option>
-                <option value="autre">Autre</option>
+                {optionsType.map((type) => (
+                  <option key={type} value={type}>{libelleTypeSoin(type)}</option>
+                ))}
               </select>
             </div>
           </div>
@@ -1164,7 +1171,7 @@ function SanitaireTab({
             {data.stats.periodeFin ? formatDate(data.stats.periodeFin) : "-"}
             {filter !== "all" && (
               <span className="ml-2 text-indigo-600">
-                (filtre: {filter} - {filteredEntries.length} résultat{filteredEntries.length > 1 ? "s" : ""})
+                (filtre : {libelleTypeSoin(filter)}, {filteredEntries.length} résultat{filteredEntries.length > 1 ? "s" : ""})
               </span>
             )}
           </CardDescription>
@@ -1196,13 +1203,7 @@ function SanitaireTab({
                   <td className="p-2">
                     <span
                       className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
-                        entry.type === "vaccination"
-                          ? "bg-blue-100 text-blue-700"
-                          : entry.type === "vermifuge"
-                          ? "bg-purple-100 text-purple-700"
-                          : entry.type === "traitement"
-                          ? "bg-red-100 text-red-700"
-                          : "bg-slate-100 text-slate-700"
+                        COULEUR_TYPE_SOIN[entry.type] ?? "bg-slate-100 text-slate-700"
                       }`}
                     >
                       {entry.typeLabel}
@@ -1268,7 +1269,7 @@ function ElevageRegistreTab({
             Aucun mouvement d&apos;élevage enregistré pour {year}
           </p>
           <p className="text-sm text-muted-foreground mt-2">
-            Les entrees, sorties, naissances, deces et soins apparaîtront ici automatiquement.
+            Les entrées, sorties, naissances, décès et soins apparaîtront ici automatiquement.
           </p>
         </CardContent>
       </Card>

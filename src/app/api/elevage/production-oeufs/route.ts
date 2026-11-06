@@ -10,6 +10,70 @@ import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
 import { productionOeufsSchema } from '@/lib/validations/elevage-production-oeufs'
 import { seuilCollecteMaxJour } from '@/lib/elevage/taux-ponte'
+import { reconstituerEffectifsLots } from '@/lib/elevage/effectif'
+import { Prisma } from '@prisma/client'
+import { finJourLivraison } from '@/lib/commercial/dates-stock'
+
+const LOT_PLAFOND_SELECT = {
+  id: true,
+  quantiteInitiale: true,
+  quantiteActuelle: true,
+  statut: true,
+  nom: true,
+  especeAnimale: { select: { nom: true } },
+} satisfies Prisma.LotAnimauxSelect
+type LotPlafond = Prisma.LotAnimauxGetPayload<{ select: typeof LOT_PLAFOND_SELECT }>
+
+/** Champs scalaires d'une collecte modifiables par le PATCH. */
+type ProductionOeufModif = {
+  date?: Date
+  quantite?: number
+  casses?: number
+  sales?: number
+  calibre?: string | null
+  notes?: string | null
+  lotId?: number | null
+  animalId?: number | null
+}
+
+/**
+ * BUG #2 (audit Julien 15/05/2026) — plafond de ponte plausible d'une collecte
+ * de lot : refus 422 `COLLECTE_OVER_SEUIL` si quantite > effectif × marge
+ * d'espèce (`seuilCollecteMaxJour`). Règle unique du POST et du PATCH (revue
+ * 2026-10-20 : le PATCH n'appliquait aucun plafond). L'appelant lève la garde
+ * sur `overrideCoherence`.
+ *
+ * Revue 2026-10-20 — le plafond se calcule sur l'effectif reconstitué du lot
+ * (celui de l'écran Lots et de l'aide à la saisie), pas sur le compteur stocké
+ * `quantiteActuelle`, qui dérive : la mort d'une fiche nominative rattachée ne
+ * le décrémente pas (lot démo 71 : 5 contre 4). `seuilCollecteMaxJour` rend
+ * null pour un effectif nul : pas de plafond.
+ */
+async function refusCollecteHorsPlafond(
+  userId: string,
+  lot: LotPlafond,
+  quantite: number,
+): Promise<NextResponse | null> {
+  const effectifs = await reconstituerEffectifsLots(userId, [lot])
+  const effectif = effectifs.get(lot.id)?.effectifCalcule ?? lot.quantiteActuelle
+  const seuil = seuilCollecteMaxJour(effectif, lot.especeAnimale?.nom ?? null)
+  if (seuil == null || quantite <= seuil) return null
+  return NextResponse.json(
+    {
+      error: 'Saisie incohérente',
+      code: 'COLLECTE_OVER_SEUIL',
+      details: {
+        quantite,
+        seuilMax: seuil,
+        effectif,
+        espece: lot.especeAnimale?.nom ?? null,
+        lotNom: lot.nom,
+        message: `${effectif} ${lot.especeAnimale?.nom ?? 'pondeuse(s)'} ne peuvent pas pondre ${quantite} œufs en 1 jour (plafond plausible ≈ ${seuil}). Confirmer pour forcer la saisie.`,
+      },
+    },
+    { status: 422 }
+  )
+}
 
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
@@ -24,15 +88,14 @@ export async function GET(request: NextRequest) {
     const limit = parseInt(searchParams.get('limit') || '100')
     const annee = parseInt(searchParams.get('annee') || String(new Date().getFullYear()))
     const yearStart = new Date(annee, 0, 1)
-    const yearEnd = new Date(annee, 11, 31, 23, 59, 59)
+    const yearEnd = new Date(annee, 11, 31, 23, 59, 59, 999)
 
-    const where: any = { userId: session.user.id, date: { gte: yearStart, lte: yearEnd } }
+    const date: Prisma.DateTimeFilter = { gte: yearStart, lte: yearEnd }
+    if (dateDebut) date.gte = new Date(dateDebut)
+    if (dateFin) date.lte = new Date(dateFin)
+    const where: Prisma.ProductionOeufWhereInput = { userId: session.user.id, date }
     if (lotId) where.lotId = parseInt(lotId)
     if (animalId) where.animalId = parseInt(animalId)
-    if (dateDebut || dateFin) {
-      if (dateDebut) where.date.gte = new Date(dateDebut)
-      if (dateFin) where.date.lte = new Date(dateFin)
-    }
 
     const productions = await prisma.productionOeuf.findMany({
       where,
@@ -50,7 +113,11 @@ export async function GET(request: NextRequest) {
 
     // Stats agrégées
     const stats = await prisma.productionOeuf.aggregate({
-      where,
+      // Les lignes futures restent dans la liste pour être corrigées, comme
+      // dans l'alerte du stock, mais ne constituent pas une production acquise.
+      where: { ...where, date: { ...date, lte: new Date(Math.min(
+        (date.lte as Date).getTime(), finJourLivraison(new Date()).getTime(),
+      )) } },
       _sum: {
         quantite: true,
         casses: true,
@@ -111,12 +178,7 @@ export async function POST(request: NextRequest) {
     if (lotId) {
       const lot = await prisma.lotAnimaux.findFirst({
         where: { id: lotId, userId: session.user.id },
-        select: {
-          quantiteActuelle: true,
-          statut: true,
-          nom: true,
-          especeAnimale: { select: { nom: true } },
-        },
+        select: LOT_PLAFOND_SELECT,
       })
       if (!lot) {
         return NextResponse.json(
@@ -143,25 +205,10 @@ export async function POST(request: NextRequest) {
           { status: 422 }
         )
       }
-      if (!overrideCoherence && lot.quantiteActuelle > 0) {
-        const seuil = seuilCollecteMaxJour(lot.quantiteActuelle, lot.especeAnimale?.nom ?? null)
-        if (seuil != null && quantite > seuil) {
-          return NextResponse.json(
-            {
-              error: 'Saisie incohérente',
-              code: 'COLLECTE_OVER_SEUIL',
-              details: {
-                quantite,
-                seuilMax: seuil,
-                effectif: lot.quantiteActuelle,
-                espece: lot.especeAnimale?.nom ?? null,
-                lotNom: lot.nom,
-                message: `${lot.quantiteActuelle} ${lot.especeAnimale?.nom ?? 'pondeuse(s)'} ne peuvent pas pondre ${quantite} œufs en 1 jour (plafond plausible ≈ ${seuil}). Confirmer pour forcer la saisie.`,
-              },
-            },
-            { status: 422 }
-          )
-        }
+      // Plafond de ponte plausible : voir `refusCollecteHorsPlafond`.
+      if (!overrideCoherence) {
+        const refus = await refusCollecteHorsPlafond(session.user.id, lot, quantite)
+        if (refus) return refus
       }
 
       // Bug feedback testeur 2026-05-26 (cmpm75c6r) — Garde-fou doublon :
@@ -239,6 +286,7 @@ export async function PATCH(request: NextRequest) {
   try {
     const body = await request.json()
     const { id, date, quantite, casses, sales, calibre, notes, lotId, animalId } = body
+    const overrideCoherence = (body as { overrideCoherence?: boolean })?.overrideCoherence === true
 
     if (!id) {
       return NextResponse.json({ error: 'ID requis' }, { status: 400 })
@@ -264,7 +312,7 @@ export async function PATCH(request: NextRequest) {
       )
     }
 
-    const updateData: any = {}
+    const updateData: ProductionOeufModif = {}
     if (date !== undefined) updateData.date = new Date(date)
     // Audit élevage 2026-06-11 — garde NaN : parseInt("abc") partait en
     // erreur Prisma 500 illisible ; on renvoie un 400 explicite.
@@ -302,6 +350,26 @@ export async function PATCH(request: NextRequest) {
         select: { id: true },
       })
       if (!a) return NextResponse.json({ error: 'Animal introuvable' }, { status: 404 })
+    }
+
+    // Revue 2026-10-20 — même plafond de ponte que le POST (`COLLECTE_OVER_SEUIL`,
+    // levé par `overrideCoherence`) dès que la quantité ou le lot change. Une
+    // modification qui ne touche ni l'un ni l'autre (notes, calibre, date) n'est
+    // pas replafonnée : on peut corriger une collecte forcée à sa saisie.
+    const lotCibleId = updateData.lotId !== undefined ? updateData.lotId : existing.lotId
+    const quantiteCible = updateData.quantite ?? existing.quantite
+    if (
+      !overrideCoherence &&
+      lotCibleId != null &&
+      (quantiteCible !== existing.quantite || lotCibleId !== existing.lotId)
+    ) {
+      const lot = await prisma.lotAnimaux.findFirst({
+        where: { id: lotCibleId, userId: session.user.id },
+        select: LOT_PLAFOND_SELECT,
+      })
+      if (!lot) return NextResponse.json({ error: 'Lot introuvable' }, { status: 404 })
+      const refus = await refusCollecteHorsPlafond(session.user.id, lot, quantiteCible)
+      if (refus) return refus
     }
 
     const production = await prisma.productionOeuf.update({

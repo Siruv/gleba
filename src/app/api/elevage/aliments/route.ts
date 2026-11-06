@@ -8,6 +8,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { Prisma } from '@prisma/client'
+import { MESSAGE_ALIMENT_INACCESSIBLE, alimentAccessible } from '@/lib/elevage/aliment-accessible'
 
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
@@ -18,7 +20,7 @@ export async function GET(request: NextRequest) {
     const { searchParams } = new URL(request.url)
     const type = searchParams.get('type')
 
-    const where: any = { OR: [{ ownerUserId: null }, { ownerUserId: userId }] }
+    const where: Prisma.AlimentWhereInput = { OR: [{ ownerUserId: null }, { ownerUserId: userId }] }
     if (type) where.type = type
 
     // Fenêtre de 30 j pour estimer la consommation moyenne journalière (→ jours
@@ -212,9 +214,9 @@ export async function POST(request: NextRequest) {
     ])
 
     return NextResponse.json({ data: aliment }, { status: 201 })
-  } catch (error: any) {
+  } catch (error) {
     console.error('POST /api/elevage/aliments error:', error)
-    if (error.code === 'P2002') {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
       return NextResponse.json(
         { error: 'Un aliment avec cet ID existe déjà' },
         { status: 409 }
@@ -238,6 +240,11 @@ export async function PATCH(request: NextRequest) {
 
     if (!id) {
       return NextResponse.json({ error: 'ID requis' }, { status: 400 })
+    }
+    // Audit 2026-10-19 — le stock ne se tient que sur un aliment officiel ou
+    // privé du compte, jamais sur l'aliment privé d'un autre.
+    if (typeof id !== 'string' || !await alimentAccessible(userId, id)) {
+      return NextResponse.json({ error: MESSAGE_ALIMENT_INACCESSIBLE, champ: 'id' }, { status: 404 })
     }
 
     // Audit #91 : le front envoie null quand le champ est vide → parseFloat(null)

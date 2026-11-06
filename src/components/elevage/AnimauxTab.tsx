@@ -5,6 +5,8 @@
  */
 
 import * as React from "react"
+import { ChampsEncaissement } from "@/components/comptabilite/ChampsEncaissement"
+import { encaissementVenteInitial } from "@/lib/comptabilite/encaissement-vente"
 import { urlApercu } from "@/lib/apercu-document"
 import { merePresenteALaNaissance } from "@/lib/elevage/sortie-animal"
 import Link from "next/link"
@@ -16,7 +18,6 @@ import {
   Pencil,
   RefreshCw,
   Search,
-  Filter,
   Stethoscope,
   Scissors,
   ShoppingCart,
@@ -31,7 +32,7 @@ import {
   UserPlus,
 } from "lucide-react"
 
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
@@ -57,7 +58,7 @@ import { DeleteConfirmDialog } from "@/components/ui/delete-confirm-dialog"
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { especeBaseId, especeBaseLabel, listEspecesBasePresentes } from "@/lib/elevage/espece-base"
+import { cleFiltreEspece, especeBaseId, libelleEspeceAnimale, listEspecesBasePresentes } from "@/lib/elevage/espece-base"
 import { useFiliereSelection, filiereMatch } from "@/lib/elevage/filiere-context"
 import { coerceFiliere, type Filiere } from "@/lib/elevage/filiere"
 import { capacites } from "@/lib/elevage/filiere-ui"
@@ -144,7 +145,15 @@ interface Lot {
   parcelleGeo: { id: string; nom: string } | null
   especeAnimale: { id: string; nom: string; type: string; filiere: string | null; couleur: string | null }
   _count: { animaux: number; productionsOeufs: number; soins: number }
+  /** Servis par GET /api/elevage/lots (effectif reconstitué). */
+  effectifCalcule?: number
+  nominatifsActifs?: number
+  /** Têtes anonymes présentes : plafond d'un abattage de lot (même valeur que la route). */
+  effectifCollectif?: number
 }
+
+/** Part collective servie par la route, repli sur le compteur stocké pour un lot non enrichi. */
+const partCollectiveLot = (lot: Lot) => lot.effectifCollectif ?? lot.quantiteActuelle
 
 interface Parcelle {
   id: string
@@ -174,6 +183,18 @@ const STATUT_COLORS: Record<string, string> = {
   mort: "bg-slate-100 text-slate-800",
   reforme: "bg-orange-100 text-orange-800",
   termine: "bg-slate-100 text-slate-800",
+}
+
+// Ticket cmv9e1u2r — les boutons-icônes des lignes n'avaient aucun nom
+// accessible (le tooltip ne nomme pas le bouton) : chaque action porte un
+// aria-label qui nomme le geste ET la ligne, sinon « Vendre » répété sur
+// toute la table ne dit pas quel animal.
+function nomLigneAnimal(animal: Pick<Animal, "id" | "identifiant" | "nom">): string {
+  return [animal.identifiant, animal.nom].filter(Boolean).join(" ") || `animal n° ${animal.id}`
+}
+
+function nomLigneLot(lot: Pick<Lot, "id" | "nom">): string {
+  return lot.nom || `#${lot.id}`
 }
 
 // ============================================================
@@ -401,7 +422,7 @@ function AnimauxSubTab() {
   // listait que celles des animaux nominatifs : un user qui gère tout son
   // troupeau en LOTS (poules, brebis, lapins) ne voyait que Chèvre et
   // Cochon. On fetch aussi les lots actifs pour agréger leurs espèces.
-  const [lotsEspeceIds, setLotsEspeceIds] = React.useState<string[]>([])
+  const [lotsEspeces, setLotsEspeces] = React.useState<Array<{ especeAnimaleId: string; especeNom: string | null }>>([])
   // Lots actifs, pour rattacher un animal à un lot depuis sa fiche. Feedback
   // éleveur 2026-07-21 : il n'existait aucune passerelle animal → lot
   // dans l'UI (ni sur la fiche animal, ni sur la page du lot).
@@ -434,9 +455,9 @@ function AnimauxSubTab() {
       if (especesRes.ok) setEspeces((await especesRes.json()).data)
       if (lotsRes.ok) {
         const lotsJson = await lotsRes.json()
-        const lots: Array<{ id: number; nom: string | null; especeAnimaleId: string; statut: string; prixAchatTotal: number | null }> = lotsJson.data ?? []
+        const lots: Array<{ id: number; nom: string | null; especeAnimaleId: string; especeAnimale?: { nom: string } | null; statut: string; prixAchatTotal: number | null }> = lotsJson.data ?? []
         const actifs = lots.filter((l) => l.statut === "actif")
-        setLotsEspeceIds(actifs.map((l) => l.especeAnimaleId))
+        setLotsEspeces(actifs.map((l) => ({ especeAnimaleId: l.especeAnimaleId, especeNom: l.especeAnimale?.nom ?? null })))
         setLotsActifs(actifs.map((l) => ({ id: l.id, nom: l.nom, especeAnimaleId: l.especeAnimaleId, prixAchatTotal: l.prixAchatTotal })))
       }
       if (parcellesRes.ok) {
@@ -657,10 +678,12 @@ function AnimauxSubTab() {
   const [isSavingAbattage, setIsSavingAbattage] = React.useState(false)
 
   const [venteDialog, setVenteDialog] = React.useState<Animal | null>(null)
-  const [venteForm, setVenteForm] = React.useState({
+  const nouvelleVente = () => ({
     date: todayLocalISO(),
     prixUnitaire: "", client: "", description: "", notes: "", nExploitationDestination: "",
+    ...encaissementVenteInitial(),
   })
+  const [venteForm, setVenteForm] = React.useState(nouvelleVente)
   const [isSavingVente, setIsSavingVente] = React.useState(false)
 
   const [mortDialog, setMortDialog] = React.useState<Animal | null>(null)
@@ -727,7 +750,8 @@ function AnimauxSubTab() {
           unite: "unite",
           prixUnitaire: venteForm.prixUnitaire ? parseFloat(venteForm.prixUnitaire) : 0,
           client: venteForm.client || null,
-          paye: true,
+          paye: venteForm.paye,
+          modeReglement: venteForm.modeReglement || null,
           notes: venteForm.notes || null,
         }),
       })
@@ -745,7 +769,7 @@ function AnimauxSubTab() {
       })
       toast({ title: "Vente enregistrée", description: `${venteDialog.nom || venteDialog.identifiant || ''} marque comme vendu` })
       setVenteDialog(null)
-      setVenteForm({ date: todayLocalISO(), prixUnitaire: "", client: "", description: "", notes: "", nExploitationDestination: "" })
+      setVenteForm(nouvelleVente())
       fetchData()
     } catch {
       toast({ variant: "destructive", title: "Erreur", description: "Impossible d'enregistrer la vente" })
@@ -800,10 +824,10 @@ function AnimauxSubTab() {
   const especesPresentes = React.useMemo(
     () =>
       listEspecesBasePresentes([
-        ...animaux.map((a) => ({ especeAnimaleId: a.especeAnimale.id })),
-        ...lotsEspeceIds.map((especeAnimaleId) => ({ especeAnimaleId })),
+        ...animaux.map((a) => ({ especeAnimaleId: a.especeAnimale.id, especeNom: a.especeAnimale.nom })),
+        ...lotsEspeces,
       ]),
-    [animaux, lotsEspeceIds]
+    [animaux, lotsEspeces]
   )
 
   // Phase 0 modes d'élevage — le référentiel contient désormais les espèces
@@ -856,7 +880,7 @@ function AnimauxSubTab() {
 
   const filteredAnimaux = animaux.filter(a => {
     if (!filiereMatch(filiereSel, a.especeAnimale.filiere)) return false
-    if (filterEspece !== 'all' && especeBaseId(a.especeAnimale.id) !== filterEspece) {
+    if (filterEspece !== 'all' && cleFiltreEspece(a.especeAnimale.id) !== filterEspece) {
       return false
     }
     if (!search) return true
@@ -1379,7 +1403,7 @@ function AnimauxSubTab() {
                         </Link>
                       </h3>
                       <p className="text-sm text-muted-foreground">
-                        {animal.identifiant || "Identifiant non renseigné"} · {especeBaseLabel(animal.especeAnimale.id)}
+                        {animal.identifiant || "Identifiant non renseigné"} · {libelleEspeceAnimale(animal.especeAnimale)}
                         {animal.race ? ` · ${animal.race}` : ""}
                       </p>
                     </div>
@@ -1444,7 +1468,7 @@ function AnimauxSubTab() {
                         {animal.statut === "actif" ? (
                           <>
                             <DropdownMenuItem onClick={() => {
-                              setVenteForm((form) => ({ ...form, date: todayLocalISO() }))
+                              setVenteForm(nouvelleVente())
                               setVenteDialog(animal)
                             }}>
                               Vendre
@@ -1547,7 +1571,7 @@ function AnimauxSubTab() {
                         {animal.especeAnimale.couleur && (
                           <div className="w-3 h-3 rounded-full" style={{ backgroundColor: animal.especeAnimale.couleur }} />
                         )}
-                        {especeBaseLabel(animal.especeAnimale.id)}
+                        {libelleEspeceAnimale(animal.especeAnimale)}
                       </div>
                     </TableCell>
                     <TableCell>{animal.race || '-'}</TableCell>
@@ -1624,9 +1648,10 @@ function AnimauxSubTab() {
                                     pour limiter le détour. */}
                                 <Link
                                   href={`/elevage/animaux/${animal.id}#soins`}
+                                  aria-label={`Fiche et soins de ${nomLigneAnimal(animal)}`}
                                   className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-500 hover:bg-blue-100 hover:text-blue-600 inline-flex"
                                 >
-                                  <Stethoscope className="h-3.5 w-3.5" />
+                                  <Stethoscope className="h-3.5 w-3.5" aria-hidden="true" />
                                 </Link>
                               </TooltipTrigger>
                               <TooltipContent>Fiche &amp; soins</TooltipContent>
@@ -1634,10 +1659,12 @@ function AnimauxSubTab() {
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <button
+                                  type="button"
+                                  aria-label={`Modifier ${nomLigneAnimal(animal)}`}
                                   onClick={() => handleEditAnimal(animal)}
                                   className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-amber-100 hover:text-amber-700"
                                 >
-                                  <Pencil className="h-3.5 w-3.5" />
+                                  <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
                                 </button>
                               </TooltipTrigger>
                               <TooltipContent>Modifier la saisie</TooltipContent>
@@ -1645,10 +1672,12 @@ function AnimauxSubTab() {
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <button
-                                  onClick={() => { setVenteForm(f => ({ ...f, date: todayLocalISO() })); setVenteDialog(animal) }}
+                                  type="button"
+                                  aria-label={`Vendre ${nomLigneAnimal(animal)}`}
+                                  onClick={() => { setVenteForm(nouvelleVente()); setVenteDialog(animal) }}
                                   className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-blue-100 hover:text-blue-600"
                                 >
-                                  <ShoppingCart className="h-3.5 w-3.5" />
+                                  <ShoppingCart className="h-3.5 w-3.5" aria-hidden="true" />
                                 </button>
                               </TooltipTrigger>
                               <TooltipContent>Vendre</TooltipContent>
@@ -1660,10 +1689,12 @@ function AnimauxSubTab() {
                               <Tooltip>
                                 <TooltipTrigger asChild>
                                   <button
+                                    type="button"
+                                    aria-label={`Enregistrer l'abattage de ${nomLigneAnimal(animal)}`}
                                     onClick={() => { setAbattageForm(f => ({ ...f, date: todayLocalISO(), poidsVif: animal.poidsActuel?.toString() || "" })); setAbattageDialog(animal) }}
                                     className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-red-100 hover:text-red-600"
                                   >
-                                    <Scissors className="h-3.5 w-3.5" />
+                                    <Scissors className="h-3.5 w-3.5" aria-hidden="true" />
                                   </button>
                                 </TooltipTrigger>
                                 <TooltipContent>Abattage</TooltipContent>
@@ -1672,10 +1703,12 @@ function AnimauxSubTab() {
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <button
+                                  type="button"
+                                  aria-label={`Déclarer le décès de ${nomLigneAnimal(animal)}`}
                                   onClick={() => { setMortForm(f => ({ ...f, date: todayLocalISO() })); setMortDialog(animal) }}
                                   className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-slate-200 hover:text-slate-600"
                                 >
-                                  <Skull className="h-3.5 w-3.5" />
+                                  <Skull className="h-3.5 w-3.5" aria-hidden="true" />
                                 </button>
                               </TooltipTrigger>
                               <TooltipContent>Décès</TooltipContent>
@@ -1689,8 +1722,10 @@ function AnimauxSubTab() {
                           size="sm"
                           onClick={() => handleDelete(animal)}
                           className="text-red-600 hover:text-red-700"
+                          aria-label={`Supprimer ${nomLigneAnimal(animal)}`}
+                          title="Supprimer"
                         >
-                          &times;
+                          <span aria-hidden="true">&times;</span>
                         </Button>
                       )}
                     </TableCell>
@@ -1831,6 +1866,11 @@ function AnimauxSubTab() {
               <Label>Notes</Label>
               <Textarea value={venteForm.notes} onChange={(e) => setVenteForm(f => ({ ...f, notes: e.target.value }))} rows={2} />
             </div>
+            <ChampsEncaissement
+              idPrefix="animal-vente"
+              value={venteForm}
+              onChange={(changement) => setVenteForm(f => ({ ...f, ...changement }))}
+            />
             <div className="flex justify-end gap-2 pt-2">
               <Button type="button" variant="outline" onClick={() => setVenteDialog(null)}>Annuler</Button>
               <Button type="submit" disabled={isSavingVente}>{isSavingVente ? "Enregistrement..." : "Enregistrer la vente"}</Button>
@@ -1889,19 +1929,14 @@ function AnimauxSubTab() {
             ? `l'animal ${animalToDelete.nom || animalToDelete.identifiant || `#${animalToDelete.id}`}`
             : ""
         }
-        dependencies={
-          animalToDelete?._count
-            ? [
-                { label: "soins / traitements", count: animalToDelete._count.soins },
-                { label: "productions d'œufs", count: animalToDelete._count.productionsOeufs },
-                { label: "enregistrements de naissances (descendants)", count: animalToDelete._count.enfants },
-              ]
-            : []
-        }
+        // Un animal qui porte des saisies ne se supprime plus (route : 409 qui
+        // nomme ce qui le retient, `traces-animal.ts`) : rien n'est donc
+        // « supprimé avec lui », on prévient seulement du refus probable.
         warning={
-          animalToDelete?._count?.enfants
-            ? "Les liens de parenté seront rompus mais les descendants resteront enregistrés."
-            : undefined
+          animalToDelete?._count &&
+          (animalToDelete._count.soins + animalToDelete._count.productionsOeufs + animalToDelete._count.enfants) > 0
+            ? "Cet animal porte des soins, des productions ou des descendants : ils restent au registre d'élevage et la suppression sera refusée. S'il a quitté l'exploitation, déclarez plutôt sa sortie (Vendre, Abattage ou Décès)."
+            : "Seule une fiche sans aucune saisie (soin, mouvement, production, pesée…) peut être supprimée. Pour un animal qui a quitté l'exploitation, déclarez plutôt sa sortie."
         }
         onConfirm={confirmDelete}
       />
@@ -1997,7 +2032,15 @@ function LotsSubTab() {
           notes: abatLotForm.notes || null,
         }),
       })
-      if (!res.ok) throw new Error('Erreur')
+      if (!res.ok) {
+        // Revue 2026-10-20 — le refus de la route (plafond des têtes
+        // collectives, temps d'attente…) se lit tel quel au lieu d'un
+        // « Impossible d'enregistrer » muet.
+        const p = await res.json().catch(() => null)
+        const detail = p?.details?.message ?? (typeof p?.details === 'string' ? p.details : null) ?? p?.error
+        toast({ variant: "destructive", title: "Abattage refusé", description: detail || "Impossible d'enregistrer l'abattage" })
+        return
+      }
       toast({ title: "Abattage enregistré", description: `${abatLotForm.quantite} animal(aux) du lot ${abatLotDialog.nom || `#${abatLotDialog.id}`}` })
       setAbatLotDialog(null)
       setAbatLotForm({ date: todayLocalISO(), quantite: "1", poidsVif: "", poidsCarcasse: "", destination: "auto_consommation", prixVente: "", lieu: "", notes: "", nEtablissementDestination: "" })
@@ -2355,7 +2398,7 @@ function LotsSubTab() {
                       <div>
                         <h3 className="font-semibold">{lot.nom || `Lot #${lot.id}`}</h3>
                         <p className="text-sm text-muted-foreground">
-                          {especeBaseLabel(lot.especeAnimale.id)} · {effectif} tête{effectif > 1 ? "s" : ""}
+                          {libelleEspeceAnimale(lot.especeAnimale)} · {effectif} tête{effectif > 1 ? "s" : ""}
                         </p>
                       </div>
                       <Badge className={STATUT_COLORS[lot.statut] || ""}>{labelStatutLot(lot.statut)}</Badge>
@@ -2422,7 +2465,7 @@ function LotsSubTab() {
                     <TableCell>
                       <div className="flex items-center gap-2">
                         {lot.especeAnimale.couleur && <div className="w-3 h-3 rounded-full" style={{ backgroundColor: lot.especeAnimale.couleur }} />}
-                        {especeBaseLabel(lot.especeAnimale.id)}
+                        {libelleEspeceAnimale(lot.especeAnimale)}
                       </div>
                     </TableCell>
                     <TableCell className="text-right">{lot.quantiteInitiale}</TableCell>
@@ -2484,10 +2527,12 @@ function LotsSubTab() {
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <button
+                                type="button"
+                                aria-label={`Modifier le lot ${nomLigneLot(lot)}`}
                                 onClick={() => handleEditLot(lot)}
                                 className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-amber-100 hover:text-amber-700"
                               >
-                                <Pencil className="h-3.5 w-3.5" />
+                                <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
                               </button>
                             </TooltipTrigger>
                             <TooltipContent>Modifier le lot</TooltipContent>
@@ -2496,24 +2541,27 @@ function LotsSubTab() {
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <button
+                                  type="button"
                                   onClick={() => ouvrirComposition(lot)}
                                   className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-emerald-100 hover:text-emerald-700"
-                                  aria-label="Ajouter ou retirer des animaux"
+                                  aria-label={`Ajouter ou retirer des animaux du lot ${nomLigneLot(lot)}`}
                                 >
-                                  <UserPlus className="h-3.5 w-3.5" />
+                                  <UserPlus className="h-3.5 w-3.5" aria-hidden="true" />
                                 </button>
                               </TooltipTrigger>
                               <TooltipContent>Ajouter / retirer des animaux</TooltipContent>
                             </Tooltip>
                           )}
-                          {lot.statut === 'actif' && lot.quantiteActuelle > 0 && capacites(coerceFiliere(lot.especeAnimale.filiere)).abattage && (
+                          {lot.statut === 'actif' && partCollectiveLot(lot) > 0 && capacites(coerceFiliere(lot.especeAnimale.filiere)).abattage && (
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <button
+                                  type="button"
+                                  aria-label={`Enregistrer un abattage depuis le lot ${nomLigneLot(lot)}`}
                                   onClick={() => { setAbatLotForm(f => ({ ...f, date: todayLocalISO(), quantite: "1" })); setAbatLotDialog(lot) }}
                                   className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-red-100 hover:text-red-600"
                                 >
-                                  <Scissors className="h-3.5 w-3.5" />
+                                  <Scissors className="h-3.5 w-3.5" aria-hidden="true" />
                                 </button>
                               </TooltipTrigger>
                               <TooltipContent>Abattage</TooltipContent>
@@ -2524,10 +2572,12 @@ function LotsSubTab() {
                               <Tooltip>
                                 <TooltipTrigger asChild>
                                   <button
+                                    type="button"
+                                    aria-label={`Réformer le lot ${nomLigneLot(lot)}`}
                                     onClick={() => handleReformerLot(lot)}
                                     className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-orange-100 hover:text-orange-700"
                                   >
-                                    <Archive className="h-3.5 w-3.5" />
+                                    <Archive className="h-3.5 w-3.5" aria-hidden="true" />
                                   </button>
                                 </TooltipTrigger>
                                 <TooltipContent>Réformer le lot</TooltipContent>
@@ -2535,10 +2585,12 @@ function LotsSubTab() {
                               <Tooltip>
                                 <TooltipTrigger asChild>
                                   <button
+                                    type="button"
+                                    aria-label={`Clôturer le lot ${nomLigneLot(lot)}`}
                                     onClick={() => handleCloturerLot(lot)}
                                     className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-slate-200 hover:text-slate-700"
                                   >
-                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                    <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
                                   </button>
                                 </TooltipTrigger>
                                 <TooltipContent>Clôturer (terminé)</TooltipContent>
@@ -2549,10 +2601,12 @@ function LotsSubTab() {
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <button
+                                  type="button"
+                                  aria-label={`Réactiver le lot ${nomLigneLot(lot)}`}
                                   onClick={() => handleReactiverLot(lot)}
                                   className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-green-100 hover:text-green-700"
                                 >
-                                  <RotateCcw className="h-3.5 w-3.5" />
+                                  <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
                                 </button>
                               </TooltipTrigger>
                               <TooltipContent>Réactiver (repasser en actif)</TooltipContent>
@@ -2561,10 +2615,12 @@ function LotsSubTab() {
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <button
+                                type="button"
+                                aria-label={`Supprimer le lot ${nomLigneLot(lot)}`}
                                 onClick={() => handleSupprimerLot(lot)}
                                 className="p-1.5 rounded-md transition-colors bg-slate-100 text-slate-400 hover:bg-red-100 hover:text-red-700"
                               >
-                                <Trash2 className="h-3.5 w-3.5" />
+                                <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
                               </button>
                             </TooltipTrigger>
                             <TooltipContent>Supprimer le lot</TooltipContent>
@@ -2594,7 +2650,23 @@ function LotsSubTab() {
               Abattage depuis un lot
             </DialogTitle>
             <DialogDescription>
-              {abatLotDialog?.nom || `Lot #${abatLotDialog?.id}`} — {abatLotDialog?.especeAnimale.nom} ({abatLotDialog?.quantiteActuelle} restants)
+              {abatLotDialog?.nom || `Lot #${abatLotDialog?.id}`} — {abatLotDialog?.especeAnimale.nom}
+              {abatLotDialog && (() => {
+                const collectif = partCollectiveLot(abatLotDialog)
+                const fiches = abatLotDialog.nominatifsActifs ?? 0
+                return (
+                  <>
+                    {` (${collectif} tête${collectif > 1 ? "s" : ""} collective${collectif > 1 ? "s" : ""} présente${collectif > 1 ? "s" : ""})`}
+                    {fiches > 0 && (
+                      <span className="block">
+                        {fiches > 1
+                          ? `Les ${fiches} fiches nominatives rattachées s'abattent depuis leur fiche.`
+                          : "La fiche nominative rattachée s'abat depuis sa fiche."}
+                      </span>
+                    )}
+                  </>
+                )
+              })()}
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={handleAbatLotSubmit} className="space-y-4">
@@ -2605,7 +2677,7 @@ function LotsSubTab() {
               </div>
               <div className="space-y-2">
                 <Label>Quantité *</Label>
-                <Input type="number" min="1" max={abatLotDialog?.quantiteActuelle || 999} value={abatLotForm.quantite} onChange={(e) => setAbatLotForm(f => ({ ...f, quantite: e.target.value }))} />
+                <Input type="number" min="1" max={abatLotDialog ? partCollectiveLot(abatLotDialog) || undefined : undefined} value={abatLotForm.quantite} onChange={(e) => setAbatLotForm(f => ({ ...f, quantite: e.target.value }))} />
               </div>
               <div className="space-y-2">
                 <Label>Destination *</Label>

@@ -14,13 +14,107 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { Prisma } from '@prisma/client'
 import { collecteLaitSchema, updateCollecteLaitSchema } from '@/lib/validations/lait'
 import { causesAttenteCollectes, soinCouvrantCollecte } from '@/lib/elevage/attente-lait'
+import { reconstituerEffectifsLots } from '@/lib/elevage/effectif'
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
+import { ErreurElevage } from '@/lib/elevage/erreurs'
+import { protegerCollecteAffectee } from '@/lib/elevage/collecte-affectee'
 import {
   estAnimalCollectableLait,
   estLotCollectableLait,
   plafondCollecteLait,
 } from '@/lib/elevage/cibles-collecte-lait'
+
+/**
+ * Refus d'un lot de fromage qui n'appartient pas au compte, sinon `null`.
+ * POST et PATCH écrivaient `lotFromageId` sans rien vérifier : la collecte se
+ * rattachait au lot de fabrication d'un autre compte (audit 2026-10-19). Même
+ * refus que la vente de fromage (`ventes/route.ts`), qui nomme son champ.
+ */
+async function refusLotFromageHorsCompte(lotFromageId: string, userId: string): Promise<NextResponse | null> {
+  const lot = await prisma.lotFromage.findFirst({
+    where: { id: lotFromageId, userId },
+    select: { id: true },
+  })
+  if (lot) return null
+  return NextResponse.json(
+    { error: 'Lot de fromage introuvable dans votre cave.', champ: 'lotFromageId' },
+    { status: 400 }
+  )
+}
+
+type CibleCollecte = {
+  type: 'animal' | 'lot'
+  nomEspece: string | null
+  effectif: number
+  collectable: boolean
+}
+
+/**
+ * Cible d'une traite (animal ou lot du compte) avec ce qu'il faut pour son
+ * plafond indicatif ; `null` si elle n'existe pas dans le compte.
+ */
+async function chargerCibleCollecte(
+  userId: string,
+  animalId: number | null | undefined,
+  lotId: number | null | undefined,
+): Promise<CibleCollecte | null> {
+  if (animalId) {
+    const a = await prisma.animal.findFirst({
+      where: { id: animalId, userId },
+      select: {
+        id: true,
+        sexe: true,
+        orientationProduction: true,
+        especeAnimale: {
+          select: { nom: true, production: true, productions: true },
+        },
+      },
+    })
+    if (!a) return null
+    return { type: 'animal', nomEspece: a.especeAnimale.nom, effectif: 1, collectable: estAnimalCollectableLait(a) }
+  }
+  if (lotId) {
+    const l = await prisma.lotAnimaux.findFirst({
+      where: { id: lotId, userId },
+      select: {
+        id: true,
+        quantiteInitiale: true,
+        quantiteActuelle: true,
+        especeAnimale: {
+          select: { nom: true, production: true, productions: true },
+        },
+      },
+    })
+    if (!l) return null
+    // Revue 2026-10-20 — plafond sur l'effectif reconstitué (celui de
+    // l'écran Lots), pas sur le compteur stocké qui dérive.
+    const effectifs = await reconstituerEffectifsLots(userId, [l])
+    return {
+      type: 'lot',
+      nomEspece: l.especeAnimale.nom,
+      effectif: Math.max(1, effectifs.get(l.id)?.effectifCalcule ?? l.quantiteActuelle),
+      collectable: estLotCollectableLait(l),
+    }
+  }
+  return null
+}
+
+/** Refus d'un volume au-dessus du plafond indicatif non confirmé, sinon `null`. */
+function refusVolumeInhabituel(cible: CibleCollecte, quantite: number, confirme: boolean): NextResponse | null {
+  const plafond = plafondCollecteLait(cible.nomEspece, cible.type, cible.effectif)
+  if (quantite <= plafond || confirme) return null
+  return NextResponse.json(
+    {
+      error: `Volume inhabituel : ${quantite} L dépasse le plafond indicatif de ${plafond} L pour cette traite. Confirmez explicitement pour l’enregistrer.`,
+      code: 'VOLUME_LAIT_INHABITUEL',
+      details: { plafond, quantite, espece: cible.nomEspece },
+    },
+    { status: 422 },
+  )
+}
 
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
@@ -34,7 +128,7 @@ export async function GET(request: NextRequest) {
   const requestedLimit = Number.parseInt(searchParams.get('limit') || '', 10)
   const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 1000) : undefined
 
-  const where: any = { userId: session.user.id }
+  const where: Prisma.CollecteLaitWhereInput = { userId: session.user.id }
   if (from || to) {
     where.date = {}
     if (from) where.date.gte = new Date(from)
@@ -97,70 +191,22 @@ export async function POST(request: NextRequest) {
 
     // Audit élevage 2026-06-11 — validation tenant : l'animal/le lot
     // référencé doit appartenir au user (même règle que mouvements-cheptel).
-    let cible: {
-      type: 'animal' | 'lot'
-      nomEspece: string | null
-      effectif: number
-    } | null = null
-    if (data.animalId) {
-      const a = await prisma.animal.findFirst({
-        where: { id: data.animalId, userId: session.user.id },
-        select: {
-          id: true,
-          sexe: true,
-          orientationProduction: true,
-          especeAnimale: {
-            select: { nom: true, production: true, productions: true },
-          },
+    const cible = await chargerCibleCollecte(session.user.id, data.animalId, data.lotId)
+    if (!cible) {
+      return NextResponse.json({ error: data.animalId ? 'Animal introuvable' : 'Lot introuvable' }, { status: 404 })
+    }
+    if (!cible.collectable) {
+      return NextResponse.json(
+        {
+          error: cible.type === 'animal'
+            ? 'La collecte de lait est réservée aux femelles d’un atelier laitier ou mixte.'
+            : 'La collecte de lait est réservée aux lots d’un atelier laitier ou mixte.',
         },
-      })
-      if (!a) return NextResponse.json({ error: 'Animal introuvable' }, { status: 404 })
-      if (!estAnimalCollectableLait(a)) {
-        return NextResponse.json(
-          { error: 'La collecte de lait est réservée aux femelles d’un atelier laitier ou mixte.' },
-          { status: 422 },
-        )
-      }
-      cible = { type: 'animal', nomEspece: a.especeAnimale.nom, effectif: 1 }
+        { status: 422 },
+      )
     }
-    if (data.lotId) {
-      const l = await prisma.lotAnimaux.findFirst({
-        where: { id: data.lotId, userId: session.user.id },
-        select: {
-          id: true,
-          quantiteActuelle: true,
-          especeAnimale: {
-            select: { nom: true, production: true, productions: true },
-          },
-        },
-      })
-      if (!l) return NextResponse.json({ error: 'Lot introuvable' }, { status: 404 })
-      if (!estLotCollectableLait(l)) {
-        return NextResponse.json(
-          { error: 'La collecte de lait est réservée aux lots d’un atelier laitier ou mixte.' },
-          { status: 422 },
-        )
-      }
-      cible = {
-        type: 'lot',
-        nomEspece: l.especeAnimale.nom,
-        effectif: Math.max(1, l.quantiteActuelle),
-      }
-    }
-
-    if (cible) {
-      const plafond = plafondCollecteLait(cible.nomEspece, cible.type, cible.effectif)
-      if (data.quantiteLitres > plafond && !data.confirmerVolumeInhabituel) {
-        return NextResponse.json(
-          {
-            error: `Volume inhabituel : ${data.quantiteLitres} L dépasse le plafond indicatif de ${plafond} L pour cette traite. Confirmez explicitement pour l’enregistrer.`,
-            code: 'VOLUME_LAIT_INHABITUEL',
-            details: { plafond, quantite: data.quantiteLitres, espece: cible.nomEspece },
-          },
-          { status: 422 },
-        )
-      }
-    }
+    const refusVolume = refusVolumeInhabituel(cible, data.quantiteLitres, data.confirmerVolumeInhabituel)
+    if (refusVolume) return refusVolume
 
     // Normalise la date au jour (00:00 UTC)
     const day = new Date(data.date)
@@ -170,39 +216,49 @@ export async function POST(request: NextRequest) {
     // le soin porte sur le MÊME animal/lot OU sur l'animal↔son lot (soin de lot
     // → collecte individuelle d'un membre, et inversement). Comparaison au jour
     // (collecte à 00:00, soin horodaté). Cf. lib attente-lait.
-    const soinCouvrant = await soinCouvrantCollecte(prisma, session.user.id, data.animalId ?? null, data.lotId ?? null, day)
-    const ecarte = (data.ecarteAttente ?? false) || soinCouvrant !== null
+    if (data.lotFromageId) {
+      const refusLot = await refusLotFromageHorsCompte(data.lotFromageId, session.user.id)
+      if (refusLot) return refusLot
+    }
 
-    // Upsert pour permettre "saisie identique à hier" / corrections
-    const existing = await prisma.collecteLait.findFirst({
-      where: {
+    const { collecte, soinCouvrant, existant } = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session.user.id)
+      // Même verrou que la fabrication : son affectation ne peut pas apparaître
+      // entre le contrôle d'une correction et son écriture.
+      const soinCouvrant = await soinCouvrantCollecte(tx, session.user.id, data.animalId ?? null, data.lotId ?? null, day)
+      const existing = await tx.collecteLait.findFirst({
+        where: {
+          userId: session.user.id,
+          date: day,
+          traite: data.traite,
+          animalId: data.animalId ?? null,
+          lotId: data.lotId ?? null,
+        },
+      })
+      if (existing) protegerCollecteAffectee(existing, { ...data, date: day })
+      const ecarte = soinCouvrant !== null || (body.ecarteAttente !== undefined ? data.ecarteAttente : existing?.ecarteAttente ?? false)
+
+      const payload = {
         userId: session.user.id,
         date: day,
         traite: data.traite,
         animalId: data.animalId ?? null,
         lotId: data.lotId ?? null,
-      },
+        quantiteLitres: data.quantiteLitres,
+        mgGpl: data.mgGpl,
+        mpGpl: data.mpGpl,
+        cellulesParMl: data.cellulesParMl,
+        temperatureC: data.temperatureC,
+        ecarteAttente: ecarte,
+        notes: data.notes,
+        lotFromageId: data.lotFromageId,
+      }
+
+      const collecte = existing
+        ? await tx.collecteLait.update({ where: { id: existing.id }, data: payload })
+        : await tx.collecteLait.create({ data: payload })
+      return { collecte, soinCouvrant, existant: Boolean(existing) }
     })
-
-    const payload = {
-      userId: session.user.id,
-      date: day,
-      traite: data.traite,
-      animalId: data.animalId ?? null,
-      lotId: data.lotId ?? null,
-      quantiteLitres: data.quantiteLitres,
-      mgGpl: data.mgGpl ?? null,
-      mpGpl: data.mpGpl ?? null,
-      cellulesParMl: data.cellulesParMl ?? null,
-      temperatureC: data.temperatureC ?? null,
-      ecarteAttente: ecarte,
-      notes: data.notes ?? null,
-      lotFromageId: data.lotFromageId ?? null,
-    }
-
-    const collecte = existing
-      ? await prisma.collecteLait.update({ where: { id: existing.id }, data: payload })
-      : await prisma.collecteLait.create({ data: payload })
 
     return NextResponse.json(
       {
@@ -211,9 +267,10 @@ export async function POST(request: NextRequest) {
           ? `Collecte écartée automatiquement : traitement « ${soinCouvrant.produit || soinCouvrant.type} » en temps d'attente lait jusqu'au ${soinCouvrant.finAttenteLait?.toLocaleDateString('fr-FR')}.`
           : null,
       },
-      { status: existing ? 200 : 201 }
+      { status: existant ? 200 : 201 }
     )
   } catch (err) {
+    if (err instanceof ErreurElevage) return NextResponse.json({ error: err.message, code: err.code }, { status: err.status })
     console.error('POST /api/elevage/collectes-lait error:', err)
     return NextResponse.json({ error: 'Erreur interne du serveur' }, { status: 500 })
   }
@@ -229,9 +286,25 @@ export async function PATCH(request: NextRequest) {
     if (!parsed.success) {
       return NextResponse.json({ error: 'Données invalides', details: parsed.error.flatten() }, { status: 400 })
     }
-    const { id, ...updates } = parsed.data
-    const existing = await prisma.collecteLait.findFirst({ where: { id, userId: session.user.id } })
-    if (!existing) return NextResponse.json({ error: 'Collecte non trouvée' }, { status: 404 })
+    const { id, confirmerVolumeInhabituel, ...updates } = parsed.data
+    if (updates.lotFromageId) {
+      const refusLot = await refusLotFromageHorsCompte(updates.lotFromageId, session.user.id)
+      if (refusLot) return refusLot
+    }
+
+    // Revue du 2026-11-01 — une correction de volume passe par le même plafond
+    // indicatif que la saisie, au lieu de la seule borne fixe de 100 L.
+    if (updates.quantiteLitres !== undefined) {
+      const actuelle = await prisma.collecteLait.findFirst({
+        where: { id, userId: session.user.id },
+        select: { quantiteLitres: true, animalId: true, lotId: true },
+      })
+      if (actuelle && Number(actuelle.quantiteLitres) !== updates.quantiteLitres) {
+        const cible = await chargerCibleCollecte(session.user.id, actuelle.animalId, actuelle.lotId)
+        const refusVolume = cible && refusVolumeInhabituel(cible, updates.quantiteLitres, confirmerVolumeInhabituel)
+        if (refusVolume) return refusVolume
+      }
+    }
 
     // Ticket cms1v9rj5 — règle métier : une collecte dont la date est couverte
     // par la fenêtre [début soin .. fin_attente_lait] d'un soin actif DOIT être
@@ -240,19 +313,26 @@ export async function PATCH(request: NextRequest) {
     // change. La ré-intégration (flag → false), elle, ne se fait que sur
     // changement de date (audit 2026-06-11 : déplacer une collecte hors fenêtre
     // gardait l'ancien flag) pour ne pas effacer un écartement manuel.
-    const data: typeof updates & { ecarteAttente?: boolean } = { ...updates }
-    if (updates.ecarteAttente === undefined && (existing.animalId || existing.lotId)) {
-      const day = new Date(updates.date ?? existing.date)
-      day.setUTCHours(0, 0, 0, 0)
-      // Cross-granularité + comparaison au jour (cf. lib attente-lait).
-      const soinCouvrant = await soinCouvrantCollecte(prisma, session.user.id, existing.animalId, existing.lotId, day)
-      if (soinCouvrant) data.ecarteAttente = true
-      else if (updates.date) data.ecarteAttente = false
-    }
+    const collecte = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session.user.id)
+      const existing = await tx.collecteLait.findFirst({ where: { id, userId: session.user.id } })
+      if (!existing) throw new ErreurElevage('Collecte non trouvée', 404)
+      protegerCollecteAffectee(existing, updates)
+      const data: typeof updates & { ecarteAttente?: boolean } = { ...updates }
+      if (existing.animalId || existing.lotId) {
+        const day = new Date(updates.date ?? existing.date)
+        day.setUTCHours(0, 0, 0, 0)
+        // Cross-granularité + comparaison au jour (cf. lib attente-lait).
+        const soinCouvrant = await soinCouvrantCollecte(tx, session.user.id, existing.animalId, existing.lotId, day)
+        if (soinCouvrant) data.ecarteAttente = true
+        else if (updates.date && updates.ecarteAttente === undefined) data.ecarteAttente = false
+      }
 
-    const collecte = await prisma.collecteLait.update({ where: { id }, data })
+      return tx.collecteLait.update({ where: { id }, data })
+    })
     return NextResponse.json({ data: collecte })
   } catch (err) {
+    if (err instanceof ErreurElevage) return NextResponse.json({ error: err.message, code: err.code }, { status: err.status })
     console.error('PATCH /api/elevage/collectes-lait error:', err)
     return NextResponse.json({ error: 'Erreur interne du serveur' }, { status: 500 })
   }
@@ -266,17 +346,18 @@ export async function DELETE(request: NextRequest) {
   const id = searchParams.get('id')
   if (!id) return NextResponse.json({ error: 'ID requis' }, { status: 400 })
 
-  const existing = await prisma.collecteLait.findFirst({ where: { id, userId: session.user.id } })
-  if (!existing) return NextResponse.json({ error: 'Collecte non trouvée' }, { status: 404 })
-
-  // Refus si déjà affectée à un lot fromage (intégrité traçabilité)
-  if (existing.lotFromageId) {
-    return NextResponse.json(
-      { error: 'Cette collecte est affectée à un lot fromage. Désaffectez-la d\'abord.' },
-      { status: 409 }
-    )
+  try {
+    await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session.user.id)
+      const existing = await tx.collecteLait.findFirst({ where: { id, userId: session.user.id } })
+      if (!existing) throw new ErreurElevage('Collecte non trouvée', 404)
+      if (existing.lotFromageId) throw new ErreurElevage('Cette collecte est affectée à une fabrication. Annulez cette fabrication avant de supprimer la collecte.')
+      await tx.collecteLait.delete({ where: { id } })
+    })
+    return NextResponse.json({ success: true })
+  } catch (err) {
+    if (err instanceof ErreurElevage) return NextResponse.json({ error: err.message }, { status: err.status })
+    console.error('DELETE /api/elevage/collectes-lait error:', err)
+    return NextResponse.json({ error: 'Erreur interne du serveur' }, { status: 500 })
   }
-
-  await prisma.collecteLait.delete({ where: { id } })
-  return NextResponse.json({ success: true })
 }

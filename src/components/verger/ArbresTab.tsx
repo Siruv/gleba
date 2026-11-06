@@ -7,9 +7,10 @@
 import * as React from "react"
 import { urlApercu } from "@/lib/apercu-document"
 import { useRouter } from "next/navigation"
+import { useSession } from "next-auth/react"
 import { ColumnDef } from "@tanstack/react-table"
-import { TreeDeciduous, Leaf, Cherry, Fence, Flower2, Shrub, CalendarPlus, Copy, Map as MapIcon, MapPin } from "lucide-react"
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
+import { TreeDeciduous, Leaf, Cherry, Fence, Flower2, Shrub, Grape, CalendarPlus, Copy, Map as MapIcon, MapPin, type LucideIcon } from "lucide-react"
+import { MenuDuplicationArbre } from "@/components/verger/MenuDuplicationArbre"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
@@ -31,36 +32,39 @@ import { GpsMapPickerDialog } from "@/components/gps/GpsMapPickerDialog"
 import { ReleveGpsDialog } from "@/components/verger/ReleveGpsDialog"
 import { roundCoord } from "@/lib/geolocation"
 import { adequationEspece } from "@/lib/adequation-zone"
-import { CONDUITES_ARBRE } from "@/lib/verger/arbre-constants"
+import { avertissementSuppressionArbre, CONDUITES_ARBRE } from "@/lib/verger/arbre-constants"
+import {
+  TYPES_ARBRE,
+  categoriesEspecePourTypeArbre,
+  estTypeArbreFruitier,
+  libelleTypeArbre,
+  typeArbrePourCategorieEspece,
+  type TypeArbre,
+} from "@/lib/verger/types-arbre"
+import { libelleVarieteOption } from "@/lib/verger/variete-arbre"
+import { choisirEspeceArbre } from "@/lib/verger/espece-arbre"
 import type { ZoneClimat } from "@/lib/terroir"
 import { Snowflake } from "lucide-react"
 
-/**
- * QA cmswxinhf — l'avertissement annonçait la purge des observations et des
- * opérations sans distinguer les traitements phyto, que la suppression effaçait
- * réellement du registre réglementaire. Ils sont désormais conservés quelle que
- * soit leur saisie d'origine (voir src/lib/verger/preserver-traces-phyto.ts).
- */
-const AVERTISSEMENT_SUPPRESSION_ARBRE =
-  "Bio/HVE : la suppression purge les récoltes, ainsi que les opérations et observations SANS traitement. " +
-  "Tous les traitements phytosanitaires restent au registre (détachés de l'arbre, nom snapshoté), comme les lots de bois. " +
-  "Préférez « Archiver » pour conserver toute la traçabilité."
+// Ticket cmvnopnsu (2026-10-25) : le calendrier d'entretien est généré à la
+// création (`genererCalendrierEntretien`), ce que le formulaire ne disait pas.
+const AIDE_CALENDRIER_CREATION =
+  "À l'enregistrement, Gleba planifie l'entretien connu pour l'espèce, à partir d'aujourd'hui ou de cette date si elle est à venir. Vous pourrez le recalculer depuis la liste des arbres (écran large)."
 
-const TYPES_ARBRES = [
+// Types d'arbre : liste unique dans src/lib/verger/types-arbre.ts (QA
+// 2026-10-19, les lianes fruitières manquaient à la création et aux onglets).
+const ICONES_TYPES_ARBRE: Record<TypeArbre, LucideIcon> = {
+  fruitier: Cherry,
+  petit_fruit: Shrub,
+  liane: Grape,
+  forestier: Leaf,
+  ornement: Flower2,
+  haie: Fence,
+}
+
+const TYPES_ARBRES: ReadonlyArray<{ value: string; label: string; icon: LucideIcon }> = [
   { value: "all", label: "Tous", icon: TreeDeciduous },
-  { value: "fruitier", label: "Fruitiers", icon: Cherry },
-  { value: "petit_fruit", label: "Petits fruits", icon: Shrub },
-  { value: "forestier", label: "Forestiers", icon: Leaf },
-  { value: "ornement", label: "Ornementaux", icon: Flower2 },
-  { value: "haie", label: "Haies", icon: Fence },
-] as const
-
-const TYPES_ARBRES_FORM = [
-  { value: "fruitier", label: "Fruitier" },
-  { value: "petit_fruit", label: "Petit fruit" },
-  { value: "forestier", label: "Forestier" },
-  { value: "ornement", label: "Ornemental" },
-  { value: "haie", label: "Haie" },
+  ...TYPES_ARBRE.map((t) => ({ value: t.value, label: t.labelPluriel, icon: ICONES_TYPES_ARBRE[t.value] })),
 ]
 
 const ETATS_ARBRE = [
@@ -69,14 +73,6 @@ const ETATS_ARBRE = [
   { value: "moyen", label: "Moyen" },
   { value: "mauvais", label: "Mauvais" },
 ]
-
-const TYPE_LABELS: Record<string, string> = {
-  fruitier: "Fruitier",
-  petit_fruit: "Petit fruit",
-  forestier: "Forestier",
-  ornement: "Ornemental",
-  haie: "Haie",
-}
 
 const etatColors: Record<string, string> = {
   excellent: "bg-green-100 text-green-700",
@@ -95,6 +91,8 @@ interface Arbre {
   etat: string | null
   productif: boolean
   fournisseur?: string | null
+  prixAchat?: number | null
+  dateAchat?: string | null
   // PROMPT 10 — fiche complète
   portGreffe?: string | null
   porteGreffeId?: string | null
@@ -134,6 +132,9 @@ interface LotArbres {
 
 interface EspeceRef {
   id: string
+  /** Libellé d'une espèce perso (son id est un cuid) ; null pour le catalogue. */
+  nom: string | null
+  userId: string | null
   type: string
   // Référentiel géographique : adéquation à la zone climatique.
   zonesAdaptees?: string | null
@@ -142,18 +143,19 @@ interface EspeceRef {
 
 interface VarieteRef {
   id: string
+  /** Libellé proposé : le nom affiché (une variété personnelle a un cuid pour id). */
+  libelle: string
   especeId: string
 }
 
-// Map du type d'arbre (form) vers le type d'espece (referentiel)
-const TYPE_TO_REF: Record<string, string> = {
-  fruitier: "arbre_fruitier",
-  petit_fruit: "petit_fruit",
-}
+/** Espèce telle que renvoyée par `/api/especes` (champs utilisés ici). */
+type EspeceApi = Pick<EspeceRef, "id" | "type" | "zonesAdaptees" | "besoinFroid"> & { nom?: string | null; userId?: string | null }
+/** Variété telle que renvoyée par `/api/varietes` (champs utilisés ici). */
+type VarieteApi = { id: string; nom?: string | null; especeId: string }
 
 function makeColumns(
   onGenererCalendrier: (arbre: Arbre) => void,
-  onDupliquer: (arbre: Arbre, nombre: number) => void,
+  onDupliquer: (arbre: Arbre, nombre: number, recopierAchat: boolean) => void,
 ): ColumnDef<Arbre>[] {
   return [
     {
@@ -178,7 +180,7 @@ function makeColumns(
         const type = getValue() as string
         return (
           <Badge variant="outline" className="text-xs">
-            {TYPE_LABELS[type] || type}
+            {libelleTypeArbre(type)}
           </Badge>
         )
       },
@@ -263,34 +265,27 @@ function makeColumns(
     {
       id: "calendrier",
       header: "",
-      // Masquée sur mobile : le raccourci reste accessible depuis la fiche.
+      // Masquée sous 768 px. La fiche de l'arbre ne propose ni la duplication
+      // ni le recalcul du calendrier (constat du 2026-10-25) : sur téléphone,
+      // ces deux gestes ne sont pas accessibles.
       meta: { className: "hidden md:table-cell" },
       cell: ({ row }) => {
         const arbre = row.original
         return (
           <div className="flex items-center gap-1">
             {/* Friction 2026-10-05 : 52 arbres saisis un par un faute de copie. */}
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 px-2"
-                  onClick={(e) => e.stopPropagation()}
-                  title="Dupliquer l'arbre"
-                  aria-label={`Dupliquer ${arbre.nom}`}
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
-                {[1, 2, 3, 5, 10].map((n) => (
-                  <DropdownMenuItem key={n} onClick={() => onDupliquer(arbre, n)}>
-                    {n === 1 ? "Dupliquer" : `Dupliquer ×${n}`}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <MenuDuplicationArbre arbre={arbre} onDupliquer={(n, recopierAchat) => onDupliquer(arbre, n, recopierAchat)}>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2"
+                onClick={(e) => e.stopPropagation()}
+                title="Dupliquer l'arbre"
+                aria-label={`Dupliquer ${arbre.nom}`}
+              >
+                <Copy className="h-3.5 w-3.5" />
+              </Button>
+            </MenuDuplicationArbre>
             {arbre.espece && (
           <Button
             variant="ghost"
@@ -300,7 +295,11 @@ function makeColumns(
               e.stopPropagation()
               onGenererCalendrier(arbre)
             }}
-            title="Générer le calendrier d'entretien"
+            // Ticket cmvnopnsu — le calendrier naît à la création de l'arbre ;
+            // ce bouton le recalcule (opérations automatiques non faites de
+            // l'année), selon la même règle (`planCalendrierEntretien`).
+            title="Recalculer le calendrier d'entretien"
+            aria-label={`Recalculer le calendrier d'entretien de ${arbre.nom}`}
           >
             <CalendarPlus className="h-3.5 w-3.5" />
           </Button>
@@ -315,6 +314,7 @@ function makeColumns(
 export function ArbresTab() {
   const router = useRouter()
   const { toast } = useToast()
+  const { data: session } = useSession()
   const [data, setData] = React.useState<Arbre[]>([])
   const [isLoading, setIsLoading] = React.useState(true)
   const [selectedType, setSelectedType] = React.useState("all")
@@ -389,7 +389,18 @@ export function ArbresTab() {
       })
       if (res.ok) {
         const data = await res.json()
-        toast({ title: `Calendrier généré pour ${data.espece}`, description: `${data.count} opérations créées` })
+        // Ticket cmvnopnsu — le bouton recalcule ; l'année dite est celle
+        // réellement régénérée (celle de la plantation si elle est à venir).
+        const count = Number(data.count) || 0
+        toast({
+          title: `Calendrier recalculé pour ${data.espece} (${data.year})`,
+          description:
+            count === 0
+              ? "Aucune opération à prévoir."
+              : count === 1
+                ? "1 opération créée."
+                : `${count} opérations créées.`,
+        })
       } else {
         const err = await res.json()
         toast({ title: "Calendrier non disponible", description: err.error, variant: "destructive" })
@@ -488,17 +499,32 @@ export function ArbresTab() {
     fetchData()
   }, [fetchData])
 
-  const handleDupliquer = React.useCallback(async (arbre: Arbre, nombre: number) => {
+  const handleDupliquer = React.useCallback(async (arbre: Arbre, nombre: number, recopierAchat: boolean) => {
     try {
       const res = await fetch(`/api/arbres/${arbre.id}/dupliquer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nombre }),
+        body: JSON.stringify({ nombre, recopierAchat }),
       })
       const data = await res.json().catch(() => null)
       if (!res.ok) throw new Error(data?.error || "Duplication impossible")
       const noms: string[] = (data?.arbres ?? []).map((a: { nom: string }) => a.nom)
-      toast({ title: noms.length > 1 ? `${noms.length} arbres créés` : "Arbre dupliqué", description: noms.join(", ") })
+      // Ticket cmvnopnsu — chaque copie reçoit son calendrier d'entretien
+      // (`calendriers` renvoyé par la route) : on le dit.
+      const calendriers = Number(data?.calendriers) || 0
+      const annonceCalendrier =
+        calendriers === 0
+          ? null
+          : calendriers === 1
+            ? "Calendrier d'entretien généré."
+            : `Calendrier d'entretien généré pour ${calendriers} arbres.`
+      const achats = Number(data?.achatsRecopies) || 0
+      const annonceAchats =
+        achats === 0 ? null : achats === 1 ? "1 dépense d'achat créée" : `${achats} dépenses d'achat créées`
+      toast({
+        title: noms.length > 1 ? `${noms.length} arbres créés` : "Arbre dupliqué",
+        description: [noms.join(", "), annonceCalendrier, annonceAchats].filter(Boolean).join(". "),
+      })
       fetchData()
     } catch (e) {
       toast({ title: "Erreur", description: e instanceof Error ? e.message : undefined, variant: "destructive" })
@@ -526,15 +552,15 @@ export function ArbresTab() {
       fetch("/api/comptabilite/fournisseurs?actif=true").then(r => r.json()).catch(() => null),
       fetch("/api/carte").then(r => r.json()).catch(() => []),
     ]).then(([especesRes, varietesRes, fournisseursRes, parcellesRes]) => {
-      const especes = especesRes?.data || []
-      setEspecesRef(especes.map((e: any) => ({ id: e.id, type: e.type, zonesAdaptees: e.zonesAdaptees, besoinFroid: e.besoinFroid })))
-      const especesIds = new Set(especes.map((e: any) => e.id))
-      const varietes = (varietesRes?.data || [])
-        .filter((v: any) => especesIds.has(v.especeId))
-        .map((v: any) => ({ id: v.id, especeId: v.especeId }))
+      const especes = (especesRes?.data || []) as EspeceApi[]
+      setEspecesRef(especes.map((e) => ({ id: e.id, nom: e.nom ?? null, userId: e.userId ?? null, type: e.type, zonesAdaptees: e.zonesAdaptees, besoinFroid: e.besoinFroid })))
+      const especesIds = new Set(especes.map((e) => e.id))
+      const varietes = ((varietesRes?.data || []) as VarieteApi[])
+        .filter((v) => especesIds.has(v.especeId))
+        .map((v) => ({ id: v.id, libelle: libelleVarieteOption(v), especeId: v.especeId }))
       setVarietesRef(varietes)
-      const fournisseurs = (fournisseursRes?.data || [])
-        .map((f: any) => f.id)
+      const fournisseurs = ((fournisseursRes?.data || []) as { id: string }[])
+        .map((f) => f.id)
         .filter(Boolean)
       setFournisseursRef(fournisseurs)
       setParcelles((Array.isArray(parcellesRes) ? parcellesRes : []).map((p: ParcelleVerger) => ({ id: p.id, nom: p.nom, usage: p.usage, couches: p.couches ?? [] })))
@@ -559,22 +585,37 @@ export function ArbresTab() {
     return filtered
   }, [selectedType, data, filtreCompletude])
 
+  // QA cmvgddn3l (2026-10-20) — « prunier » en minuscules n'ouvrait que
+  // « Aucun » porte-greffe : la liste, les variétés et l'avertissement de zone
+  // se résolvaient sur le libellé brut alors que la sauvegarde relie la saisie
+  // au catalogue sans tenir compte de la casse ni des accents. Même helper que
+  // POST /api/arbres (`choisirEspeceArbre`), une seule clé pour tout le formulaire.
+  const especeSaisie = newArbre.espece.trim()
+  const especeCle = React.useMemo(() => {
+    if (!especeSaisie) return ""
+    return choisirEspeceArbre(especeSaisie, especesRef, session?.user?.id ?? "").especeId ?? especeSaisie
+  }, [especeSaisie, especesRef, session?.user?.id])
+
   // PROMPT 10 — Charger les porte-greffes adaptés à l'espèce courante du formulaire.
+  // La route résout aussi la saisie (filet pour un référentiel pas encore chargé).
   React.useEffect(() => {
-    if (!newArbre.espece) {
+    if (!especeCle) {
       setPortesGreffeOptions([])
       return
     }
-    fetch(`/api/verger/porte-greffes?especeId=${encodeURIComponent(newArbre.espece)}`)
+    fetch(`/api/verger/porte-greffes?especeId=${encodeURIComponent(especeCle)}`)
       .then((r) => (r.ok ? r.json() : { data: [] }))
       .then((d) => setPortesGreffeOptions(d.data || []))
       .catch(() => setPortesGreffeOptions([]))
-  }, [newArbre.espece])
+  }, [especeCle])
 
   const especeOptions = React.useMemo(() => {
-    const refType = TYPE_TO_REF[newArbre.type]
-    const refEspeces = refType
-      ? especesRef.filter(e => e.type === refType).map(e => e.id)
+    // Même table type d'arbre → catégories d'espèce que la fiche arbre : une
+    // liane (kiwi, vigne) est proposée sous « Liane fruitière », et toujours
+    // sous Fruitier et Petit fruit pour les arbres déjà saisis ainsi.
+    const categories = categoriesEspecePourTypeArbre(newArbre.type)
+    const refEspeces = categories
+      ? especesRef.filter(e => categories.includes(e.type)).map(e => e.id)
       : especesRef.map(e => e.id)
     const userEspeces = data.map(a => a.espece).filter(Boolean) as string[]
     const unique = [...new Set([...refEspeces, ...userEspeces])]
@@ -582,20 +623,23 @@ export function ArbresTab() {
   }, [data, especesRef, newArbre.type])
 
   const varieteOptions = React.useMemo(() => {
-    const refVarietes = newArbre.espece
-      ? varietesRef.filter(v => v.especeId === newArbre.espece).map(v => v.id)
-      : varietesRef.map(v => v.id)
+    // QA 2026-10-19 — une variété personnelle était proposée sous son id
+    // technique (cuid) : on propose son nom, que la matrice de pollinisation
+    // sait relier à la variété (src/lib/verger/variete-arbre.ts).
+    const refVarietes = especeCle
+      ? varietesRef.filter(v => v.especeId === especeCle).map(v => v.libelle)
+      : varietesRef.map(v => v.libelle)
     const userVarietes = data.map(a => a.variete).filter(Boolean) as string[]
     const unique = [...new Set([...refVarietes, ...userVarietes])]
     return unique.sort().map(v => ({ value: v, label: v }))
-  }, [data, varietesRef, newArbre.espece])
+  }, [data, varietesRef, especeCle])
 
   // Avertissement d'adéquation : l'espèce sélectionnée est-elle peu adaptée à la
   // zone de l'utilisateur ? (ex : fruitier à besoin de froid en climat tropical).
   // Non bloquant — le membre peut planter quand même (microclimat d'altitude…).
   const avertissementZone = React.useMemo(() => {
-    if (!newArbre.espece || !userZone) return null
-    const ref = especesRef.find(e => e.id === newArbre.espece)
+    if (!especeCle || !userZone) return null
+    const ref = especesRef.find(e => e.id === especeCle)
     if (!ref) return null
     const { statut, raison } = adequationEspece({
       zonesAdaptees: ref.zonesAdaptees,
@@ -603,10 +647,23 @@ export function ArbresTab() {
       userZone,
     })
     return statut === 'peu_adaptee' ? raison : null
-  }, [newArbre.espece, especesRef, userZone])
+  }, [especeCle, especesRef, userZone])
+
+  // QA 2026-10-19 — un kiwi saisi sous « Petit fruit » restait classé ainsi
+  // sans que rien ne signale sa catégorie au référentiel (liane fruitière).
+  // Seulement entre types fruitiers : un châtaignier planté en forestier ou un
+  // cognassier en haie sont des choix délibérés.
+  const typeConseille = React.useMemo(() => {
+    if (!especeCle || !estTypeArbreFruitier(newArbre.type)) return null
+    // Saisie libre comprise (« kiwi ») : clé résolue comme le rattachement au
+    // catalogue côté serveur (casse, accents et tirets ignorés).
+    const ref = especesRef.find(e => e.id === especeCle)
+    const conseille = typeArbrePourCategorieEspece(ref?.type)
+    return conseille && conseille !== newArbre.type ? conseille : null
+  }, [especeCle, newArbre.type, especesRef])
 
   const fournisseurOptions = React.useMemo(() => {
-    const userFournisseurs = data.map((a: any) => a.fournisseur).filter(Boolean) as string[]
+    const userFournisseurs = data.map((a) => a.fournisseur).filter(Boolean) as string[]
     const unique = [...new Set([...fournisseursRef, ...userFournisseurs])]
     return unique.sort().map(v => ({ value: v, label: v }))
   }, [data, fournisseursRef])
@@ -999,21 +1056,17 @@ export function ArbresTab() {
         open={arbreToDelete !== null}
         onOpenChange={(open) => !open && setArbreToDelete(null)}
         entityLabel={arbreToDelete ? `l'arbre "${arbreToDelete.nom}"` : ""}
-        dependencies={
-          arbreToDelete?._count
-            ? [
-                { label: "récoltes", count: arbreToDelete._count.recoltesArbres },
-                { label: "opérations (taille, traitement, greffe…)", count: arbreToDelete._count.operationsArbres },
-                { label: "observations de santé", count: arbreToDelete._count.observationsSante },
-              ]
-            : []
-        }
-        warning={AVERTISSEMENT_SUPPRESSION_ARBRE}
+        warning={avertissementSuppressionArbre(arbreToDelete)}
         onConfirm={async () => {
           if (!arbreToDelete) return
           try {
             const res = await fetch(`/api/arbres/${arbreToDelete.id}`, { method: "DELETE" })
-            if (!res.ok) throw new Error("delete failed")
+            if (!res.ok) {
+              const payload = await res.json().catch(() => null)
+              toast({ variant: "destructive", title: "Suppression refusée",
+                description: typeof payload?.error === "string" ? payload.error : "La suppression n’a pas pu être effectuée." })
+              return
+            }
             toast({ title: "Arbre supprimé" })
             fetchData()
           } catch {
@@ -1074,7 +1127,7 @@ export function ArbresTab() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {TYPES_ARBRES_FORM.map((t) => (
+                    {TYPES_ARBRE.map((t) => (
                       <SelectItem key={t.value} value={t.value}>
                         {t.label}
                       </SelectItem>
@@ -1110,6 +1163,18 @@ export function ArbresTab() {
                   options={especeOptions}
                   placeholder="Ex : Pommier, Chêne…"
                 />
+                {typeConseille && (
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    Au référentiel, {newArbre.espece} est classé « {libelleTypeArbre(typeConseille)} ».{" "}
+                    <button
+                      type="button"
+                      className="underline text-lime-700 hover:text-lime-800"
+                      onClick={() => setNewArbre((current) => ({ ...current, type: typeConseille ?? current.type }))}
+                    >
+                      Classer en {libelleTypeArbre(typeConseille)}
+                    </button>
+                  </p>
+                )}
                 {avertissementZone && (
                   <p className="mt-1.5 flex items-start gap-1.5 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2 py-1.5">
                     <Snowflake className="h-3.5 w-3.5 mt-0.5 flex-shrink-0 text-amber-500" />
@@ -1138,7 +1203,7 @@ export function ArbresTab() {
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <Label>Date d'achat</Label>
+                <Label>Date d&apos;achat</Label>
                 <Input
                   type="date"
                   name="dateAchat"
@@ -1154,7 +1219,7 @@ export function ArbresTab() {
                 />
               </div>
               <div>
-                <Label>Prix d'achat (EUR)</Label>
+                <Label>Prix d&apos;achat (EUR)</Label>
                 <Input
                   type="number"
                   step="0.01"
@@ -1185,10 +1250,15 @@ export function ArbresTab() {
                   if (value) setNewArbre((current) => (current.datePlantation === value ? current : { ...current, datePlantation: value }))
                 }}
               />
+              {/* Ticket cmvnopnsu — la création génère le calendrier d'entretien
+                  (règle voulue) : on l'annonce avant l'enregistrement. */}
+              {!batchMode && (
+                <p className="mt-1.5 text-xs text-muted-foreground">{AIDE_CALENDRIER_CREATION}</p>
+              )}
             </div>
 
             {/* PROMPT 10 — Spécificités fruitier / agroforesterie */}
-            {(newArbre.type === "fruitier" || newArbre.type === "petit_fruit") && (
+            {estTypeArbreFruitier(newArbre.type) && (
               <div className="space-y-3 rounded-lg border border-rose-200 bg-rose-50/40 p-3">
                 <Label className="text-sm font-medium text-rose-900">Porte-greffe & conduite</Label>
                 <div>
@@ -1373,7 +1443,7 @@ export function ArbresTab() {
               {batchMode && (
                 <>
                   <p className="text-xs text-muted-foreground">
-                    Le champ « Nom » sera ignoré au profit d'un nommage automatique
+                    Le champ « Nom » sera ignoré au profit d&apos;un nommage automatique
                     {' '}<code className="text-[10px]">prefix-01</code>, <code className="text-[10px]">prefix-02</code>…
                   </p>
                   <div className="grid grid-cols-2 gap-3">

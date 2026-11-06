@@ -1,3 +1,6 @@
+import { invalidateKpi } from '@/lib/kpi/cache'
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
 /**
  * API Opérations Arbres
  * GET /api/arbres/operations - Liste des opérations
@@ -8,6 +11,9 @@ import { NextRequest, NextResponse } from "next/server"
 import prisma from "@/lib/prisma"
 import { requireAuthApi } from "@/lib/auth-utils"
 import { createDepenseFromOperationArbre } from "@/lib/auto-compta"
+import { lireAnnee } from "@/lib/api/annee"
+import { whereOperationsArbreAnnee } from "@/lib/verger/annee-operation"
+import { resoudreOperateurExploitation } from "@/lib/tracabilite/operateur-exploitation"
 
 // Types d'opérations
 export const TYPES_OPERATIONS = [
@@ -18,7 +24,9 @@ export const TYPES_OPERATIONS = [
   { value: "autre", label: "Autre" },
 ]
 
-// GET /api/arbres/operations
+// GET /api/arbres/operations?annee=AAAA|all (alias historique : ?year=AAAA)
+// Sans paramètre d'année : toutes les années (Calendrier « à faire », registre
+// phyto, bandeau premiers pas).
 export async function GET(request: NextRequest) {
   const { error, session } = await requireAuthApi()
   if (error) return error
@@ -31,7 +39,7 @@ export async function GET(request: NextRequest) {
     const arbreId = searchParams.get("arbreId")
     const type = searchParams.get("type")
     const fait = searchParams.get("fait")
-    const year = searchParams.get("year")
+    const parametreAnnee = searchParams.has("annee") ? "annee" : searchParams.has("year") ? "year" : null
 
     const where: Record<string, unknown> = { userId }
 
@@ -47,19 +55,14 @@ export async function GET(request: NextRequest) {
       where.fait = fait === "true"
     }
 
-    if (year) {
-      const yearNum = parseInt(year)
-      // Le calendrier positionne les opérations sur `datePrevue || date` :
-      // on filtre donc sur les deux champs (sinon les ops planifiées sur
-      // l'année N avec une `date` sur N-1/N+1 disparaissaient). Borne haute
-      // exclusive (`lt` 1er janvier N+1) pour ne pas exclure le 31 décembre
-      // dès qu'une heure est renseignée.
-      const start = new Date(yearNum, 0, 1)
-      const end = new Date(yearNum + 1, 0, 1)
-      where.OR = [
-        { date: { gte: start, lt: end } },
-        { datePrevue: { gte: start, lt: end } },
-      ]
+    if (parametreAnnee) {
+      // QA 2026-10-19 — une opération appartient à l'année de sa date de
+      // réalisation (faite) ou de sa date prévue (à faire), comme dans la
+      // colonne Date de l'onglet et le calendrier mensuel. Règle unique :
+      // src/lib/verger/annee-operation.ts. L'ancien filtre (date OU date
+      // prévue dans l'année) rangeait une même opération sous deux années.
+      const { annee, toutesAnnees } = lireAnnee(searchParams, parametreAnnee)
+      if (!toutesAnnees) where.AND = [whereOperationsArbreAnnee(annee)]
     }
 
     const operations = await prisma.operationArbre.findMany({
@@ -81,8 +84,10 @@ export async function GET(request: NextRequest) {
       ],
     })
 
+    invalidateKpi(session!.user.id)
     return NextResponse.json(operations)
   } catch (err) {
+    if (err instanceof ErreurReglement) return NextResponse.json({ error: err.message }, { status: err.status })
     console.error("GET /api/arbres/operations error:", err)
     return NextResponse.json(
       { error: "Erreur lors de la récupération des opérations" },
@@ -127,6 +132,13 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    // Revue cmvgeltj1 — l'opérateur désigné sort en Applicateur au registre
+    // phyto : titulaire ou membre de l'exploitation seulement.
+    const operateur = await resoudreOperateurExploitation(userId, body.operateurId)
+    if ("refus" in operateur) {
+      return NextResponse.json({ error: operateur.refus }, { status: 400 })
+    }
+
     const fait = body.fait !== undefined ? Boolean(body.fait) : true
     const datePrevue = body.datePrevue ? new Date(body.datePrevue) : null
     if (datePrevue && Number.isNaN(datePrevue.getTime())) {
@@ -147,7 +159,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Date de réalisation invalide" }, { status: 400 })
     }
 
-    const operation = await prisma.operationArbre.create({
+    const operation = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, userId)
+    const operation = await tx.operationArbre.create({
       data: {
         userId,
         arbreId: body.arbreId,
@@ -166,7 +180,7 @@ export async function POST(request: NextRequest) {
         recurrence: body.recurrence || null,
         saisonRecommandee: body.saisonRecommandee || null,
         // DEV3 #6 — opérateur, temps, météo, matériel
-        operateurId: body.operateurId || null,
+        operateurId: operateur.operateurId,
         tempsHeures: body.tempsHeures != null ? parseFloat(body.tempsHeures) : null,
         temperatureC: body.temperatureC != null ? parseFloat(body.temperatureC) : null,
         ventKmh: body.ventKmh != null ? parseFloat(body.ventKmh) : null,
@@ -186,24 +200,14 @@ export async function POST(request: NextRequest) {
       },
     })
 
-    // Auto-comptabilite : creer une depense si cout > 0
-    if (operation.cout && operation.cout > 0) {
-      try {
-        await createDepenseFromOperationArbre(userId, {
-          id: operation.id,
-          type: operation.type,
-          description: operation.description,
-          cout: operation.cout,
-          date: operation.date,
-          fait: operation.fait,
-        })
-      } catch (autoComptaError) {
-        console.error('Auto-compta error (operation_arbre POST):', autoComptaError)
-      }
-    }
+      await createDepenseFromOperationArbre(userId, operation, tx)
+      return operation
+    })
 
+    invalidateKpi(session!.user.id)
     return NextResponse.json(operation, { status: 201 })
   } catch (err) {
+    if (err instanceof ErreurReglement) return NextResponse.json({ error: err.message }, { status: err.status })
     console.error("POST /api/arbres/operations error:", err)
     return NextResponse.json(
       { error: "Erreur lors de la création de l'opération" },

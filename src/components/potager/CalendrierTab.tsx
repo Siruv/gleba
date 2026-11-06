@@ -383,7 +383,7 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
                   <p className="text-xs leading-relaxed">
                     Cultures actuellement en cours sur vos planches (semées ou plantées, pas
                     encore arrachées). Permet de visualiser l&apos;activité réelle du jardin
-                    par rapport au total enregistré sur l&apos;annee.
+                    par rapport au total enregistré sur l&apos;année.
                   </p>
                 </TooltipContent>
               </Tooltip>
@@ -460,7 +460,7 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
                 <TooltipContent side="bottom" className="max-w-xs text-left">
                   <p className="font-semibold mb-1">Récoltes de l&apos;année</p>
                   <p className="text-xs leading-relaxed">
-                    Cumul de toutes les recoltes enregistrées entre le 1<sup>er</sup> janvier
+                    Cumul de toutes les récoltes enregistrées entre le 1<sup>er</sup> janvier
                     et aujourd&apos;hui. La comparaison vs N-1 indique si la saison est meilleure
                     ou moins bonne que l&apos;an dernier à la même date.
                   </p>
@@ -642,7 +642,7 @@ export function CalendrierTab({ year }: CalendrierTabProps) {
                 : weekOffset === 1
                   ? "Semaine prochaine"
                   : weekOffset === -1
-                    ? "Semaine derniere"
+                    ? "Semaine dernière"
                     : format(weekStart, "d MMM", { locale: fr }) +
                       " - " +
                       format(weekEnd, "d MMM", { locale: fr })}

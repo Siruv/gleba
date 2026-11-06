@@ -7,7 +7,6 @@
 
 import * as React from "react"
 import Link from "next/link"
-import Image from "next/image"
 import { getAvailableYears } from "@/components/year-selector"
 import { useSession } from "next-auth/react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -15,7 +14,7 @@ import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { UserMenu } from "@/components/auth/UserMenu"
+import { AppHeader } from "@/components/shell/AppHeader"
 import {
   BarChart,
   Bar,
@@ -33,8 +32,6 @@ import {
   Sprout,
   TreeDeciduous,
   Bird,
-  Settings,
-  Wallet,
   Calendar,
   TrendingUp,
   TrendingDown,
@@ -118,8 +115,11 @@ interface Totaux {
   coutMainOeuvre: number
   margeBrute: number
   margePercent: number
+  /** Part en kilos seulement : afficher `productionParUnite` (QA cmvge3bqj). */
   production: number
   productionParUnite?: QuantiteParUnite
+  /** Production hors espèces du potager (verger), ventilée par unité. */
+  productionHorsEspecesParUnite?: QuantiteParUnite
   surface: number
   heuresTravaillees: number
   nbEspeces: number
@@ -231,7 +231,6 @@ export default function CoutsProductionPage() {
   }, [yearHydrated, selectedYear])
 
   // QA Camille 2026-05-15 — bonus : plage factorisée [N+1 … N-4]
-  const currentYear = new Date().getFullYear()
   const availableYears = getAvailableYears()
 
   // Fetch data
@@ -346,54 +345,7 @@ export default function CoutsProductionPage() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 via-slate-50 to-slate-50">
       {/* Header */}
-      <header className="border-b border-b-2 border-b-blue-500 bg-white/80 backdrop-blur-sm sticky top-0 z-50">
-        <div className="container mx-auto px-4 py-3 flex items-center justify-between max-w-[1600px]">
-          <Link href="/" className="flex items-center hover:opacity-90 transition-opacity">
-            <Image
-              src="/gleba-logo.png"
-              alt="Gleba"
-              width={150}
-              height={100}
-              className="h-10 w-auto rounded-lg"
-              priority
-            />
-          </Link>
-          <div className="flex items-center gap-2">
-            <div className="flex items-center border rounded-lg overflow-hidden">
-              <Link href="/">
-                <Button variant="ghost" size="sm" className="rounded-none text-green-700 hover:text-green-800 hover:bg-green-50 border-r">
-                  <Sprout className="h-4 w-4 mr-1" />
-                  <span className="hidden sm:inline">Maraîchage</span>
-                </Button>
-              </Link>
-              <Link href="/verger">
-                <Button variant="ghost" size="sm" className="rounded-none text-lime-700 hover:text-lime-800 hover:bg-lime-50 border-r">
-                  <TreeDeciduous className="h-4 w-4 mr-1" />
-                  <span className="hidden sm:inline">Verger</span>
-                </Button>
-              </Link>
-              <Link href="/elevage">
-                <Button variant="ghost" size="sm" className="rounded-none text-amber-700 hover:text-amber-800 hover:bg-amber-50 border-r">
-                  <Bird className="h-4 w-4 mr-1" />
-                  <span className="hidden sm:inline">Élevage</span>
-                </Button>
-              </Link>
-              <Link href="/comptabilite">
-                <Button variant="ghost" size="sm" className="rounded-none bg-blue-50 text-blue-700">
-                  <Wallet className="h-4 w-4 mr-1" />
-                  <span className="hidden sm:inline">Compta</span>
-                </Button>
-              </Link>
-            </div>
-            <Link href="/parametres">
-              <Button variant="ghost" size="sm">
-                <Settings className="h-4 w-4" />
-              </Button>
-            </Link>
-            {session?.user && <UserMenu user={session.user} />}
-          </div>
-        </div>
-      </header>
+      <AppHeader current="comptabilite" />
 
       <main className="container mx-auto px-4 py-8 max-w-[1600px]">
         {/* Title + Back + Year selector */}
@@ -661,7 +613,7 @@ export default function CoutsProductionPage() {
                             <div className="p-4">
                               <div className="flex items-center justify-between mb-3">
                                 <h3 className="text-sm font-semibold text-teal-800">
-                                  Detail des cultures - {espece.especeNom ?? espece.especeId}
+                                  Détail des cultures - {espece.especeNom ?? espece.especeId}
                                 </h3>
                                 <Button
                                   variant="ghost"
@@ -757,7 +709,11 @@ export default function CoutsProductionPage() {
                         <span className="text-xs text-muted-foreground ml-2 font-normal">({data.totauxEspeces.nbCultures} cultures)</span>
                       </TableCell>
                       <TableCell className="text-right">{formatNumber(data.totauxEspeces.surface)}</TableCell>
-                      <TableCell className="text-right">{formatNumber(data.totauxEspeces.production)}</TableCell>
+                      <TableCell className="text-right">
+                        {data.totauxEspeces.productionParUnite
+                          ? formatQuantiteParUnite(data.totauxEspeces.productionParUnite)
+                          : formatNumber(data.totauxEspeces.production)}
+                      </TableCell>
                       <TableCell className="text-right">
                         {data.totauxEspeces.surface > 0 ? formatNumber(data.totauxEspeces.production / data.totauxEspeces.surface, 2) : "-"}
                       </TableCell>
@@ -792,7 +748,9 @@ export default function CoutsProductionPage() {
                       </TableCell>
                       <TableCell className="text-right">-</TableCell>
                       <TableCell className="text-right">
-                        {formatNumber(Math.round((data.totaux.production - data.totauxEspeces.production) * 100) / 100)}
+                        {data.totaux.productionHorsEspecesParUnite
+                          ? formatQuantiteParUnite(data.totaux.productionHorsEspecesParUnite)
+                          : formatNumber(Math.round((data.totaux.production - data.totauxEspeces.production) * 100) / 100)}
                       </TableCell>
                       <TableCell className="text-right">-</TableCell>
                       <TableCell className="text-right">
@@ -833,7 +791,12 @@ export default function CoutsProductionPage() {
                         </span>
                       </TableCell>
                       <TableCell className="text-right">{formatNumber(data.totaux.surface)}</TableCell>
-                      <TableCell className="text-right">{formatNumber(data.totaux.production)}</TableCell>
+                      {/* QA cmvge3bqj — les tiges ne s'additionnent pas aux kilos. */}
+                      <TableCell className="text-right">
+                        {data.totaux.productionParUnite
+                          ? formatQuantiteParUnite(data.totaux.productionParUnite)
+                          : formatNumber(data.totaux.production)}
+                      </TableCell>
                       <TableCell className="text-right">-</TableCell>
                       <TableCell className="text-right text-green-600">{formatEuro(data.totaux.revenus)}</TableCell>
                       <TableCell className="text-right text-red-600">{formatEuro(data.totaux.coutTotal)}</TableCell>

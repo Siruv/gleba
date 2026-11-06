@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { especeBaseId, especeBaseLabel, listEspecesBasePresentes, naitParEclosion } from "../espece-base"
+import { cleFiltreEspece, especeBaseId, especeBaseLabel, libelleEspeceAnimale, libellePetit, listEspecesBasePresentes, naitParEclosion } from "../espece-base"
 
 describe("especeBaseId", () => {
   it("extrait l'espèce avant '_'", () => {
@@ -11,6 +11,12 @@ describe("especeBaseId", () => {
 
   it("retombe sur l'id si pas de séparateur", () => {
     expect(especeBaseId("abeille")).toBe("abeille")
+  })
+
+  it("conserve l'identité de deux profils personnels au même préfixe inconnu", () => {
+    expect(especeBaseId("ferme_canard")).toBe("ferme_canard")
+    expect(especeBaseId("ferme_poule")).toBe("ferme_poule")
+    expect(especeBaseId("constructor_profil")).toBe("constructor_profil")
   })
 })
 
@@ -69,6 +75,7 @@ describe("naitParEclosion (ticket cmv292a85)", () => {
   it("un lot de poules pondeuses, sans durée de couvaison transmise, éclot", () => {
     expect(naitParEclosion({ id: "poule_pondeuse" })).toBe(true)
     expect(naitParEclosion({ id: "Poule" })).toBe(true)
+    expect(naitParEclosion({ id: "Poule_Sussex" })).toBe(true)
     expect(naitParEclosion({ id: "canard_coureur" })).toBe(true)
   })
 
@@ -84,5 +91,107 @@ describe("naitParEclosion (ticket cmv292a85)", () => {
   it("sans espèce, pas d'éclosion", () => {
     expect(naitParEclosion(null)).toBe(false)
     expect(naitParEclosion(undefined)).toBe(false)
+  })
+})
+
+// Ticket cmvnookz7 (QA 2026-10-25) — profil perso « v8-Julien canard 25 octobre »
+// (Volaille, Mixte), id `v8_julien_canard_25_octobre` : la colonne Espèce de
+// la liste des lots affichait « v8 » (premier segment de l'id), le formulaire
+// de ponte le nom complet.
+describe("libelleEspeceAnimale (ticket cmvnookz7)", () => {
+  const profilJulien = { id: "v8_julien_canard_25_octobre", nom: "v8-Julien canard 25 octobre" }
+
+  it("un profil perso hors catalogue s'affiche sous son nom complet", () => {
+    expect(libelleEspeceAnimale(profilJulien)).toBe("v8-Julien canard 25 octobre")
+    expect(libelleEspeceAnimale({ id: "yak_himalaya", nom: "Yak de l'Himalaya" })).toBe("Yak de l'Himalaya")
+  })
+
+  it("une espèce du catalogue garde son espèce de base (la race a sa colonne)", () => {
+    expect(libelleEspeceAnimale({ id: "poule_sussex", nom: "Poule Sussex" })).toBe("Poule")
+    expect(libelleEspeceAnimale({ id: "chevre_alpine", nom: "Chèvre Alpine" })).toBe("Chèvre")
+    expect(libelleEspeceAnimale({ id: "canard_barbarie_maison", nom: "Canard de Barbarie maison" })).toBe("Canard")
+  })
+
+  it("sans nom, retombe sur le premier segment de l'id", () => {
+    expect(libelleEspeceAnimale({ id: "yak_himalaya" })).toBe("yak")
+    expect(libelleEspeceAnimale({ id: "yak_himalaya", nom: "  " })).toBe("yak")
+  })
+
+  it("le filtre Espèce libelle le profil perso par son nom complet", () => {
+    const result = listEspecesBasePresentes([
+      { especeAnimaleId: profilJulien.id, especeNom: profilJulien.nom },
+      { especeAnimaleId: "poule_marans", especeNom: "Poule Marans" },
+    ])
+    expect(result).toEqual([
+      { id: "poule", label: "Poule" },
+      { id: "v8_julien_canard_25_octobre", label: "v8-Julien canard 25 octobre" },
+    ])
+  })
+
+  // Revue du ticket : deux profils perso au même premier mot fusionnaient
+  // sous la base « mes » et le libellé ne nommait que le premier.
+  it("deux profils perso au même premier mot restent deux entrées du filtre", () => {
+    const result = listEspecesBasePresentes([
+      { especeAnimaleId: "mes_poules", especeNom: "Mes poules" },
+      { especeAnimaleId: "mes_canards", especeNom: "Mes canards" },
+      { especeAnimaleId: "mes_poules", especeNom: "Mes poules" },
+    ])
+    expect(result).toEqual([
+      { id: "mes_canards", label: "Mes canards" },
+      { id: "mes_poules", label: "Mes poules" },
+    ])
+  })
+
+  it("la clé du filtre (option et ligne) : espèce de base connue, sinon id complet du profil", () => {
+    expect(cleFiltreEspece("poule_sussex")).toBe("poule")
+    expect(cleFiltreEspece("poule_marans")).toBe("poule")
+    expect(cleFiltreEspece("mes_poules")).toBe("mes_poules")
+    expect(cleFiltreEspece("mes_canards")).toBe("mes_canards")
+    expect(cleFiltreEspece("constructor_x")).toBe("constructor_x")
+    expect(libelleEspeceAnimale({ id: "constructor_x", nom: "Profil x" })).toBe("Profil x")
+  })
+})
+
+// Relecture de la PR #47 (2026-11-03) : l'identifiant d'un profil personnel
+// vient du nom saisi (« Poules pondeuses » → `poules_pondeuses`). Seul un
+// préfixe connu groupe les profils : il doit l'être aussi au pluriel.
+describe("profils nommés au pluriel", () => {
+  it.each([
+    ["poules_pondeuses", "poules_marans", "poule"],
+    ["poules_pondeuses", "poule_marans", "poule"],
+    ["chevres_alpines", "chevres_saanen", "chevre"],
+    ["vaches_laitieres", "vache_charolaise", "vache"],
+    ["moutons_ouessant", "moutons_solognots", "mouton"],
+    ["veaux_lait", "veau_sous_mere", "veau"],
+    ["chevaux_trait", "cheval_selle", "cheval"],
+    ["Poules_Sussex", "poule_marans", "poule"],
+  ])("%s et %s sont la même espèce (%s)", (a, b, base) => {
+    expect(especeBaseId(a)).toBe(base)
+    expect(especeBaseId(b)).toBe(base)
+    expect(cleFiltreEspece(a)).toBe(cleFiltreEspece(b))
+  })
+
+  it("garde les espèces dont le singulier finit déjà par s", () => {
+    expect(especeBaseId("brebis_solognote")).toBe("brebis")
+    expect(especeBaseId("souris_blanche")).toBe("souris")
+  })
+
+  it("ne regroupe toujours pas deux profils dont le premier mot est inconnu", () => {
+    expect(especeBaseId("mes_poules")).toBe("mes_poules")
+    expect(especeBaseId("mes_canards")).toBe("mes_canards")
+    expect(especeBaseId("fermes_canard")).toBe("fermes_canard")
+    expect(especeBaseId("constructors_profil")).toBe("constructors_profil")
+    expect(especeBaseId("tostrings_profil")).toBe("tostrings_profil")
+  })
+
+  it("affiche l'espèce de base, le petit et l'éclosion d'un profil au pluriel", () => {
+    expect(libelleEspeceAnimale({ id: "poules_pondeuses", nom: "Poules pondeuses" })).toBe("Poule")
+    expect(especeBaseLabel("chevres_alpines")).toBe("Chèvre")
+    expect(especeBaseLabel("moutons_ouessant")).toBe("Mouton")
+    expect(libellePetit("chevres_alpines")).toEqual({ s: "chevreau / cabri", p: "chevreaux / cabris" })
+    expect(libellePetit("moutons_ouessant").s).toBe("agneau")
+    expect(naitParEclosion({ id: "poules_pondeuses" })).toBe(true)
+    expect(naitParEclosion({ id: "canards_coureurs" })).toBe(true)
+    expect(naitParEclosion({ id: "chevres_alpines" })).toBe(false)
   })
 })

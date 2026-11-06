@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { PageEntete, ConteneurPage } from "@/components/shell/PageEntete"
 import Link from "next/link"
 import { useSearchParams } from "next/navigation"
 import { updateDashboardSearchParams } from "@/lib/dashboard-navigation"
@@ -32,6 +33,8 @@ import { AssistantPlantationDialog } from "@/components/verger/AssistantPlantati
 import { TourVerger } from "@/components/tours/tour-verger"
 import { PremiersPasBanner } from "@/components/premiers-pas-banner"
 import { getAvailableYears } from "@/components/year-selector"
+import { useAnneeModule } from "@/hooks/use-annee-module"
+import { CLE_ANNEE_VERGER, ongletVergerSuitAnnee } from "@/lib/verger/annee-verger"
 
 const TABS = [
   { id: "calendrier", label: "Calendrier", icon: Calendar, shortLabel: "Calendrier" },
@@ -47,7 +50,6 @@ const TABS = [
 type TabId = (typeof TABS)[number]["id"]
 
 // QA Camille 2026-05-15 — bonus : plage factorisée [N+1 … N-4]
-const currentYearNow = new Date().getFullYear()
 const availableYears = getAvailableYears()
 
 export default function VergerPage() {
@@ -60,28 +62,18 @@ export default function VergerPage() {
 
 function VergerPageInner() {
   const searchParams = useSearchParams()
-  const [selectedYear, setSelectedYear] = React.useState(currentYearNow)
-  // QA cmsogh2sw — l'année du verger revenait à l'année courante à chaque
-  // reload alors que compta (gleba_compta_year) et élevage (gleba_elevage_year)
-  // la persistent. Même pattern exact que la compta : lecture au montage
-  // (client-only), puis persistance des seuls changements réels.
-  // QA cmsoamukd — state et non ref : le fetch du montage attend l'hydratation
-  // (sinon la salve « année par défaut » peut écraser celle de l'année choisie).
-  const [yearHydrated, setYearHydrated] = React.useState(false)
-  React.useEffect(() => {
-    const stored = window.localStorage.getItem("gleba_verger_year")
-    if (stored && /^\d{4}$/.test(stored)) {
-      const y = parseInt(stored, 10)
-      if (y !== selectedYear) setSelectedYear(y)
-    }
-    setYearHydrated(true)
-    // Montage uniquement : lecture initiale de la préférence.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-  React.useEffect(() => {
-    // Ne persiste qu'après la lecture initiale, sinon le fallback écrase la préférence.
-    if (yearHydrated) window.localStorage.setItem("gleba_verger_year", String(selectedYear))
-  }, [yearHydrated, selectedYear])
+  // QA cmsogh2sw — l'année du verger survit au rechargement (préférence
+  // gleba_verger_year). QA cmsoamukd — les onglets attendent la restauration
+  // (`yearHydrated`) avant de charger, sinon la salve « année par défaut »
+  // écrase celle de l'année choisie.
+  // QA 2026-10-19 — l'année vit désormais dans l'URL (`?annee=`, deep-link)
+  // et filtre réellement les onglets qui en dépendent (Calendrier,
+  // Opérations) ; les autres l'annoncent « Toutes années » (annee-verger.ts).
+  const {
+    annee: selectedYear,
+    definirAnnee,
+    pret: yearHydrated,
+  } = useAnneeModule({ cleStockage: CLE_ANNEE_VERGER, annees: availableYears })
   const [showChat, setShowChat] = React.useState(false)
   const [isChatExpanded, setIsChatExpanded] = React.useState(false)
   const [showAssistant, setShowAssistant] = React.useState(false)
@@ -143,12 +135,7 @@ function VergerPageInner() {
 
       {/* Shell partagé (palier 2) : header global + barre d'onglets communs */}
       <AppHeader current="verger" showLune />
-      <ModuleTabBar
-        tabs={TABS}
-        activeTab={activeTab}
-        onTabChange={(tab) => setActiveTab(tab as TabId)}
-        accent="lime"
-        actions={
+      <PageEntete id="verger" actions={
           <>
             <Button
               size="sm"
@@ -157,12 +144,12 @@ function VergerPageInner() {
               title="Assistant Plantation"
             >
               <Wand2 className="h-4 w-4 mr-1" />
-              <span className="hidden sm:inline">Plantation</span>
+              <span>Plantation</span>
             </Button>
             <Link href="/jardin?usage=verger">
               <Button variant="outline" size="sm" className="text-teal-700 border-teal-300 hover:bg-teal-50">
                 <MapIcon className="h-4 w-4 mr-1" />
-                <span className="hidden sm:inline">Plan</span>
+                <span>Plan</span>
               </Button>
             </Link>
             <Button
@@ -173,38 +160,57 @@ function VergerPageInner() {
               title="Assistant IA"
             >
               <Bot className="h-4 w-4 mr-1" />
-              <span className="hidden sm:inline">IA</span>
+              <span>IA</span>
             </Button>
             <Link href="/parcelles">
               <Button variant="outline" size="sm" className="text-purple-700 border-purple-300 hover:bg-purple-50">
                 <MapIcon className="h-4 w-4 mr-1" />
-                <span className="hidden sm:inline">Parcelles</span>
+                <span>Parcelles</span>
               </Button>
             </Link>
-            <Select
-              value={selectedYear.toString()}
-              onValueChange={(value) => setSelectedYear(parseInt(value))}
-            >
-              <SelectTrigger className="w-[100px] h-8">
-                <Calendar className="h-3.5 w-3.5 mr-1 text-muted-foreground" />
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {availableYears.map((year) => (
-                  <SelectItem key={year} value={year.toString()}>
-                    {year}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {ongletVergerSuitAnnee(activeTab) ? (
+              <Select
+                value={selectedYear.toString()}
+                onValueChange={(value) => definirAnnee(parseInt(value, 10))}
+              >
+                <SelectTrigger className="w-[100px] h-8" aria-label="Année affichée">
+                  <Calendar className="h-3.5 w-3.5 mr-1 text-muted-foreground" />
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {availableYears.map((year) => (
+                    <SelectItem key={year} value={year.toString()}>
+                      {year}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : (
+              // QA 2026-10-19 — un sélecteur sans effet sur l'onglet affiché
+              // laissait croire à un filtre : la portée est dite.
+              <span
+                className="inline-flex h-8 items-center gap-1 rounded-md border border-dashed px-2 text-xs text-muted-foreground"
+                title="Cet onglet couvre toutes les années ; le sélecteur d'année s'applique au Calendrier et aux Opérations."
+                data-testid="verger-portee-annee"
+              >
+                <Calendar className="h-3.5 w-3.5" />
+                Toutes années
+              </span>
+            )}
           </>
-        }
+        } />
+      <ModuleTabBar
+        tabs={TABS}
+        activeTab={activeTab}
+        onTabChange={(tab) => setActiveTab(tab as TabId)}
+        accent="lime"
+
       />
 
       {/* POSTREVIEW Sprint 6 — Tour Shepherd.js Verger */}
       <TourVerger />
       {/* Contenu de l'onglet actif */}
-      <main className="container mx-auto px-4 py-6 max-w-[1600px] space-y-4">
+      <ConteneurPage className="space-y-4 py-6">
         {activeTab === "calendrier" && <PremiersPasBanner module="verger" />}
         {/* QA cmsogh2sw — garde d'hydratation : ne pas monter le calendrier
             avant la lecture de gleba_verger_year, sinon il fetche l'année par
@@ -213,10 +219,10 @@ function VergerPageInner() {
         {activeTab === "plantations" && <PlantationsTab />}
         {activeTab === "arbres" && <ArbresTab />}
         {activeTab === "productions" && <ProductionsTab />}
-        {activeTab === "operations" && <OperationsTab />}
+        {activeTab === "operations" && yearHydrated && <OperationsTab annee={selectedYear} />}
         {activeTab === "sante" && <SanteTab />}
         {activeTab === "referentiel" && <ReferentielTab />}
-      </main>
+      </ConteneurPage>
 
       {/* Assistant Plantation (accessible depuis le header) */}
       <AssistantPlantationDialog

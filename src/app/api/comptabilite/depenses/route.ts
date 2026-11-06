@@ -7,7 +7,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { enrichirLignesReglements } from '@/lib/comptabilite/projection-reglements'
 import { MODULES_COMPTA, bucketModuleCompta, ventilerParModule } from '@/lib/comptabilite/modules'
+import { chargerSuiviDesDepenses } from '@/lib/comptabilite/suivi-ecriture'
 
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
@@ -16,7 +18,7 @@ export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
     const year = searchParams.get('year') ? parseInt(searchParams.get('year')!) : new Date().getFullYear()
-    const module = searchParams.get('module')
+    const moduleDemande = searchParams.get('module')
     const limit = parseInt(searchParams.get('limit') || '200')
 
     const userId = session.user.id
@@ -32,6 +34,7 @@ export async function GET(request: NextRequest) {
       achatsLots,
       achatsAnimaux,
       achatsArbres,
+      campagnes,
       interventions,
       depensesManuelles,
     ] = await Promise.all([
@@ -133,7 +136,8 @@ export async function GET(request: NextRequest) {
         },
       }),
 
-      // Arbre (achats)
+      // Arbre (achats) : même date que son miroir comptable (achat, sinon
+      // plantation, sinon création) ; sans date, il manquait à la liste.
       prisma.arbre.findMany({
         where: {
           userId,
@@ -141,11 +145,19 @@ export async function GET(request: NextRequest) {
           OR: [
             { dateAchat: { gte: startOfYear, lte: endOfYear } },
             { datePlantation: { gte: startOfYear, lte: endOfYear }, dateAchat: null },
+            { dateAchat: null, datePlantation: null, createdAt: { gte: startOfYear, lte: endOfYear } },
           ],
         },
         orderBy: { dateAchat: 'desc' },
       }),
 
+      prisma.campagnePlantation.findMany({
+        where: { userId, coutReel: { gt: 0 }, OR: [
+          { datePlantationReelle: { gte: startOfYear, lte: endOfYear } },
+          { datePlantationReelle: null, datePlantationPrevue: { gte: startOfYear, lte: endOfYear } },
+          { datePlantationReelle: null, datePlantationPrevue: null, createdAt: { gte: startOfYear, lte: endOfYear } },
+        ] },
+      }),
       // Intervention (travaux culturaux : intrants + main d'oeuvre)
       // Ticket cmsx69cuc — cette source manquait à la liste. Son miroir
       // comptable (DepenseManuelle auto, sourceType='intervention') est exclu
@@ -209,6 +221,9 @@ export async function GET(request: NextRequest) {
       fournisseur: string | null
       paye: boolean | null
       categorie: string
+      modeReglement?: string | null
+      numeroPiece?: string | null
+      tauxTVA?: number | null
       comptable: boolean
     }
 
@@ -372,6 +387,13 @@ export async function GET(request: NextRequest) {
       })
     })
 
+    campagnes.forEach(c => expenses.push({
+      id: `campagne-${c.id}`, source: 'CampagnePlantation', sourceId: c.id, module: 'verger',
+      date: (c.datePlantationReelle ?? c.datePlantationPrevue ?? c.createdAt).toISOString(),
+      description: `Campagne de plantation - ${c.nom}`, quantite: null, unite: null, prixUnitaire: null,
+      montant: c.coutReel ?? 0, fournisseur: c.pepiniere, paye: null, categorie: 'Plantations', comptable: true,
+    }))
+
     // Intervention -> dépenses (miroir de createDepenseFromIntervention :
     // même montant, même module, même règle « comptable »).
     interventions.forEach(i => {
@@ -420,6 +442,9 @@ export async function GET(request: NextRequest) {
         montant: d.montant,
         fournisseur: d.fournisseurNom,
         paye: d.paye,
+        modeReglement: d.modeReglement ?? null,
+        numeroPiece: d.numeroPiece ?? null,
+        tauxTVA: d.tauxTVA ?? null,
         categorie: d.categorie === 'materiel' ? 'Matériel' :
                    d.categorie === 'carburant' ? 'Carburant' :
                    d.categorie === 'main_oeuvre' ? 'Main d\'oeuvre' :
@@ -434,18 +459,20 @@ export async function GET(request: NextRequest) {
     // carte annoncerait un montant que le filtre ne sait pas montrer. Un
     // module hors des quatre postes (ex. `boutique`) reste filtré à l'exact.
     let filtered = expenses
-    if (module) {
-      const demande = module.trim().toLowerCase()
+    if (moduleDemande) {
+      const demande = moduleDemande.trim().toLowerCase()
       filtered = (MODULES_COMPTA as readonly string[]).includes(demande)
         ? expenses.filter(e => bucketModuleCompta(e.module) === demande)
-        : expenses.filter(e => e.module === module)
+        : expenses.filter(e => e.module === moduleDemande)
     }
 
     // Trier par date décroissante
     filtered.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
 
     // Limiter
-    const limited = filtered.slice(0, limit)
+    const page = filtered.slice(0, limit)
+    const suivi = await chargerSuiviDesDepenses(userId, page)
+    const limited = await enrichirLignesReglements(userId, 'depense', page.map((d) => ({ ...d, ...suivi.get(d.id) })), depensesManuelles)
 
     // Calculer les stats
     const comptables = filtered.filter((e) => e.comptable)
@@ -471,7 +498,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       data: limited,
       stats,
-      meta: { year, module, total: filtered.length },
+      meta: { year, module: moduleDemande, total: filtered.length },
     })
   } catch (error) {
     console.error('GET /api/comptabilite/depenses error:', error)

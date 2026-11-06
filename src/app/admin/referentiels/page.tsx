@@ -16,14 +16,12 @@ import {
   Upload,
   Database,
   Loader2,
-  CheckCircle,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { useToast } from "@/hooks/use-toast"
-import { Skeleton } from "@/components/ui/skeleton"
 import { todayLocalISO } from '@/lib/format-utils'
 
 const REFERENTIELS = [
@@ -91,7 +89,7 @@ export default function ReferentielsAdminPage() {
         title: "Export réussi",
         description: `${type} exporté`,
       })
-    } catch (error) {
+    } catch {
       toast({
         variant: "destructive",
         title: "Erreur",
@@ -190,11 +188,15 @@ export default function ReferentielsAdminPage() {
       </header>
 
       <main className="container mx-auto px-4 py-6 max-w-[1200px]">
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-lin bg-craie p-4">
+          <div><h2 className="font-medium text-foret">Contributions à l’encyclopédie</h2><p className="text-sm text-ardoise">Relire les textes et leurs sources avant de publier une nouvelle version.</p></div>
+          <Button asChild><Link href="/admin/referentiel/contributions">Relire les propositions</Link></Button>
+        </div>
         {/* Info */}
         <div className="mb-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
           <p className="text-sm text-yellow-800">
             <strong>⚠️ Attention :</strong> Ces référentiels sont partagés entre TOUS les utilisateurs.
-            Les modifications affecteront l'ensemble de l'application.
+            Les modifications affecteront l&apos;ensemble de l&apos;application.
           </p>
         </div>
 

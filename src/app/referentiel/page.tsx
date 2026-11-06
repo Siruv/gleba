@@ -2,11 +2,12 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { BookOpen, ChevronRight, Globe2, Leaf, MapPin, Search, Sprout, TreeDeciduous } from "lucide-react";
 
-import { MarketingShell } from "@/components/seo/MarketingShell";
+import { ReferentielShell } from "@/components/referentiel/ReferentielShell";
 import prisma from "@/lib/prisma";
 import { nomPublic, originePublique, visibiliteEnfantPublic, visibiliteReferentielPublic } from "@/lib/referentiel-public";
 import { ESPECE_TYPES, estTypeVerger, libelleTypeEspece } from "@/lib/validations/espece";
 import { ogBase } from "@/lib/seo/og";
+import { valeurRenseignee } from "@/lib/referentiel-valeur";
 
 export const dynamic = "force-dynamic";
 
@@ -108,7 +109,7 @@ export default async function ReferentielPage({ searchParams }: PageProps) {
   ]);
 
   return (
-    <MarketingShell>
+    <ReferentielShell>
       <section className="px-4 pb-10 pt-8 sm:px-6 sm:pt-14">
         <div className="mx-auto max-w-6xl">
           <div className="max-w-3xl">
@@ -170,7 +171,7 @@ export default async function ReferentielPage({ searchParams }: PageProps) {
                     </div>
                     <h2 className="mt-4 text-xl font-semibold text-slate-900 group-hover:text-emerald-800">{name}</h2>
                     <p className="mt-1 min-h-5 text-sm italic text-slate-500">{espece.nomLatin || TYPE_LABELS[espece.type] || espece.type}</p>
-                    <p className="mt-3 line-clamp-2 min-h-10 text-sm leading-5 text-slate-600">{espece.description || `${TYPE_LABELS[espece.type] || "Végétal"} du référentiel agricole Gleba.`}</p>
+                    <p className="mt-3 line-clamp-2 min-h-10 text-sm leading-5 text-slate-600">{valeurRenseignee(espece.description) ?? `${TYPE_LABELS[espece.type] || "Végétal"} du référentiel agricole Gleba.`}</p>
                     <div className="mt-4 flex items-center gap-3 border-t border-slate-100 pt-4 text-xs text-slate-500">
                       <span>{espece._count.varietes} variété{espece._count.varietes > 1 ? "s" : ""}</span>
                       <span>{espece._count.itps} ITP</span>
@@ -189,7 +190,7 @@ export default async function ReferentielPage({ searchParams }: PageProps) {
           </div>
         </div>
       </section>
-    </MarketingShell>
+    </ReferentielShell>
   );
 }
 

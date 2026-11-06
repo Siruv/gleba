@@ -7,7 +7,7 @@ import prisma from "@/lib/prisma"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import Link from "next/link"
-import { Users, UserPlus, Shield, Activity, Database, MessageSquare, Bug, TrendingUp, Flag, Bell, ShieldAlert, Bot } from "lucide-react"
+import { Users, UserPlus, Shield, Activity, Database, MessageSquare, Bug, TrendingUp, Flag, Bell, ShieldAlert, Bot, FileSpreadsheet } from "lucide-react"
 import { AdminTabs } from "@/components/admin/AdminTabs"
 
 export default async function AdminPage() {
@@ -21,7 +21,7 @@ export default async function AdminPage() {
     prisma.bugReport.count({ where: { status: { in: ["OPEN", "IN_PROGRESS"] } } }),
   ])
 
-  // Derniers utilisateurs crees
+  // Derniers utilisateurs créés
   const recentUsers = await prisma.user.findMany({
     orderBy: { createdAt: "desc" },
     take: 5,
@@ -86,7 +86,7 @@ export default async function AdminPage() {
             </CardHeader>
             <CardContent>
               <p className="text-sm text-muted-foreground">
-                Systeme operationnel
+                Système opérationnel
               </p>
             </CardContent>
           </Card>
@@ -101,7 +101,7 @@ export default async function AdminPage() {
                 Gestion des utilisateurs
               </CardTitle>
               <CardDescription>
-                Gerer les comptes utilisateurs
+                Gérer les comptes utilisateurs
               </CardDescription>
             </CardHeader>
             <CardContent className="flex gap-2">
@@ -248,6 +248,26 @@ export default async function AdminPage() {
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
+                <FileSpreadsheet className="h-5 w-5 text-emerald-700" />
+                Imports de relevés
+              </CardTitle>
+              <CardDescription>
+                Relevés CSV importés ou refusés, fichiers gardés 30 jours pour les rejouer
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Link href="/admin/imports-releve">
+                <Button variant="outline" className="w-full">
+                  <FileSpreadsheet className="mr-2 h-4 w-4" />
+                  Tentatives d’import
+                </Button>
+              </Link>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
                 <Flag className="h-5 w-5 text-orange-600" />
                 Signalements
               </CardTitle>
@@ -289,10 +309,10 @@ export default async function AdminPage() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <Activity className="h-5 w-5" />
-                Activite recente
+                Activité récente
               </CardTitle>
               <CardDescription>
-                Derniers utilisateurs crees
+                Derniers utilisateurs créés
               </CardDescription>
             </CardHeader>
             <CardContent>

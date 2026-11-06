@@ -55,11 +55,30 @@ interface Stats {
     depensesSsot: number
     depensesSommeModules: number
     depensesEcart: number
-    /** QA cmsw9dcrd — Σ avoirs de l'exercice, pour nommer l'écart connu. */
+    /** QA cmsw9dcrd — Σ avoirs de l'exercice. */
     avoirsExercice?: number
+    /** Ticket cmvflua2x — d'où vient le total des revenus (somme = revenusSsot). */
+    revenusComposition?: {
+      ventes: number
+      facturesRattachees: number
+      facturesSansVente: number
+      avoirs: number
+    }
     /** Ticket cmsx69cuc — Σ des coûts analytiques (soins, aliments, fertilisation). */
     depensesAnalytiques?: number
   }
+}
+
+/** Ligne de GET /api/comptabilite/revenus ou /depenses, telle qu'exportée en CSV. */
+interface LigneTransaction {
+  date: string
+  module: string
+  categorie: string
+  description: string
+  montant: number
+  client?: string | null
+  fournisseur?: string | null
+  paye: boolean | null
 }
 
 interface ChartData {
@@ -189,8 +208,8 @@ export default function RapportsPage() {
     if (yearHydrated) window.localStorage.setItem("gleba_compta_year", String(selectedYear))
   }, [yearHydrated, selectedYear])
   const [charts, setCharts] = React.useState<ChartData | null>(null)
-  const [revenus, setRevenus] = React.useState<any[]>([])
-  const [depenses, setDepenses] = React.useState<any[]>([])
+  const [revenus, setRevenus] = React.useState<LigneTransaction[]>([])
+  const [depenses, setDepenses] = React.useState<LigneTransaction[]>([])
   const [tvaData, setTvaData] = React.useState<TVAData | null>(null)
   const [selectedTrimestre, setSelectedTrimestre] = React.useState<string>("all")
 
@@ -246,7 +265,7 @@ export default function RapportsPage() {
         if (seq !== fetchSeq.current) return
         setTvaData(data)
       }
-    } catch (error) {
+    } catch {
       if (seq === fetchSeq.current) {
         toast({ variant: "destructive", title: "Erreur", description: "Impossible de charger les données" })
       }
@@ -323,12 +342,14 @@ export default function RapportsPage() {
     <div className="min-h-screen bg-slate-50 aurora-bg-subtle">
       <div className="fixed inset-0 dot-grid opacity-40 pointer-events-none" aria-hidden="true" />
       <header className="border-b border-b-2 border-b-blue-500 bg-white/80 backdrop-blur-sm sticky top-0 z-50">
-        <div className="container mx-auto px-4 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-4">
+        {/* Revue du 2026-11-01 — à 390 px, l'année et l'actualisation sortaient
+            de l'écran (page de 441 px) : même retour à la ligne que Transactions. */}
+        <div className="container mx-auto px-4 py-4 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-4 min-w-0">
             <Link href="/comptabilite"><Button variant="ghost" size="sm"><ArrowLeft className="h-4 w-4 mr-2" />Comptabilité</Button></Link>
-            <div className="flex items-center gap-2">
-              <Download className="h-6 w-6 text-blue-600" />
-              <h1 className="text-xl font-bold">Rapports</h1>
+            <div className="flex items-center gap-2 min-w-0">
+              <Download className="h-6 w-6 text-blue-600 shrink-0" />
+              <h1 className="text-xl font-bold truncate">Rapports</h1>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -391,8 +412,8 @@ export default function RapportsPage() {
                       <p className="font-semibold">{stats.nbDepensesNonPayees} dépense(s) engagée(s) non encore payée(s)</p>
                       <p className="text-xs mt-0.5">
                         Le total dépenses ci-dessous inclut {formatEuro(stats.depensesNonPayees ?? 0)} de
-                        charges constatées (compta. d'engagement) dont le règlement reste à effectuer.
-                        Voir l'onglet Transactions pour le détail.
+                        charges constatées (compta. d&apos;engagement) dont le règlement reste à effectuer.
+                        Voir l&apos;onglet Transactions pour le détail.
                       </p>
                     </div>
                   </div>
@@ -405,36 +426,29 @@ export default function RapportsPage() {
                     fertilisations…) qui ne sont pas des charges comptables ;
                     l'écart y est attendu et expliqué par le bandeau discret
                     ci-dessous, pas par une alerte rouge. */}
-                {/* QA cmsw9dcrd — quand l'écart correspond aux avoirs de
-                    l'exercice (SSOT nette d'avoirs vs ventilation en factures
-                    brutes, convention tranchée le 2026-08-10), le bandeau le
-                    dit et passe en ton neutre : c'est un fait comptable
-                    documenté, pas une anomalie. */}
-                {stats.coherenceCheck && Math.abs(stats.coherenceCheck.revenusEcart) > 0.5 && (() => {
+                {/* Ticket cmvflua2x (2026-10-19) — les revenus par module sont
+                    désormais la ventilation de la SSOT elle-même (mêmes ventes,
+                    mêmes factures, avoirs déduits du module de leur facture
+                    d'origine) : leur somme égale la carte Revenus au centime.
+                    L'ancien bandeau disait « Incohérence » sans dire d'où
+                    venait l'écart ; s'il en réapparaissait un, il est chiffré
+                    et la composition du total est nommée. */}
+                {stats.coherenceCheck && Math.abs(stats.coherenceCheck.revenusEcart) > 0.005 && (() => {
                   const cc = stats.coherenceCheck!
-                  const avoirs = cc.avoirsExercice ?? 0
-                  const ecartEstAvoirs =
-                    avoirs > 0 && Math.abs(Math.abs(cc.revenusEcart) - avoirs) < 0.01
-                  return ecartEstAvoirs ? (
-                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 flex items-start gap-2">
-                      <Info className="h-4 w-4 mt-0.5 text-slate-500 flex-shrink-0" />
-                      <div>
-                        <p className="font-semibold">Écart SSOT / ventilation = avoirs de l&apos;exercice</p>
-                        <p className="text-xs mt-0.5">
-                          Le total SSOT ({formatEuro(cc.revenusSsot)}) est net des avoirs ({formatEuro(avoirs)}) ;
-                          la ventilation par module ({formatEuro(cc.revenusSommeModules)}) additionne les factures brutes.
-                          La ligne TOTAL ci-dessous reflète la somme des cellules visibles.
-                        </p>
-                      </div>
-                    </div>
-                  ) : (
+                  const comp = cc.revenusComposition
+                  return (
                     <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-900 flex items-start gap-2">
                       <Info className="h-4 w-4 mt-0.5 text-red-700 flex-shrink-0" />
                       <div>
-                        <p className="font-semibold">Incohérence détectée entre la SSOT et la ventilation par module</p>
+                        <p className="font-semibold">
+                          Écart de {formatEuro(Math.abs(cc.revenusEcart))} entre le total des revenus et la somme des modules
+                        </p>
                         <p className="text-xs mt-0.5">
-                          Revenus : SSOT {formatEuro(cc.revenusSsot)} vs somme modules {formatEuro(cc.revenusSommeModules)} (écart {formatEuro(cc.revenusEcart)}).
-                          La ligne TOTAL ci-dessous reflète la somme des cellules visibles.
+                          Total des revenus {formatEuro(cc.revenusSsot)} ; somme des modules {formatEuro(cc.revenusSommeModules)}.
+                          {comp && (
+                            <> Composition du total : ventes {formatEuro(comp.ventes)}, factures rattachées à une vente {formatEuro(comp.facturesRattachees)}, factures sans vente rattachée {formatEuro(comp.facturesSansVente)}, avoirs {formatEuro(comp.avoirs)}.</>
+                          )}
+                          {" "}La ligne TOTAL ci-dessous reflète la somme des cellules visibles.
                         </p>
                       </div>
                     </div>
@@ -581,6 +595,26 @@ export default function RapportsPage() {
                         })()}
                       </TableBody>
                     </Table>
+                    {/* Ticket cmvflua2x — d'où viennent les revenus des
+                        modules : une facture saisie sans vente métier n'a pas
+                        de module, elle est rangée en « Autre », et un avoir se
+                        déduit du module de sa facture d'origine. */}
+                    {(() => {
+                      const comp = stats.coherenceCheck?.revenusComposition
+                      if (!comp || (Math.abs(comp.facturesSansVente) < 0.005 && Math.abs(comp.avoirs) < 0.005)) return null
+                      const parts: string[] = []
+                      if (Math.abs(comp.facturesSansVente) >= 0.005) {
+                        parts.push(`« Autre » comprend ${formatEuro(comp.facturesSansVente)} de factures sans vente rattachée (saisies dans Factures)`)
+                      }
+                      if (Math.abs(comp.avoirs) >= 0.005) {
+                        parts.push(`les avoirs (${formatEuro(comp.avoirs)}) sont déduits du module de leur facture d'origine`)
+                      }
+                      return (
+                        <p className="mt-3 text-xs text-muted-foreground" data-testid="revenus-composition">
+                          Revenus par module : ventilation du total des revenus ({formatEuro(stats.revenus)}). {parts.join(" ; ")}.
+                        </p>
+                      )
+                    })()}
                   </CardContent>
                 </Card>
 
@@ -669,7 +703,7 @@ export default function RapportsPage() {
                           {formatEuro(bilanData.totalActif)}
                         </span>
                       </CardTitle>
-                      <CardDescription>Ce que possède l'exploitation</CardDescription>
+                      <CardDescription>Ce que possède l&apos;exploitation</CardDescription>
                     </CardHeader>
                     <CardContent>
                       <Table>
@@ -734,7 +768,7 @@ export default function RapportsPage() {
                           {formatEuro(bilanData.totalPassif)}
                         </span>
                       </CardTitle>
-                      <CardDescription>Comment l'actif est financé</CardDescription>
+                      <CardDescription>Comment l&apos;actif est financé</CardDescription>
                     </CardHeader>
                     <CardContent>
                       <Table>
@@ -756,7 +790,7 @@ export default function RapportsPage() {
                           </TableRow>
                           <TableRow>
                             <TableCell>
-                              <div className="font-medium">Résultat de l'exercice</div>
+                              <div className="font-medium">Résultat de l&apos;exercice</div>
                               <div className="text-xs text-muted-foreground">12 · pivot Actif/Passif</div>
                             </TableCell>
                             <TableCell className={`text-right font-mono font-bold ${bilanData.passif.resultatExercice >= 0 ? 'text-emerald-600' : 'text-orange-600'}`}>
@@ -784,7 +818,7 @@ export default function RapportsPage() {
                           {bilanData.passif.ecartEquilibrage !== 0 && (
                             <TableRow>
                               <TableCell>
-                                <div className="font-medium text-amber-700">Écart d'équilibrage</div>
+                                <div className="font-medium text-amber-700">Écart d&apos;équilibrage</div>
                                 <div className="text-xs text-muted-foreground">47x · à reclasser (disponibilités banque, capital…)</div>
                               </TableCell>
                               <TableCell className="text-right font-mono text-amber-700">
@@ -807,9 +841,9 @@ export default function RapportsPage() {
                     <p className="font-medium mb-1">ℹ Notes méthodologiques (MVP)</p>
                     <ul className="list-disc ml-5 text-xs space-y-1">
                       <li>Les <strong>stocks</strong> et <strong>disponibilités bancaires</strong> ne sont pas encore intégrés
-                        (à valoriser manuellement). L'écart apparaît au compte <strong>47x</strong>.</li>
+                        (à valoriser manuellement). L&apos;écart apparaît au compte <strong>47x</strong>.</li>
                       <li>Les <strong>amortissements linéaires</strong> ne sont pas appliqués sur les immobilisations
-                        (étape suivante : fiche Immobilisation + durée d'amortissement).</li>
+                        (étape suivante : fiche Immobilisation + durée d&apos;amortissement).</li>
                       <li>Le <strong>capital</strong> provient de Paramètres &gt; Exploitation. Renseignez-le pour équilibrer.</li>
                     </ul>
                   </CardContent>
@@ -1095,7 +1129,7 @@ export default function RapportsPage() {
                                 <ul className="space-y-0.5 text-xs text-muted-foreground">
                                   <li><span className="font-medium text-slate-700">{d.nbDepenses}</span> · dépenses manuelles</li>
                                   {(d.nbConsommationsAliments ?? 0) > 0 && (
-                                    <li><span className="font-medium text-slate-700">{d.nbConsommationsAliments}</span> · consommations d'aliments</li>
+                                    <li><span className="font-medium text-slate-700">{d.nbConsommationsAliments}</span> · consommations d&apos;aliments</li>
                                   )}
                                   {(d.nbFertilisations ?? 0) > 0 && (
                                     <li><span className="font-medium text-slate-700">{d.nbFertilisations}</span> · fertilisations</li>
@@ -1104,7 +1138,7 @@ export default function RapportsPage() {
                               </div>
                             </div>
                             <p className="text-xs text-muted-foreground mt-3">
-                              Périmètre TVA aligné sur l'onglet Transactions : les sources brutes
+                              Périmètre TVA aligné sur l&apos;onglet Transactions : les sources brutes
                               (élevage, récoltes, bois, abattages) sont comptées séparément des
                               ventes manuelles pour éviter le double comptage avec les
                               VenteManuelle « auto » que ces sources génèrent.

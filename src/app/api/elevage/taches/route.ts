@@ -8,9 +8,22 @@ import { Prisma } from '@prisma/client'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
 import { oeufsAttendusJour } from '@/lib/elevage/taux-ponte'
+import {
+  calculerTetesNonPondeuses,
+  effectifPondeuses,
+  effectifsPondeursLots,
+  estEspecePondeuse,
+} from '@/lib/elevage/pondeuses'
+import { reconstituerEffectifsLots } from '@/lib/elevage/effectif'
 import { chargerFenetresMiseBas } from '@/lib/elevage/fenetre-mise-bas'
 import { remiseVente } from '@/lib/elevage/attentes'
 import { sqlSoinAnimalPresent, whereSoinAnimalPresent } from '@/lib/elevage/soins-a-faire'
+import {
+  compterEcheancesSoins,
+  echeanceSoinAFaire,
+  jourCivil,
+  trierParEcheanceSoin,
+} from '@/lib/elevage/echeances-soins'
 
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
@@ -39,7 +52,7 @@ export async function GET(request: NextRequest) {
       : []
     const lotFiliere = filiere ? { lot: { especeAnimale: { filiere } } } : {}
 
-    const [soins, productions, consommations, lotsActifs, animauxPondeurs] = await Promise.all([
+    const [soins, productions, consommations, lotsTous, animauxPondeurs] = await Promise.all([
       // Soins prevus ou faits dans la periode
       prisma.soinAnimal.findMany({
         where: {
@@ -95,15 +108,16 @@ export async function GET(request: NextRequest) {
       // uniquement, donc un lot "Pondeuses 2026" mal réformé (statut=termine
       // mais cheptel non transféré) sortait du calcul et le taux de ponte
       // tombait à 0/jour → "Taux collecte sem. —". On inclut tout lot dont
-      // quantiteActuelle > 0 quel que soit le statut.
+      // l'effectif est > 0 quel que soit le statut.
+      // Revue 2026-10-20 — « effectif » = effectif reconstitué, filtré plus bas
+      // après reconstitution : le compteur stocké `quantiteActuelle` dérive
+      // dans les deux sens (lot à 0 dont les têtes sont des fiches nominatives
+      // rattachées ; fiche morte qui ne le décrémente pas).
       prisma.lotAnimaux.findMany({
-        where: {
-          userId,
-          quantiteActuelle: { gt: 0 },
-        },
+        where: { userId },
         include: {
           especeAnimale: {
-            select: { ponteAnnuelle: true, production: true, nom: true },
+            select: { ponteAnnuelle: true, production: true, nom: true, dureeElevage: true },
           },
         },
       }),
@@ -120,6 +134,11 @@ export async function GET(request: NextRequest) {
         },
       }),
     ])
+
+    const effectifsLots = await reconstituerEffectifsLots(userId, lotsTous)
+    const effectifLot = (lot: { id: number; quantiteActuelle: number }) =>
+      effectifsLots.get(lot.id)?.effectifCalcule ?? lot.quantiteActuelle
+    const lotsActifs = lotsTous.filter((lot) => effectifLot(lot) > 0)
 
     // QA caprin cms1vevyb — mises-bas prévues et tarissements des saillies
     // gestantes dans la fenêtre affichée : le toast « alertes activées »
@@ -244,6 +263,16 @@ export async function GET(request: NextRequest) {
       soinsSansInjections.filter((s) => s.fait).length +
       injectionsActives.filter((i) => i.statut === 'realisee').length
     const soinsTotal = soinsSansInjections.length + injectionsActives.length
+    // QA 2026-10-19 — retards et échéances à venir des MÊMES lignes à faire que
+    // la liste « Soins à faire » du dashboard : la tuile « Soins à planifier »
+    // et le bandeau les lisent ici au lieu de recompter à part (`/stats`).
+    const echeancesSoins = compterEcheancesSoins(
+      [
+        ...soinsSansInjections.filter((s) => !s.fait).map((s) => echeanceSoinAFaire(s)),
+        ...injectionsActives.filter((i) => i.statut !== 'realisee').map((i) => i.datePrevue),
+      ],
+      jourCivil(now) ?? '',
+    )
     const totalOeufs = productions.reduce((s, p) => s + p.quantite, 0)
     const totalConsoKg = consommations.reduce((s, c) => s + c.quantite, 0)
 
@@ -254,12 +283,18 @@ export async function GET(request: NextRequest) {
     // (lib/elevage/taux-ponte.ts) qui ajuste au mois courant et à la race
     // (Marans, Sussex, etc.).
     const refDate = end < now ? end : now
-    let estimationOeufsJour = lotsActifs.reduce((sum, lot) => {
-      if (lot.especeAnimale.production === 'oeufs' || lot.especeAnimale.production === 'mixte') {
-        return sum + oeufsAttendusJour(lot.quantiteActuelle, lot.especeAnimale.nom, refDate)
-      }
-      return sum
-    }, 0)
+    // QA cmv5jfsol — même effectif pondeur que /stats et /lots : effectif
+    // reconstitué du lot (et non plus `quantiteActuelle` brut, qui ignore les
+    // fiches nominatives rattachées) moins les jeunes nés dans le lot et les
+    // fiches mâles ou trop jeunes. L'effectif reconstitué est celui déjà
+    // calculé pour retenir les lots vivants.
+    const lotsPondeurs = lotsActifs.filter(l => estEspecePondeuse(l.especeAnimale.production))
+    const tetesNonPondeuses = await calculerTetesNonPondeuses(userId, lotsPondeurs, refDate)
+    let estimationOeufsJour = lotsPondeurs.reduce((sum, lot) => sum + oeufsAttendusJour(
+      effectifPondeuses(effectifLot(lot), tetesNonPondeuses.get(lot.id)),
+      lot.especeAnimale.nom,
+      refDate,
+    ), 0)
 
     // Bug #9 — Si on dispose d'un historique significatif (>= 14 jours
     // avec ponte), on pondère 50/50 avec la moyenne observée pour ne pas
@@ -295,14 +330,23 @@ export async function GET(request: NextRequest) {
       if (lotIdsProductifs.length > 0) {
         const lotsProductifs = await prisma.lotAnimaux.findMany({
           where: { userId, id: { in: lotIdsProductifs } },
-          include: { especeAnimale: { select: { ponteAnnuelle: true, production: true, nom: true } } },
+          include: { especeAnimale: { select: { ponteAnnuelle: true, production: true, nom: true, dureeElevage: true } } },
         })
+        // QA cmv5jfsol — le repli retranche lui aussi les têtes non pondeuses,
+        // sinon un lot de jeunes à qui des œufs ont été imputés recompterait
+        // ses poussins à plein.
+        const effectifsProductifs = await effectifsPondeursLots(
+          userId,
+          lotsProductifs.filter(l => estEspecePondeuse(l.especeAnimale.production)),
+          refDate,
+        )
         estimationOeufsJour = lotsProductifs.reduce((sum, lot) => {
-          if (lot.especeAnimale.production === 'oeufs' || lot.especeAnimale.production === 'mixte') {
-            const effectif = lot.quantiteActuelle > 0 ? lot.quantiteActuelle : lot.quantiteInitiale
-            return sum + oeufsAttendusJour(effectif, lot.especeAnimale.nom, refDate)
-          }
-          return sum
+          const e = effectifsProductifs.get(lot.id)
+          if (!e) return sum
+          const effectif = e.effectifPondeuses > 0
+            ? e.effectifPondeuses
+            : Math.max(0, lot.quantiteInitiale - e.tetesNonPondeuses)
+          return sum + oeufsAttendusJour(effectif, lot.especeAnimale.nom, refDate)
         }, 0)
       }
     }
@@ -314,7 +358,9 @@ export async function GET(request: NextRequest) {
         date: r.date,
         femelle: r.femelle,
       })),
-      soins: [
+      // Revue 2026-10-19 : un seul ordre, par échéance (plus en retard d'abord),
+      // soins et injections mêlés, avant toute troncature côté écran.
+      soins: trierParEcheanceSoin([
         ...soinsSansInjections
           .map(s => ({
         id: s.id,
@@ -359,7 +405,7 @@ export async function GET(request: NextRequest) {
           animal: i.animalId ? { id: i.animalId, nom: i.animalNom, identifiant: i.animalIdentifiant } : null,
           lot: i.lotId ? { id: i.lotId, nom: i.lotNom } : null,
         })),
-      ],
+      ]),
       productions: productions.map(p => ({
         id: p.id,
         date: p.date,
@@ -378,6 +424,7 @@ export async function GET(request: NextRequest) {
         soinsTotal,
         soinsFaits,
         soinsRestants: soinsTotal - soinsFaits,
+        echeancesSoins,
         totalOeufs,
         totalConsoKg: Math.round(totalConsoKg * 10) / 10,
         estimationOeufsJour: Math.round(estimationOeufsJour),
@@ -397,7 +444,7 @@ export async function GET(request: NextRequest) {
   } catch (error) {
     console.error('GET /api/elevage/taches error:', error)
     return NextResponse.json(
-      { error: 'Erreur lors de la recuperation des taches', details: "Erreur interne du serveur" },
+      { error: 'Erreur lors de la récupération des tâches', details: "Erreur interne du serveur" },
       { status: 500 }
     )
   }

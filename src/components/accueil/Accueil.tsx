@@ -1,9 +1,8 @@
 "use client"
 
 import * as React from "react"
-import { useSession } from "next-auth/react"
-import { CloudSun, LayoutGrid } from "lucide-react"
-import Link from "next/link"
+import { ConteneurPage } from "@/components/shell/PageEntete"
+import { LayoutGrid } from "lucide-react"
 import {
   DndContext,
   DragOverlay,
@@ -19,9 +18,8 @@ import {
 } from "@dnd-kit/core"
 import { SortableContext, horizontalListSortingStrategy, sortableKeyboardCoordinates } from "@dnd-kit/sortable"
 
-import { UserMenu } from "@/components/auth/UserMenu"
 import { messageErreurReponse } from "@/lib/api-erreur"
-import { formatNombre, jourLocalISO } from "@/lib/accueil/classement"
+import { formatNombre } from "@/lib/accueil/classement"
 import {
   CATALOGUE_TUILES,
   IDS_REPERES,
@@ -51,14 +49,12 @@ import type { AccueilAujourdhui, ElementAujourdhui } from "@/lib/accueil/types"
 import { symboleDevise } from "@/lib/format-utils"
 import { toast } from "@/hooks/use-toast"
 import { useAccueilDisposition } from "@/hooks/use-accueil-disposition"
+import { useJourNavigateur } from "@/hooks/use-jour-navigateur"
 import { cn } from "@/lib/utils"
 
-import { LuneDuJour } from "@/components/lunaire/LuneDuJour"
 
 import { AccueilEnTete } from "./AccueilEnTete"
-import { BarreCommande } from "./BarreCommande"
 import { CLASSES_BOUTON, CLASSES_BOUTON_PRINCIPAL } from "./boutons"
-import { NavigationBasse } from "./NavigationBasse"
 import { NombreAnime } from "./NombreAnime"
 import { BandeMasques, CatalogueTuiles, Personnalisable } from "./Personnalisable"
 import { Repere } from "./Repere"
@@ -122,28 +118,8 @@ async function chargerMeteo(): Promise<(MeteoSemaine & { nbParcelles: number }) 
   }
 }
 
-function MeteoResume({ meteo, className }: { meteo: MeteoSemaine | null; className?: string }) {
-  if (!meteo?.actuelle) return null
-  const a = meteo.actuelle
-  return (
-    <Link href="/meteo" className={cn("flex items-center gap-2.5 text-sm text-encre hover:underline underline-offset-2", className)} title="Ouvrir la météo">
-      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-eau-doux text-eau" aria-hidden>
-        <CloudSun className="h-5 w-5" />
-      </span>
-      <span className="leading-tight">
-        <b className="font-semibold">{Math.round(a.temperature)} °C</b>
-        <span className="text-ardoise"> · {a.weatherDescription} · {a.humidity} %</span>
-        <br />
-        <span className="text-ardoise">
-          {meteo.parcelle.nom} · vent {Math.round(a.windSpeed)} km/h
-        </span>
-      </span>
-    </Link>
-  )
-}
 
 export function Accueil() {
-  const { data: session } = useSession()
   const [accueil, setAccueil] = React.useState<Chargement<AccueilAujourdhui>>(INITIAL)
   const [meteo, setMeteo] = React.useState<Chargement<MeteoSemaine & { nbParcelles: number }>>(INITIAL)
   const [tentative, setTentative] = React.useState(0)
@@ -206,9 +182,14 @@ export function Accueil() {
     })
   }, [])
 
+  // Jour du navigateur en attendant celui de la composition : `null` au
+  // prérendu du build et à l'hydratation, jamais un `new Date()` au rendu
+  // (React #418, signalement du 2026-10-25 ; voir `useJourNavigateur`).
+  const jourNavigateur = useJourNavigateur()
+
   const donnees = accueil.donnees
-  const date = donnees?.date ?? jourLocalISO(new Date())
-  const annee = donnees?.annee ?? new Date().getFullYear()
+  const date = donnees?.date ?? jourNavigateur
+  const annee = donnees?.annee ?? (date ? Number(date.slice(0, 4)) : null)
   const modules = donnees?.modules ?? []
 
   const fenetre: PhraseFenetre | null = React.useMemo(() => {
@@ -232,8 +213,16 @@ export function Accueil() {
   const rm = donnees?.reperes.maraichage ?? null
   const rc = donnees?.reperes.comptabilite ?? null
   const rs = donnees?.reperes.semaine ? { ...donnees.reperes.semaine, aFaire: Math.max(0, donnees.reperes.semaine.aFaire - tachesSoldees) } : null
-  const nonDemarrees = rm ? Math.max(0, rm.culturesPlanifiees - rm.culturesActives) : 0
-  const ecartRecoltes = rm?.recoltes
+  // Les cultures terminées ne sont ni « en place » ni « non démarrées ».
+  const terminees = rm?.culturesTerminees ?? 0
+  const nonDemarrees = rm ? Math.max(0, rm.culturesPlanifiees - rm.culturesActives - terminees) : 0
+  const detailCultures = rm
+    ? [
+        `${nonDemarrees} non démarrée${nonDemarrees > 1 ? "s" : ""}`,
+        ...(terminees > 0 ? [`${terminees} terminée${terminees > 1 ? "s" : ""}`] : []),
+      ].join(" · ")
+    : undefined
+  const ecartRecoltes = rm?.recoltes && annee !== null
     ? rm.recoltes.valeurN1 === 0
       ? <span>{rm.recoltes.valeur > 0 ? "première année de récoltes" : "aucune récolte pour l'instant"}</span>
       : rm.recoltes.ecartN1 > 0
@@ -314,7 +303,7 @@ export function Accueil() {
     switch (id) {
       case "repere:cultures":
         return (
-          <Repere libelle="Cultures en place" valeur={rm ? <NombreAnime valeur={rm.culturesActives} /> : null} unite={rm ? `/ ${rm.culturesPlanifiees}` : undefined} detail={rm ? `${nonDemarrees} non démarrée${nonDemarrees > 1 ? "s" : ""}` : undefined} vide={chargementRepere} href="/maraichage/cultures" />
+          <Repere libelle="Cultures en place" valeur={rm ? <NombreAnime valeur={rm.culturesActives} /> : null} unite={rm ? `/ ${rm.culturesPlanifiees}` : undefined} detail={detailCultures} vide={chargementRepere} href="/maraichage/cultures" />
         )
       case "repere:surface":
         return (
@@ -322,7 +311,7 @@ export function Accueil() {
         )
       case "repere:recoltes":
         return (
-          <Repere libelle={`Récoltes ${annee}`} valeur={rm?.recoltes ? <NombreAnime valeur={rm.recoltes.valeur} format={(n) => formatNombre(n, 1)} /> : null} unite={rm?.recoltes?.unite} detail={ecartRecoltes} vide={chargementRepere} href="/maraichage/recoltes" />
+          <Repere libelle={annee !== null ? `Récoltes ${annee}` : "Récoltes"} valeur={rm?.recoltes ? <NombreAnime valeur={rm.recoltes.valeur} format={(n) => formatNombre(n, 1)} /> : null} unite={rm?.recoltes?.unite} detail={ecartRecoltes} vide={chargementRepere} href="/maraichage/recoltes" />
         )
       case "repere:tresorerie":
         return (
@@ -375,18 +364,7 @@ export function Accueil() {
   return (
     <div className="min-h-screen bg-papier font-ui text-encre">
       <div className="min-w-0">
-        <main className="mx-auto max-w-[1400px] space-y-4 px-4 pb-28 pt-4 lg:px-7 lg:pb-8 lg:pt-5">
-          {/* Rangée du haut : barre de commande, météo, compte */}
-          <div className="flex items-center gap-3">
-            <BarreCommande className="max-w-[560px] flex-1" compact />
-            <MeteoResume meteo={meteo.donnees} className="ml-auto hidden md:flex" />
-            {/* Petite lune à côté de la météo (2026-10-12) : phase du jour dessinée,
-                lien vers le calendrier complet de la page Météo. */}
-            <LuneDuJour />
-            {session?.user && <UserMenu user={session.user} />}
-          </div>
-
-          <AccueilEnTete
+        <AccueilEnTete
             date={date}
             fenetre={fenetre}
             chargementFenetre={meteo.chargement}
@@ -399,6 +377,7 @@ export function Accueil() {
               )
             }
           />
+        <ConteneurPage className="space-y-4 pt-6 pb-28 lg:pb-8">
 
           {edition && (
             <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-lin bg-sauge-doux px-4 py-2.5 text-[13.5px] accueil-entree" role="region" aria-label="Personnaliser l'accueil">
@@ -501,8 +480,8 @@ export function Accueil() {
             <span>Nouvel accueil, en essai : vos retours comptent, surtout « je ne retrouve plus… ».</span>
             <RetourAncienAccueil />
           </p>
-        </main>
-        <NavigationBasse className="lg:hidden" />
+        </ConteneurPage>
+
       </div>
     </div>
   )

@@ -10,12 +10,17 @@
  * production-bois, recoltes-arbres.
  */
 
-import type { PrismaClient } from '@prisma/client'
+import type { Exploitation, Prisma, PrismaClient } from '@prisma/client'
+import { adresseDeFiche, identiteAcheteur } from '@/lib/comptabilite/rattachement-client'
 import { factureSansTaxe } from '@/lib/territoires'
+import { suiviReglementActif } from '@/lib/comptabilite/suivi-reglement-source'
+import { cleFacture } from '@/lib/comptabilite/cle-reglement'
 
 type PrismaTx = Parameters<Parameters<PrismaClient['$transaction']>[0]>[0]
 
 export interface LigneFactureInput {
+  articleStockType?: string | null
+  articleStockId?: string | null
   description: string
   quantite: number
   unite: string
@@ -28,6 +33,7 @@ export interface LigneFactureInput {
 }
 
 export interface CreerFactureParams {
+  cleCreationStock?: string | null
   userId: string
   type: string // 'facture' | 'avoir' | 'acompte'
   clientId?: number | null
@@ -47,6 +53,14 @@ export interface CreerFactureParams {
   factureOrigineId?: number | null
   conditionsPaiement?: string | null
   mentionsSpecifiques?: string[]
+  // Facturation électronique, lot 1 (2026-10-13) : catégorie de l'opération
+  // (défaut biens) et livraison si elle diffère de la facture.
+  categorieOperation?: string | null
+  dateLivraison?: Date | null
+  adresseLivraison?: string | null
+  codePostalLivraison?: string | null
+  villeLivraison?: string | null
+  paysLivraison?: string | null
   lignes: LigneFactureInput[]
 }
 
@@ -90,6 +104,8 @@ export interface EmetteurSnapshot {
   numeroTvaIntracom: string | null
   regimeFiscal: string
   regimeTva: string
+  // Option TVA d'après les débits (BT-8). Absent des snapshots antérieurs au 2026-10-13.
+  optionTvaDebits?: boolean
   adresseSiege: string
   codePostal: string
   ville: string
@@ -110,6 +126,11 @@ export interface EmetteurSnapshot {
 async function snapshotEmetteur(tx: PrismaTx, userId: string): Promise<EmetteurSnapshot | null> {
   const e = await tx.exploitation.findUnique({ where: { userId } })
   if (!e) return null
+  return snapshotDepuisExploitation(e)
+}
+
+/** Une seule lecture de l'identité légale pour le snapshot à l'émission et pour les factures sans snapshot (exports). */
+export function snapshotDepuisExploitation(e: Exploitation): EmetteurSnapshot {
   return {
     raisonSociale: e.raisonSociale,
     formeJuridique: e.formeJuridique,
@@ -121,6 +142,7 @@ async function snapshotEmetteur(tx: PrismaTx, userId: string): Promise<EmetteurS
     numeroTvaIntracom: e.numeroTvaIntracom,
     regimeFiscal: e.regimeFiscal,
     regimeTva: e.regimeTva,
+    optionTvaDebits: e.optionTvaDebits,
     adresseSiege: e.adresseSiege,
     codePostal: e.codePostal,
     ville: e.ville,
@@ -148,6 +170,7 @@ function mentionsParDefaut(snapshot: EmetteurSnapshot | null, lignes: LigneFactu
   // Mention 293 B si franchise ; mention d'exonération générique si non-assujetti
   // (territoires hors champ TVA : Guyane, Mayotte, COM…).
   if (snapshot?.regimeTva === 'franchise-293b') out.push('293b')
+  else if (snapshot?.regimeTva === 'rfa') out.push('rfa')
   else if (snapshot?.regimeTva === 'non-assujetti') out.push('exoneration')
   // Mentions générales obligatoires (pro)
   out.push('escompte', 'penalites', 'indemnite-40')
@@ -285,32 +308,41 @@ export const snapshotEmetteurForEmission = snapshotEmetteur
  * Appelé quand une source facturée (vente élevage, abattage, récolte, bois)
  * est annulée, dé-vendue ou supprimée. Règles :
  *   - facture déjà annulée → ok
- *   - facture brouillon/émise non payée → annulée ici même
- *   - facture payée → ok seulement si un avoir non annulé y est rattaché
- *     (factureOrigineId) ; sinon refus — l'utilisateur doit émettre un avoir.
+ *   - facture non payée sans avoir émis → annulée ici même
+ *   - facture payée ou déjà créditée → avoirs émis couvrant le total requis ;
+ *     facture et avoirs conservés pour que leur revenu net reste nul.
  * Sans cette symétrie, la facture restait comptée dans KPI/TVA/FEC alors que
  * la vente n'existait plus (CA fantôme), ou la vente disparaissait du FEC.
  */
+export async function montantAvoirsEmis(db: Pick<PrismaTx, 'facture'>, userId: string, factureId: number) {
+  const avoirs = await db.facture.aggregate({
+    where: { userId, type: 'avoir', factureOrigineId: factureId, statut: { in: ['emise', 'payee'] } },
+    _sum: { totalTTC: true },
+  })
+  return avoirs._sum.totalTTC ?? 0
+}
+
 export async function annulerFactureLiee(
   db: PrismaTx,
   userId: string,
   factureId: number
 ): Promise<{ ok: true } | { ok: false; raison: string }> {
+  await db.$queryRaw`SELECT id FROM factures WHERE id = ${factureId} AND user_id = ${userId} FOR UPDATE`
   const facture = await db.facture.findFirst({
     where: { id: factureId, userId },
-    select: { id: true, numero: true, statut: true },
+    select: { id: true, numero: true, statut: true, totalTTC: true },
   })
   if (!facture || facture.statut === 'annulee') return { ok: true }
 
-  if (facture.statut === 'payee') {
-    const avoir = await db.facture.findFirst({
-      where: { userId, type: 'avoir', factureOrigineId: factureId, statut: { not: 'annulee' } },
-      select: { id: true },
-    })
-    if (!avoir) {
+  const credite = await montantAvoirsEmis(db, userId, factureId)
+  // Un dossier dont tous les versements sont annulés ne suit plus aucun paiement
+  // (revue du 2026-10-29) : il n'impose pas d'avoir pour annuler la vente.
+  const suivi = await suiviReglementActif(db, userId, cleFacture(facture.id))
+  if (facture.statut === 'payee' || credite > 0 || Boolean(suivi)) {
+    if (credite < facture.totalTTC - 0.005) {
       return {
         ok: false,
-        raison: `La facture ${facture.numero} liée à cette vente est payée : émettez d'abord un avoir depuis Comptabilité > Factures.`,
+        raison: `La facture ${facture.numero} liée à cette vente est payée ou déjà corrigée par un avoir : émettez d'abord un ou plusieurs avoirs couvrant son montant total depuis Comptabilité > Factures. Un brouillon ou un avoir partiel ne permet pas d'annuler toute la vente.`,
       }
     }
     return { ok: true }
@@ -356,6 +388,11 @@ export async function creerFacture(tx: PrismaTx, params: CreerFactureParams) {
   // et le PDF exposeraient le nom/SIRET/TVA intra du client d'un autre compte.
   let clientId: number | null = null
   let clientExonere = false
+  // Facturation électronique : l'identité de l'acheteur (SIRET, SIREN BT-47,
+  // TVA intracommunautaire BT-48) est figée sur la facture, comme l'émetteur.
+  let clientSiret: string | null = null
+  let clientSiren: string | null = null
+  let clientTvaIntra: string | null = null
 
   if (params.clientId) {
     const client = await tx.client.findFirst({
@@ -364,8 +401,11 @@ export async function creerFacture(tx: PrismaTx, params: CreerFactureParams) {
     if (client) {
       clientId = client.id
       clientNom = client.nom
-      clientAdresse = [client.adresse, client.codePostal, client.ville].filter(Boolean).join(', ')
+      // La fiche fait foi ; sans adresse sur la fiche, celle saisie sur la
+      // facture est gardée plutôt que remplacée par une chaîne vide.
+      clientAdresse = adresseDeFiche(client) || clientAdresse
       clientExonere = client.exonererTVA
+      ;({ clientSiret, clientSiren, clientTvaIntra } = identiteAcheteur(client))
     }
   }
 
@@ -379,7 +419,7 @@ export async function creerFacture(tx: PrismaTx, params: CreerFactureParams) {
   let lignes = params.lignes
   let totalHT = params.totalHT
   let totalTVA = params.totalTVA
-  let totalTTC = params.totalTTC
+  const totalTTC = params.totalTTC
   if (sansTva) {
     lignes = params.lignes.map((l) => ({
       ...l,
@@ -409,7 +449,7 @@ export async function creerFacture(tx: PrismaTx, params: CreerFactureParams) {
       totalHT,
       totalTVA,
       totalTTC,
-      totauxParTauxTva: totaux as any,
+      totauxParTauxTva: totaux,
       statut,
       modePaiement: params.modePaiement || null,
       datePaiement: params.datePaiement || null,
@@ -417,8 +457,19 @@ export async function creerFacture(tx: PrismaTx, params: CreerFactureParams) {
       mentionsLegales: params.mentionsLegales || null,
       conditionsPaiement: params.conditionsPaiement ?? null,
       mentionsSpecifiques: mentions,
-      emetteurSnapshot: emetteur as any,
+      // Json? : `null` (pas d'exploitation) est passé tel quel, comme avant.
+      emetteurSnapshot: emetteur as unknown as Prisma.InputJsonValue,
+      clientSiret,
+      clientSiren,
+      clientTvaIntra,
+      categorieOperation: params.categorieOperation || 'biens',
+      dateLivraison: params.dateLivraison || null,
+      adresseLivraison: params.adresseLivraison || null,
+      codePostalLivraison: params.codePostalLivraison || null,
+      villeLivraison: params.villeLivraison || null,
+      paysLivraison: params.paysLivraison || null,
       notes: params.notes || null,
+      cleCreationStock: params.cleCreationStock || null,
       lignes: {
         create: lignes.map((l, index) => ({
           ordre: index,
@@ -431,6 +482,8 @@ export async function creerFacture(tx: PrismaTx, params: CreerFactureParams) {
           montantTVA: l.montantTVA,
           montantTTC: l.montantTTC,
           statutBio: l.statutBio ?? null,
+          articleStockType: l.articleStockType ?? null,
+          articleStockId: l.articleStockId ?? null,
         })),
       },
     },

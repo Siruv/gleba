@@ -17,6 +17,8 @@
  */
 
 import prisma from '@/lib/prisma'
+import { montantVenteFruit, periodeVenteVerger } from '@/lib/verger/montant-vente'
+import { TAUX_TVA_BOIS_PAR_DEFAUT } from '@/lib/verger/tva-bois'
 import { collecteTvaFrancaise } from '@/lib/territoires'
 
 export interface TvaParTaux {
@@ -133,15 +135,15 @@ export async function computeTvaPeriode(
       select: { prixTotal: true, tauxTVA: true },
     }),
     prisma.recolte.findMany({
-      where: { userId, statut: 'vendu', dateVente: { gte: startDate, lte: endDate }, prixTotal: { not: null }, factureId: null },
-      select: { prixTotal: true },
+      where: { userId, statut: 'vendu', dateVente: { gte: startDate, lte: endDate }, OR: [{ prixTotal: { not: null } }, { prixKg: { not: null } }], factureId: null },
+      select: { prixTotal: true, prixKg: true, quantite: true },
     }),
     prisma.recolteArbre.findMany({
-      where: { userId, statut: 'vendu', dateVente: { gte: startDate, lte: endDate }, prixKg: { not: null }, factureId: null },
-      select: { quantite: true, prixKg: true },
+      where: { userId, statut: 'vendu', ...periodeVenteVerger(startDate, endDate), factureId: null },
+      select: { quantite: true, prixKg: true, prixTotal: true },
     }),
     prisma.productionBois.findMany({
-      where: { userId, dateVente: { gte: startDate, lte: endDate }, prixVente: { not: null }, factureId: null },
+      where: { userId, statut: 'vendu', ...periodeVenteVerger(startDate, endDate), prixVente: { not: null }, factureId: null },
       select: { prixVente: true },
     }),
     prisma.abattage.findMany({
@@ -228,7 +230,7 @@ export async function computeTvaPeriode(
     inferencesBreakdown.ventesElevage++
   }
   for (const r of recoltesPotager) {
-    const ttc = r.prixTotal || 0
+    const ttc = r.prixTotal || r.quantite * (r.prixKg || 0)
     if (ttc > 0) {
       const ht = ttc / 1.055
       addC('5.5', ht, ttc - ht)
@@ -237,7 +239,7 @@ export async function computeTvaPeriode(
     }
   }
   for (const r of recoltesArbres) {
-    const ttc = r.quantite * (r.prixKg || 0)
+    const ttc = montantVenteFruit(r)
     if (ttc > 0) {
       const ht = ttc / 1.055
       addC('5.5', ht, ttc - ht)
@@ -248,8 +250,8 @@ export async function computeTvaPeriode(
   for (const b of venteBois) {
     const ttc = b.prixVente || 0
     if (ttc > 0) {
-      const ht = ttc / 1.10
-      addC('10', ht, ttc - ht)
+      const ht = ttc / (1 + TAUX_TVA_BOIS_PAR_DEFAUT / 100)
+      addC(String(TAUX_TVA_BOIS_PAR_DEFAUT), ht, ttc - ht)
       nbInfereesCollectees++
       inferencesBreakdown.venteBois++
     }

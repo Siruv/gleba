@@ -5,9 +5,11 @@
  */
 
 import * as React from "react"
+import { AppHeader } from "@/components/shell/AppHeader"
+import { PageEntete, ConteneurPage } from "@/components/shell/PageEntete"
 import Link from "next/link"
 import { useSearchParams } from "next/navigation"
-import { ArrowLeft, Box, CalendarClock, ChevronDown, Download, ExternalLink, Image as ImageIcon, Layers as LayersIcon, Map as MapIcon, Maximize2, Minimize2, Move, RotateCcw, Ruler, Upload, ZoomIn, ZoomOut, Plus, Crosshair, Trash2, X, Copy } from "lucide-react"
+import { Box, CalendarClock, ChevronDown, Download, ExternalLink, Image as ImageIcon, Layers as LayersIcon, Map as MapIcon, Maximize2, Minimize2, Move, RotateCcw, Ruler, Upload, ZoomIn, ZoomOut, Plus, Crosshair, Trash2, X, Copy } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -71,8 +73,8 @@ import {
   typeObjet,
 } from "@/lib/jardin/objets-plan"
 
-/** Garde-fou sur la duplication en lot (une requête par copie). */
-const MAX_COPIES_PLANCHE = 20
+// Garde-fou de la duplication en lot, planches et objets : borne de la route.
+import { MAX_COPIES_PLANCHE } from "@/lib/planches/copie"
 
 // Palier 4 (perf) : dialogs lourds chargés à la demande, hors du bundle
 // initial de l'éditeur (le plus gros écran client de l'app).
@@ -93,6 +95,10 @@ import { Textarea } from "@/components/ui/textarea"
 import { parcelleCompatibleVerger } from "@/lib/verger/lot-arbres"
 import { parcelleAutoSelectionnee } from "@/lib/jardin/auto-selection"
 import { CONDUITES_ARBRE, ETATS_ARBRE } from "@/lib/verger/arbre-constants"
+import { TYPES_ARBRE, couleurTypeArbre } from "@/lib/verger/types-arbre"
+import { libelleVarieteOption } from "@/lib/verger/variete-arbre"
+import { ChampPorteGreffe } from "@/components/verger/ChampPorteGreffe"
+import { MenuDuplicationArbre } from "@/components/verger/MenuDuplicationArbre"
 
 interface PlancheWithCulture {
   id: string
@@ -160,6 +166,7 @@ interface Arbre {
   variete: string | null
   portGreffe: string | null
   porteGreffeId: string | null
+  porteGreffeRef?: { id: string; nom: string } | null
   formeTaille: string | null
   circonferenceCm: number | null
   fournisseur: string | null
@@ -226,12 +233,19 @@ function SelectTypeObjet({
   )
 }
 
-const TYPES_ARBRES = [
-  { value: "fruitier", label: "Arbre fruitier", color: "#22c55e" },
-  { value: "petit_fruit", label: "Petit fruit", color: "#ef4444" },
-  { value: "ornement", label: "Ornement", color: "#a855f7" },
-  { value: "haie", label: "Haie", color: "#84cc16" },
-]
+// Types d'arbre du plan : liste unique (src/lib/verger/types-arbre.ts),
+// identique à l'onglet Arbres du verger (lianes et forestiers compris).
+const TYPES_ARBRES = TYPES_ARBRE.map((t) => ({ value: t.value, label: t.label, color: couleurTypeArbre(t.value) }))
+
+/** Ligne de GET /api/carte, limitée aux champs lus par fetchParcelles. */
+interface ParcelleApi {
+  id: string
+  nom: string
+  usage: string | null
+  couches?: string[] | null
+  geometry: string
+  _count?: { planches?: number; arbres?: number }
+}
 
 interface ParcelleOption {
   id: string
@@ -306,6 +320,20 @@ export default function JardinPage() {
 
 function JardinContent() {
   const { toast } = useToast()
+  const racinePlanRef = React.useRef<HTMLDivElement>(null)
+  const entetePlanRef = React.useRef<HTMLDivElement>(null)
+  const outilsPlanRef = React.useRef<HTMLDivElement>(null)
+  React.useEffect(() => {
+    const publierHauteur = () => {
+      const hauteur = (entetePlanRef.current?.getBoundingClientRect().height ?? 0) + (outilsPlanRef.current?.getBoundingClientRect().height ?? 0)
+      racinePlanRef.current?.style.setProperty("--plan-entete-h", hauteur + "px")
+    }
+    const observateur = new ResizeObserver(publierHauteur)
+    if (entetePlanRef.current) observateur.observe(entetePlanRef.current)
+    if (outilsPlanRef.current) observateur.observe(outilsPlanRef.current)
+    publierHauteur()
+    return () => observateur.disconnect()
+  }, [])
   const searchParams = useSearchParams()
   const [parcelles, setParcelles] = React.useState<ParcelleOption[]>([])
   const [selectedParcelleId, setSelectedParcelleId] = React.useState<string | null>(null)
@@ -316,7 +344,7 @@ function JardinContent() {
   const planchesSauveesRef = React.useRef<Map<string | number, string>>(new Map())
   const objetsSauvesRef = React.useRef<Map<string | number, string>>(new Map())
   const arbresSauvesRef = React.useRef<Map<string | number, string>>(new Map())
-  const [especes, setEspeces] = React.useState<Espece[]>([])
+  const [, setEspeces] = React.useState<Espece[]>([])
   const [isLoading, setIsLoading] = React.useState(true)
   const [scale, setScale] = React.useState(16)
   const [isPlanFullscreen, setIsPlanFullscreen] = React.useState(false)
@@ -407,6 +435,30 @@ function JardinContent() {
 
   // Sélection multi-éléments
   const [selection, setSelection] = React.useState<SelectionItem[]>([])
+  const [detailsMobilesOuverts, setDetailsMobilesOuverts] = React.useState(false)
+  const [detailsAgrandis, setDetailsAgrandis] = React.useState(false)
+  const [renommageMobile, setRenommageMobile] = React.useState(false)
+  const titreDetailsRef = React.useRef<HTMLHeadingElement>(null)
+  const contenuDetailsRef = React.useRef<HTMLDivElement>(null)
+  const boutonDetailsRef = React.useRef<HTMLButtonElement>(null)
+  const cleSelection = selection.map(item => item.type + ':' + item.id).join('|')
+  React.useEffect(() => {
+    if (!cleSelection) setDetailsMobilesOuverts(false)
+    setDetailsAgrandis(false)
+    setRenommageMobile(false)
+  }, [cleSelection])
+  React.useEffect(() => {
+    if (!detailsMobilesOuverts || isPlanFullscreen || !window.matchMedia('(max-width: 1023px)').matches) return
+    const frame = requestAnimationFrame(() => {
+      contenuDetailsRef.current?.scrollTo({ top: 0 })
+      titreDetailsRef.current?.focus({ preventScroll: true })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [detailsMobilesOuverts, isPlanFullscreen])
+  const retourAuPlan = () => {
+    setDetailsMobilesOuverts(false)
+    requestAnimationFrame(() => boutonDetailsRef.current?.focus({ preventScroll: true }))
+  }
 
   // Valeurs dérivées pour la sidebar (quand 1 seul sélectionné)
   const selectedPlanche = selection.length === 1 && selection[0].type === 'planche' ? selection[0].id as string : null
@@ -451,12 +503,10 @@ function JardinContent() {
       planchesSauveesRef.current = indexerEtatSauve(data, empreintePlanche)
 
       // Auto-positionner les planches sans position
-      let needsPositioning = false
       const positioned = data.filter(p => p.posX !== null && p.posY !== null)
       const unpositioned = data.filter(p => p.posX === null || p.posY === null)
 
       if (unpositioned.length > 0) {
-        needsPositioning = true
         // Trouver la prochaine position libre
         let maxY = 0
         positioned.forEach(p => {
@@ -479,7 +529,7 @@ function JardinContent() {
       // Désormais, le positionnement auto est idempotent et n'est
       // persisté qu'au prochain mouvement réel (handleSave).
       // if (needsPositioning) marquerChangement()
-    } catch (error) {
+    } catch {
       toastRef.current({
         variant: "destructive",
         title: "Erreur",
@@ -500,7 +550,7 @@ function JardinContent() {
       const rows: ObjetJardin[] = data || []
       objetsSauvesRef.current = indexerEtatSauve(rows, empreinteObjet)
       setObjets(rows)
-    } catch (error) {
+    } catch {
       // Ignorer
     }
   }, [selectedParcelleId])
@@ -528,7 +578,7 @@ function JardinContent() {
       if (!response.ok) return
       const data = await response.json()
       setEspeces(data.data || [])
-    } catch (error) {
+    } catch {
       // Ignorer
     }
   }, [])
@@ -559,7 +609,7 @@ function JardinContent() {
           : rows.filter((a: { parcelleGeoId?: string | null }) => a.parcelleGeoId === selectedParcelleId)
       arbresSauvesRef.current = indexerEtatSauve(filtered, empreinteArbre)
       setArbres(filtered)
-    } catch (error) {
+    } catch {
       // Ignorer
     }
   }, [selectedParcelleId])
@@ -570,7 +620,7 @@ function JardinContent() {
       const response = await fetch("/api/carte")
       if (!response.ok) return
       const data = await response.json()
-      setParcelles(data.map((p: any) => ({
+      setParcelles((data as ParcelleApi[]).map((p) => ({
         id: p.id,
         nom: p.nom,
         usage: p.usage,
@@ -715,15 +765,17 @@ function JardinContent() {
       fetch("/api/varietes?pageSize=1000").then(r => r.json()).catch(() => null),
       fetch("/api/comptabilite/fournisseurs?actif=true").then(r => r.json()).catch(() => null),
     ]).then(([especesRes, varietesRes, fournisseursRes]) => {
-      const especes = (especesRes?.data || []).map((e: any) => e.id).filter(Boolean)
+      const especes: string[] = (especesRes?.data || []).map((e: { id: string }) => e.id).filter(Boolean)
       setArbreEspecesRef(especes)
       const especesSet = new Set(especes)
+      // QA 2026-10-19 — une variété personnelle se propose sous son nom,
+      // pas sous son id technique (voir src/lib/verger/variete-arbre.ts).
       const varietes = (varietesRes?.data || [])
-        .filter((v: any) => especesSet.has(v.especeId))
-        .map((v: any) => v.id)
+        .filter((v: { especeId: string }) => especesSet.has(v.especeId))
+        .map((v: { id: string; nom?: string | null }) => libelleVarieteOption(v))
         .filter(Boolean)
       setArbreVarietesRef(varietes)
-      const fournisseurs = (fournisseursRes?.data || []).map((f: any) => f.id).filter(Boolean)
+      const fournisseurs: string[] = (fournisseursRes?.data || []).map((f: { id: string }) => f.id).filter(Boolean)
       setArbreFournisseursRef(fournisseurs)
     })
   }, [])
@@ -750,8 +802,8 @@ function JardinContent() {
   }, [arbres, arbreFournisseursRef])
 
   const arbrePortGreffeOptions = React.useMemo(() => {
-    const valeurs = arbres.map(a => a.portGreffe).filter(Boolean) as string[]
-    return [...new Set(valeurs)].sort().map(v => ({ value: v, label: v }))
+    const valeurs = arbres.map(a => a.porteGreffeRef?.nom ?? a.portGreffe).filter(Boolean) as string[]
+    return [...new Set(valeurs)].sort()
   }, [arbres])
 
   // Charger planches et objets quand la parcelle change
@@ -1028,6 +1080,7 @@ function JardinContent() {
   const selectedPlancheData = planches.find(p => p.id === selectedPlanche)
   const selectedObjetData = objets.find(o => o.id === selectedObjet)
   const selectedArbreData = arbres.find(a => a.id === selectedArbre)
+  const nomSelection = selectedPlancheData?.nom || selectedPlancheData?.id || selectedObjetData?.nom || (selectedObjetData ? labelTypeObjet(selectedObjetData.type) : null) || selectedArbreData?.nom || (selection.length > 1 ? selection.length + ' éléments' : 'Sélection')
 
   // Parcelles proposées pour rattacher l'arbre sélectionné (mêmes règles que
   // la fiche /verger/[id] : compatibles verger + la parcelle déjà rattachée)
@@ -1200,7 +1253,7 @@ function JardinContent() {
     if (selPlanches.size > 0 || selObjets.size > 0 || arbreSansGps) {
       marquerChangement()
     }
-  }, [selection, arbres])
+  }, [selection, arbres, marquerChangement])
 
   // Orienter une planche : angle absolu, déjà normalisé dans [0, 360) par
   // RotationControl (le schéma Zod refuse un angle négatif — audit 2026-07, #24).
@@ -1337,7 +1390,7 @@ function JardinContent() {
           description: "Certaines positions n'ont pas pu être enregistrées"
         })
       }
-    } catch (error) {
+    } catch {
       toast({
         variant: "destructive",
         title: "Erreur",
@@ -1555,55 +1608,48 @@ function JardinContent() {
   // reprenait le nom déjà suffixé de la précédente → « 4-copie-copie-copie… ».
   // On numérote désormais à partir du nom de base, et on aligne les copies le
   // long de la largeur au lieu de les décaler en diagonale d'un mètre.
+  //
+  // Ticket QA du 2026-10-19 : l'écran recopiait lui-même les seules colonnes
+  // chargées pour dessiner le plan ; îlot, type, sol, rétention et rotation
+  // étaient perdus. Noms, positions et terrain sont désormais décidés par la
+  // route, qui relit la source en base (`src/lib/planches/copie.ts`), comme
+  // pour les arbres. La sauvegarde en attente est d'abord écrite pour que les
+  // copies partent de la position affichée.
   const handleDuplicatePlanche = async (nombre = 1) => {
     if (!selectedPlanche) return
     const source = planches.find(p => p.id === selectedPlanche)
     if (!source) return
-
-    const copies = Math.max(1, Math.min(nombre, MAX_COPIES_PLANCHE))
-    const noms = nomsCopiesEnLot(
-      source.nom || source.id,
-      planches.map(p => p.nom || p.id),
-      copies
-    )
-    const pas = (source.largeur || 1) + 0.4
-
     try {
-      let dernierId: string | null = null
-      for (const [index, nom] of noms.entries()) {
-        const response = await fetch("/api/planches", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            nom,
-            largeur: source.largeur,
-            longueur: source.longueur,
-            surface: (source.largeur || 0) * (source.longueur || 0),
-            posX: Math.round(((source.posX ?? 0) + pas * (index + 1)) * 10) / 10,
-            posY: source.posY ?? 0,
-            rotation2D: source.rotation2D,
-            parcelleGeoId: selectedParcelleId || undefined,
-          })
-        })
-
-        if (!response.ok) {
-          const err = await response.json()
-          throw new Error(err.error || "Erreur duplication")
+      // La route part de la position EN BASE. Une source déplacée, ou ancienne
+      // sans coordonnées et posée automatiquement à l'écran (sans armer
+      // `hasChanges`), est d'abord écrite ; sinon les copies tomberaient loin
+      // d'elle. `handleSave` n'avance l'état sauvé qu'en cas de succès : on le
+      // relit avant d'appeler la route.
+      const sourceNonSauvee = () =>
+        entitesModifiees([source], planchesSauveesRef.current, empreintePlanche).length > 0
+      if (hasChanges || sourceNonSauvee()) {
+        await handleSave()
+        if (sourceNonSauvee()) {
+          throw new Error("La position de la planche n'a pas pu être enregistrée : duplication annulée.")
         }
-
-        const created = await response.json()
-        dernierId = created.id
       }
+      const response = await fetch(`/api/planches/${encodeURIComponent(selectedPlanche)}/dupliquer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nombre: Math.max(1, Math.min(nombre, MAX_COPIES_PLANCHE)) }),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(data?.error || "Erreur duplication")
+      const creees: { id: string; nom: string }[] = data?.planches ?? []
 
       toast({
-        title: copies > 1 ? `${copies} planches créées` : "Planche dupliquée",
-        description: noms.join(", "),
+        title: creees.length > 1 ? `${creees.length} planches créées` : "Planche dupliquée",
+        description: creees.map(p => p.nom).join(", "),
       })
-      await fetchPlanches()
-      if (dernierId) setSelection([{ type: 'planche', id: dernierId }])
+      await Promise.all([fetchPlanches(), fetchPlanchesSansParcelle()])
+      const derniere = creees[creees.length - 1]
+      if (derniere) { setSelection([{ type: 'planche', id: derniere.id }]); setDetailsMobilesOuverts(true) }
     } catch (error) {
-      // Les copies déjà créées avant l'échec sont conservées : on rafraîchit
-      // pour que le plan reflète l'état réel plutôt qu'un compte optimiste.
       await fetchPlanches()
       toast({
         variant: "destructive",
@@ -1641,6 +1687,7 @@ function JardinContent() {
 
       toast({ title: `Reclassé en ${label.toLowerCase()}`, description: source?.nom })
       setSelection(payload?.objet?.id ? [{ type: 'objet', id: payload.objet.id }] : [])
+      setDetailsMobilesOuverts(Boolean(payload?.objet?.id))
       await Promise.all([fetchPlanches(), fetchObjets()])
     } catch (error) {
       toast({
@@ -1792,7 +1839,7 @@ function JardinContent() {
         description: source.nom ? noms.join(", ") : label,
       })
       await fetchObjets()
-      if (dernierId !== null) setSelection([{ type: 'objet', id: dernierId }])
+      if (dernierId !== null) { setSelection([{ type: 'objet', id: dernierId }]); setDetailsMobilesOuverts(true) }
     } catch (error) {
       // Comme pour les planches : les copies créées avant l'échec sont
       // conservées, on rafraîchit pour montrer l'état réel.
@@ -1869,6 +1916,9 @@ function JardinContent() {
       // en zone tropicale) renvoyé par l'API — non bloquant.
       const created = await response.json().catch(() => null)
       const precisions = [
+        // Ticket cmvnopnsu — la création génère le calendrier d'entretien :
+        // le plan l'annonce comme la liste des arbres.
+        created?.calendrierGenere ? "Calendrier d'entretien généré." : null,
         created?.especeHorsCatalogue
           ? `« ${created.espece} » n'est pas au catalogue : pas de calendrier d'entretien ni de contrôle climatique automatiques.`
           : null,
@@ -1901,25 +1951,29 @@ function JardinContent() {
   // par un, et un visiteur de la démo qui demandait comment faire). Les
   // positions et noms sont calculés côté serveur, la sauvegarde en attente est
   // d'abord écrite pour que la copie parte de la position affichée.
-  const handleDuplicateArbre = async (nombre = 1) => {
+  // L'achat n'est recopié que si la case du menu est cochée (revue du
+  // 2026-10-29 : une dépense d'achat par copie naissait sans prévenir).
+  const handleDuplicateArbre = async (nombre = 1, recopierAchat = false) => {
     if (!selectedArbre) return
     try {
       if (hasChanges) await handleSave()
       const response = await fetch(`/api/arbres/${selectedArbre}/dupliquer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nombre }),
+        body: JSON.stringify({ nombre, recopierAchat }),
       })
       const data = await response.json().catch(() => null)
       if (!response.ok) throw new Error(data?.error || "Erreur duplication")
       const noms: string[] = (data?.arbres ?? []).map((a: { nom: string }) => a.nom)
+      const achats = Number(data?.achatsRecopies) || 0
       toast({
         title: noms.length > 1 ? `${noms.length} arbres créés` : "Arbre dupliqué",
-        description: noms.join(", "),
+        description: [noms.join(", "), achats === 0 ? null : achats === 1 ? "1 dépense d'achat créée" : `${achats} dépenses d'achat créées`]
+          .filter(Boolean).join(". "),
       })
       await Promise.all([fetchArbres(), fetchArbresSansParcelle()])
       const dernier = data?.arbres?.[data.arbres.length - 1]
-      if (dernier) setSelection([{ type: 'arbre', id: dernier.id }])
+      if (dernier) { setSelection([{ type: 'arbre', id: dernier.id }]); setDetailsMobilesOuverts(true) }
     } catch (error) {
       await fetchArbres()
       toast({
@@ -1934,7 +1988,9 @@ function JardinContent() {
   const handleDeleteArbre = async () => {
     if (!selectedArbre) return
     const arbre = arbres.find(a => a.id === selectedArbre)
-    if (!(await confirmDialog(`Supprimer l'arbre "${arbre?.nom}" ?`))) return
+    // Revue du 2026-10-29 : la dépense d'achat sans versement part avec l'arbre.
+    const achat = (arbre?.prixAchat ?? 0) > 0 ? " Sa dépense d'achat sera supprimée aussi." : ""
+    if (!(await confirmDialog(`Supprimer l'arbre "${arbre?.nom}" ?${achat}`))) return
 
     try {
       const response = await fetch(`/api/arbres/${selectedArbre}`, {
@@ -2176,44 +2232,24 @@ function JardinContent() {
     (especeId: string) => {
       const ids = planchesParEspece.get(especeId) ?? []
       if (ids.length === 0) return
-      setSelection(
-        especeEnSurbrillance(especeId) ? [] : ids.map(id => ({ type: 'planche' as const, id }))
-      )
+      const dejaSelectionnee = especeEnSurbrillance(especeId)
+      setSelection(dejaSelectionnee ? [] : ids.map(id => ({ type: 'planche' as const, id })))
+      setDetailsMobilesOuverts(!dejaSelectionnee)
     },
     [planchesParEspece, especeEnSurbrillance]
   )
 
   return (
-    <div className="min-h-screen bg-slate-50 aurora-bg-subtle">
+    <div ref={racinePlanRef} className="min-h-screen bg-slate-50 aurora-bg-subtle">
       <div className="fixed inset-0 dot-grid opacity-40 pointer-events-none" aria-hidden="true" />
       {/* Header */}
-      <header className="border-b bg-white/80 backdrop-blur-sm sticky top-0 z-50">
-        <div className="container mx-auto flex flex-wrap items-center justify-between gap-3 px-3 py-3 sm:px-4">
-          {/* xl:min-w-fit : le bloc titre ne se compresse jamais sur grand
-              écran — si la barre d'outils manque de place, elle passe sur sa
-              propre ligne (flex-wrap du parent) au lieu de chevaucher le titre. */}
-          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 sm:gap-4 xl:min-w-fit xl:flex-nowrap">
-            <Link href="/">
-              <Button variant="ghost" size="sm">
-                <ArrowLeft className="h-4 w-4 mr-2" />
-                Accueil
-              </Button>
-            </Link>
-            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 xl:flex-nowrap">
-              <MapIcon className="h-6 w-6 text-green-600 flex-shrink-0" />
-              {/* Bug cmp8rs6uh (Marc 2026-05-16) — titre cassé sur 3 lignes
-                  quand le sélecteur de parcelle pousse la ligne : on bloque
-                  le wrap du titre et on laisse le flex-wrap se faire entre
-                  bloc-titre et bloc-actions. */}
-              <h1 className="text-xl font-bold whitespace-nowrap">Plan du jardin</h1>
-
-              {/* Selecteur de parcelle */}
-              {parcelles.length > 0 && (
+      <AppHeader />
+      <PageEntete ref={entetePlanRef} id="jardin" actions={parcelles.length > 0 && (
                 <Select
                   value={selectedParcelleId ?? "all"}
                   onValueChange={(v) => setSelectedParcelleId(v === "all" ? null : v === "none" ? "none" : v)}
                 >
-                  <SelectTrigger className="w-full min-w-0 sm:ml-2 sm:w-[200px]">
+                  <SelectTrigger className="w-full min-w-0 sm:w-[240px]" aria-label="Parcelle du plan">
                     <SelectValue placeholder="Toutes les parcelles" />
                   </SelectTrigger>
                   <SelectContent>
@@ -2226,9 +2262,10 @@ function JardinContent() {
                     <SelectItem value="none">Non assigné</SelectItem>
                   </SelectContent>
                 </Select>
-              )}
-            </div>
-          </div>
+              )} />
+      <div ref={outilsPlanRef} className="sticky top-[var(--app-header-visible-h,var(--app-header-h,0px))] z-30 border-b border-lin bg-craie/95 backdrop-blur-sm">
+        <div className="mx-auto flex w-full max-w-[1600px] flex-wrap items-center justify-end gap-3 px-4 py-3 lg:px-6">
+
 
           {/* Barre complète sur grand écran. En dessous de 1280 px, une version
               compacte évite tout débordement et conserve des cibles tactiles de 40 px.
@@ -2358,8 +2395,8 @@ function JardinContent() {
             )}
           </div>
 
-          <div className="flex w-full flex-wrap items-center gap-2 xl:hidden">
-            <div className="flex h-10 items-center rounded-md border bg-white">
+          <div className="flex w-full flex-wrap items-center gap-1 xl:hidden [&_button]:min-h-11 [&_button]:min-w-11 [&_a]:min-h-11 [&_a]:min-w-11">
+            <div className="flex min-h-11 items-center rounded-md border bg-white">
               <Button
                 variant="ghost"
                 size="icon"
@@ -2369,7 +2406,7 @@ function JardinContent() {
               >
                 <ZoomOut className="h-4 w-4" />
               </Button>
-              <span className="w-14 text-center text-xs tabular-nums">{scale}px/m</span>
+              <span className="w-12 text-center text-xs tabular-nums">{scale}px/m</span>
               <Button
                 variant="ghost"
                 size="icon"
@@ -2478,14 +2515,14 @@ function JardinContent() {
             )}
           </div>
         </div>
-      </header>
+      </div>
 
       {/* Content */}
-      <main className="container mx-auto px-2 py-3 sm:px-4 sm:py-4">
+      <ConteneurPage className="py-4">
         <div className="grid gap-4 lg:grid-cols-[1fr_280px]">
           {/* Plan */}
           <Card className={isPlanFullscreen ? "fixed inset-0 z-[100] overflow-hidden rounded-none border-0 bg-emerald-50" : "overflow-hidden"}>
-            <CardContent className={isPlanFullscreen ? "relative h-[100dvh] p-0" : "relative h-[max(420px,calc(100dvh-250px))] p-0 sm:h-[max(500px,calc(100dvh-200px))]"}>
+            <CardContent className={isPlanFullscreen ? "relative h-[100dvh] p-0" : "relative min-h-[420px] p-0 sm:min-h-[500px]"} style={isPlanFullscreen ? undefined : { height: "calc(100dvh - var(--app-header-h, 0px) - var(--plan-entete-h, 0px) - var(--navigation-basse-h, 0px) - 2rem)" }}>
               {isPlanFullscreen && (
                 <>
                   <div className="absolute right-3 top-3 z-20 flex items-center gap-1 rounded-xl border bg-white/95 p-1.5 shadow-lg backdrop-blur sm:right-4 sm:top-4 sm:gap-2">
@@ -2528,6 +2565,7 @@ function JardinContent() {
                   </div>
                 </>
               )}
+              {selection.length > 0 && (!detailsMobilesOuverts || isPlanFullscreen) && <Button ref={boutonDetailsRef} type="button" variant="secondary" className="absolute right-3 top-16 z-30 min-h-11 max-w-[calc(100%_-_1.5rem)] lg:hidden" aria-controls="details-selection-plan" aria-expanded={false} onClick={() => { setIsPlanFullscreen(false); setDetailsMobilesOuverts(true) }}>Détails de {nomSelection}</Button>}
               {tool !== 'select' && (
                 <div className="absolute top-3 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-full bg-slate-900/80 py-1.5 pl-3 pr-1.5 text-xs text-white shadow">
                   <span className="whitespace-nowrap">
@@ -2573,6 +2611,15 @@ function JardinContent() {
                     editable
                     selection={selection}
                     onSelectionChange={handleSelectionChange}
+                    onSelectionActivate={() => {
+                      setDetailsMobilesOuverts(true)
+                      // Déjà ouvert : revenir à la culture de la nouvelle sélection,
+                      // uniquement après le tap confirmé, jamais au pointerdown.
+                      if (detailsMobilesOuverts && !isPlanFullscreen && window.matchMedia('(max-width: 1023px)').matches) requestAnimationFrame(() => {
+                        contenuDetailsRef.current?.scrollTo({ top: 0 })
+                        titreDetailsRef.current?.focus({ preventScroll: true })
+                      })
+                    }}
                     onGroupMove={handleGroupMove}
                     onPlancheMove={handlePlancheMove}
                     onObjetMove={handleObjetMove}
@@ -2717,11 +2764,14 @@ function JardinContent() {
           </Card>
 
           {/* Sidebar */}
-          <div className="space-y-4">
+          <div className="min-w-0 space-y-4">
             {/* Planche sélectionnée */}
-            {selectedPlancheData ? (
+            <div id="details-selection-plan" role="region" aria-label="Détails de la sélection du plan" style={{ '--details-plan-bas': 'calc(var(--navigation-basse-h, 0px) + 0.5rem)', '--details-plan-hauteur': detailsAgrandis ? 'min(72dvh, calc(100dvh - var(--app-header-visible-h, 0px) - var(--navigation-basse-h, 0px) - 1rem))' : 'min(48dvh, calc(100dvh - var(--app-header-visible-h, 0px) - var(--navigation-basse-h, 0px) - 1rem))' } as React.CSSProperties} className={selection.length > 0 ? (detailsMobilesOuverts && !isPlanFullscreen ? 'fixed inset-x-2 bottom-[var(--details-plan-bas)] z-40 flex max-h-[var(--details-plan-hauteur)] min-w-0 max-w-full flex-col overflow-hidden rounded-xl border border-lin bg-craie shadow-xl' : 'hidden') + ' lg:static lg:block lg:max-h-none lg:overflow-visible lg:rounded-none lg:border-0 lg:bg-transparent lg:shadow-none' : ''} onKeyDown={event => { if (event.key === 'Escape' && window.matchMedia('(max-width: 1023px)').matches) { event.stopPropagation(); retourAuPlan() } }}>
+              {selection.length > 0 && <div className="flex shrink-0 items-center justify-between gap-3 border-b border-lin px-4 py-2 lg:hidden"><div className="min-w-0"><h2 ref={titreDetailsRef} tabIndex={-1} className="truncate text-base font-semibold text-encre focus:outline-none">{nomSelection}</h2>{selectedPlancheData && <p className="text-xs text-ardoise">{selectedPlancheData.largeur ?? '–'} × {selectedPlancheData.longueur ?? '–'} m{selectedPlancheData.largeur != null && selectedPlancheData.longueur != null && <> · {(selectedPlancheData.largeur * selectedPlancheData.longueur).toLocaleString('fr-FR')} m²</>}</p>}</div><div className="flex shrink-0 items-center gap-1"><Button type="button" variant="ghost" size="icon" className="min-h-11 min-w-11" aria-label={detailsAgrandis ? "Réduire les détails" : "Agrandir les détails"} title={detailsAgrandis ? "Réduire les détails" : "Agrandir les détails"} aria-pressed={detailsAgrandis} onClick={() => setDetailsAgrandis(value => !value)}>{detailsAgrandis ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}</Button><Button type="button" variant="outline" size="sm" className="min-h-11 shrink-0" onClick={retourAuPlan}>Retour au plan</Button></div></div>}
+              <div ref={contenuDetailsRef} className="min-h-0 min-w-0 overflow-x-hidden overflow-y-auto overscroll-contain [&_button]:min-h-11 [&_button]:min-w-11 [&_input]:min-h-11 lg:[&_button]:min-h-0 lg:[&_button]:min-w-0 lg:[&_input]:min-h-0 [&>div]:min-w-0 [&>div]:max-w-full [&>div]:rounded-none [&>div]:border-0 [&>div]:shadow-none lg:overflow-visible lg:[&>div]:rounded-xl lg:[&>div]:border lg:[&>div]:shadow">
+                {selectedPlancheData ? (
               <Card>
-                <CardHeader className="pb-2">
+                <CardHeader className={renommageMobile ? "pb-2" : "hidden pb-2 lg:flex"}>
                   <div className="flex items-center justify-between gap-2">
                     {/* Nom modifiable sur place : sans ça, une planche mal
                         nommée à la duplication le restait définitivement. */}
@@ -2736,57 +2786,15 @@ function JardinContent() {
                         if (e.key === "Escape") { setNomPlancheEdite(null); e.currentTarget.blur() }
                       }}
                       title="Cliquez pour renommer la planche"
+                      id="nom-planche-selection"
                       aria-label="Nom de la planche"
                     />
-                    <Button variant="ghost" size="icon" onClick={() => setSelection([])}>
+                    <Button variant="ghost" size="icon" className="hidden lg:inline-flex" aria-label="Désélectionner cet élément" onClick={() => setSelection([])}>
                       <X className="h-4 w-4" />
                     </Button>
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-3">
-                  <div className="grid grid-cols-2 gap-2 text-sm">
-                    <div>
-                      <label className="text-muted-foreground block text-xs">Largeur (m)</label>
-                      <input
-                        type="number"
-                        step="0.1"
-                        min="0.1"
-                        className="w-full border rounded px-2 py-1 text-sm font-medium"
-                        value={selectedPlancheData.largeur || 0}
-                        onChange={(e) => {
-                          const val = parseFloat(e.target.value) || 0
-                          setPlanches(prev => prev.map(p =>
-                            p.id === selectedPlancheData.id ? { ...p, largeur: val } : p
-                          ))
-                          marquerChangement()
-                        }}
-                      />
-                    </div>
-                    <div>
-                      <label className="text-muted-foreground block text-xs">Longueur (m)</label>
-                      <input
-                        type="number"
-                        step="0.1"
-                        min="0.1"
-                        className="w-full border rounded px-2 py-1 text-sm font-medium"
-                        value={selectedPlancheData.longueur || 0}
-                        onChange={(e) => {
-                          const val = parseFloat(e.target.value) || 0
-                          setPlanches(prev => prev.map(p =>
-                            p.id === selectedPlancheData.id ? { ...p, longueur: val } : p
-                          ))
-                          marquerChangement()
-                        }}
-                      />
-                    </div>
-                    <div className="col-span-2">
-                      <span className="text-muted-foreground">Surface:</span>
-                      <span className="ml-1 font-medium">
-                        {((selectedPlancheData.largeur || 0) * (selectedPlancheData.longueur || 0)).toFixed(1)} m²
-                      </span>
-                    </div>
-                  </div>
-
                   {selectedPlancheData.cultures.length > 0 ? (
                     <div>
                       <span className="text-sm text-muted-foreground">
@@ -2831,6 +2839,57 @@ function JardinContent() {
                   ) : (
                     <p className="text-sm text-muted-foreground italic">Aucune culture</p>
                   )}
+
+                  <div className="grid grid-cols-2 gap-2 text-sm">
+                    <div>
+                      <label htmlFor="selection-planche-largeur" className="text-muted-foreground block text-xs">Largeur (m)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0.1"
+                        className="w-full border rounded px-2 py-1 text-sm font-medium"
+                        id="selection-planche-largeur"
+                        value={selectedPlancheData.largeur || 0}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value) || 0
+                          setPlanches(prev => prev.map(p =>
+                            p.id === selectedPlancheData.id ? { ...p, largeur: val } : p
+                          ))
+                          marquerChangement()
+                        }}
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="selection-planche-longueur" className="text-muted-foreground block text-xs">Longueur (m)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0.1"
+                        className="w-full border rounded px-2 py-1 text-sm font-medium"
+                        id="selection-planche-longueur"
+                        value={selectedPlancheData.longueur || 0}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value) || 0
+                          setPlanches(prev => prev.map(p =>
+                            p.id === selectedPlancheData.id ? { ...p, longueur: val } : p
+                          ))
+                          marquerChangement()
+                        }}
+                      />
+                    </div>
+                    <div className="col-span-2">
+                      <span className="text-muted-foreground">Surface:</span>
+                      <span className="ml-1 font-medium">
+                        {((selectedPlancheData.largeur || 0) * (selectedPlancheData.longueur || 0)).toFixed(1)} m²
+                      </span>
+                    </div>
+                  </div>
+
+
+                  {!renommageMobile && <Button type="button" variant="ghost" size="sm" className="w-full justify-start lg:hidden" onClick={() => {
+                    setRenommageMobile(true)
+                    requestAnimationFrame(() => document.getElementById('nom-planche-selection')?.focus())
+                  }}>Renommer la planche</Button>}
 
                   {/* Pluviométrie */}
                   <div className="pt-2 border-t">
@@ -2910,7 +2969,7 @@ function JardinContent() {
                     <CardTitle className="text-base">
                       {selectedObjetData.nom || labelTypeObjet(selectedObjetData.type)}
                     </CardTitle>
-                    <Button variant="ghost" size="icon" onClick={() => setSelection([])}>
+                    <Button variant="ghost" size="icon" className="hidden lg:inline-flex" aria-label="Désélectionner cet élément" onClick={() => setSelection([])}>
                       <X className="h-4 w-4" />
                     </Button>
                   </div>
@@ -3012,7 +3071,7 @@ function JardinContent() {
                               marquerChangement()
                             }}
                           >
-                            Par defaut
+                            Par défaut
                           </Button>
                         </div>
                       </div>
@@ -3062,7 +3121,7 @@ function JardinContent() {
                 <CardHeader className="pb-2">
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-base">{selectedArbreData.nom}</CardTitle>
-                    <Button variant="ghost" size="icon" onClick={() => setSelection([])}>
+                    <Button variant="ghost" size="icon" className="hidden lg:inline-flex" aria-label="Désélectionner cet élément" onClick={() => setSelection([])}>
                       <X className="h-4 w-4" />
                     </Button>
                   </div>
@@ -3149,17 +3208,31 @@ function JardinContent() {
                       {/* Porte-greffe & conduite */}
                       <div className="grid grid-cols-2 gap-2">
                         <div>
-                          <Label className="text-xs text-muted-foreground">Porte-greffe</Label>
-                          <Combobox
-                            value={selectedArbreData.portGreffe || ""}
-                            onValueChange={(v) => {
+                          <Label htmlFor="inspecteur-porte-greffe" className="text-xs text-muted-foreground">Porte-greffe</Label>
+                          {/* QA cmvkp3kqc (2026-10-23) — même champ que la fiche :
+                              le libellé du référentiel (`porteGreffeRef`) s'affiche
+                              quand la colonne texte est vide, et l'id n'est plus
+                              effacé par une simple réouverture. */}
+                          <ChampPorteGreffe
+                            key={selectedArbreData.id}
+                            id="inspecteur-porte-greffe"
+                            espece={selectedArbreData.espece}
+                            porteGreffeId={selectedArbreData.porteGreffeId}
+                            portGreffe={selectedArbreData.portGreffe}
+                            porteGreffeNom={selectedArbreData.porteGreffeRef?.nom ?? null}
+                            suggestions={arbrePortGreffeOptions}
+                            onChange={(v) => {
                               setArbres(prev => prev.map(a =>
-                                a.id === selectedArbre ? { ...a, portGreffe: v || null, porteGreffeId: null } : a
+                                a.id === selectedArbre
+                                  ? {
+                                      ...a,
+                                      ...v,
+                                      porteGreffeRef: v.porteGreffeId && v.portGreffe ? { id: v.porteGreffeId, nom: v.portGreffe } : null,
+                                    }
+                                  : a
                               ))
                               marquerChangement()
                             }}
-                            options={arbrePortGreffeOptions}
-                            placeholder="Ex: M26"
                             className="h-8 text-sm"
                           />
                         </div>
@@ -3516,7 +3589,7 @@ function JardinContent() {
                               marquerChangement()
                             }}
                           >
-                            Par defaut
+                            Par défaut
                           </Button>
                         </div>
                       </div>
@@ -3547,21 +3620,12 @@ function JardinContent() {
                       </Button>
 
                       <div className="flex gap-2">
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button variant="outline" size="sm" className="flex-1">
-                              <Copy className="h-4 w-4 mr-2" />
-                              Dupliquer
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="start">
-                            {[1, 2, 3, 5, 10].map(n => (
-                              <DropdownMenuItem key={n} onClick={() => handleDuplicateArbre(n)}>
-                                {n === 1 ? "Dupliquer" : `Dupliquer ×${n}`}
-                              </DropdownMenuItem>
-                            ))}
-                          </DropdownMenuContent>
-                        </DropdownMenu>
+                        <MenuDuplicationArbre arbre={selectedArbreData} align="start" onDupliquer={handleDuplicateArbre}>
+                          <Button variant="outline" size="sm" className="flex-1">
+                            <Copy className="h-4 w-4 mr-2" />
+                            Dupliquer
+                          </Button>
+                        </MenuDuplicationArbre>
                         <Button variant="destructive" size="sm" onClick={handleDeleteArbre} className="flex-1">
                           <Trash2 className="h-4 w-4 mr-2" />
                           Supprimer
@@ -3575,7 +3639,7 @@ function JardinContent() {
                 <CardHeader className="pb-2">
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-base">{selection.length} éléments</CardTitle>
-                    <Button variant="ghost" size="icon" onClick={() => setSelection([])}>
+                    <Button variant="ghost" size="icon" className="hidden lg:inline-flex" aria-label="Désélectionner cet élément" onClick={() => setSelection([])}>
                       <X className="h-4 w-4" />
                     </Button>
                   </div>
@@ -3605,6 +3669,8 @@ function JardinContent() {
                 </CardContent>
               </Card>
             )}
+              </div>
+            </div>
 
             {/* Légende */}
             <Card>
@@ -3730,7 +3796,7 @@ function JardinContent() {
             </Card>
           </div>
         </div>
-      </main>
+      </ConteneurPage>
 
       {/* Dialog création planche */}
       <Dialog open={showNewPlancheDialog} onOpenChange={setShowNewPlancheDialog}>
@@ -3919,7 +3985,7 @@ function JardinContent() {
               </div>
             </div>
             <div>
-              <Label htmlFor="arbre-fournisseur">Fournisseur / Lieu d'achat</Label>
+              <Label htmlFor="arbre-fournisseur">Fournisseur / Lieu d&apos;achat</Label>
               <Combobox
                 value={newArbre.fournisseur}
                 onValueChange={v => setNewArbre(a => ({ ...a, fournisseur: v }))}

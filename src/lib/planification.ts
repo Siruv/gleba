@@ -4,9 +4,10 @@
  */
 
 import prisma from '@/lib/prisma'
-import { getISOWeek, getISOWeekYear } from 'date-fns'
+import { getISOWeek, getISOWeekYear, getISOWeeksInYear } from 'date-fns'
 import { calculerDateDepuisSemaine, dateSemaineChrono } from './assistant-helpers'
 import { whereItpUtilisable } from './itp-acces'
+import { visibiliteReferentiel } from './referentiel-communaute'
 import { alertesAssociations } from './associations-alertes'
 import { appliquerDecalageItp, decalageItpPourLecteur } from './calendrier-climat'
 import { moisDepuisSemaine, semaineSemisEffective } from './cultures/dates-itp'
@@ -19,12 +20,14 @@ import {
   type QuantiteParUnite,
 } from './recolte/quantites'
 import { chargerSurchargesRendement, rendementEffectif } from './recolte/rendement-effectif'
-import type { StatutSemence } from './semences/calcul'
+import { quantiteEntiereAvecMarge, type BesoinSemenceInput, type StatutSemence } from './semences/calcul'
 import { zoneEffectiveUser } from './terroir'
 import { etapeCycleRotation } from './rotation/etape-cycle'
 import { evaluerOccupationPlanche } from './planche-validation'
 import { selectCulturesOccupation } from './planches/occupation'
 import { finDeCycle, finRecolteDepuisItp } from './cultures/fenetre-recolte'
+import { nbPlantsCulture } from './cultures/quantite-plants'
+import { dateJourSeul } from './jour-civil'
 
 export { etapeCycleRotation, EPOCH_ROTATION_SANS_ANCRAGE } from './rotation/etape-cycle'
 
@@ -183,6 +186,13 @@ export interface BesoinSemence {
   /** true si nbGrainesG est une estimation (fallback espèce), pas la valeur saisie. */
   nbGrainesGEstime: boolean
   doseSemis: number | null
+  /** Plusieurs conduites : dose moyenne pondérée par surface ou nombre de plants. */
+  doseMoyenne?: boolean
+  /**
+   * Une partie des cultures du couple n'a pas de dose : le besoin ne compte que
+   * les cultures dosées. Le statut reste `DONNEE_MANQUANTE` et `doseSemis` null.
+   */
+  besoinPartiel?: boolean
   /** Unité dans laquelle est exprimée la dose (cf. Espece.uniteDose). */
   uniteDose: 'g_m2' | 'pieces_m2' | 'graines_plant' | 'caieux_m2' | null
   /** Taux de germination réaliste (mémo pour tooltip marge). */
@@ -237,38 +247,19 @@ export interface AssociationCulture {
 // FONCTIONS UTILITAIRES
 // ============================================================
 
-/**
- * Calcule l'annee reelle a partir de l'annee de base et de l'annee dans le cycle
- */
-function calculerAnneeReelle(anneeBase: number, anneeCycle: number, nbAnneesCycle: number): number {
-  // anneeCycle est 1-indexed (1, 2, 3...)
-  // On utilise modulo pour gerer les cycles
-  return anneeBase + (anneeCycle - 1)
-}
 
 /**
- * Calcule l'annee du cycle pour une annee donnee
- */
-function calculerAnneeCycle(annee: number, anneeBase: number, nbAnneesCycle: number): number {
-  if (nbAnneesCycle <= 0) return 1
-  const diff = annee - anneeBase
-  return ((diff % nbAnneesCycle) + nbAnneesCycle) % nbAnneesCycle + 1
-}
-
-/**
- * Calcule le nombre de plants pour une planche/ITP donne
+ * Calcule le nombre de plants pour une planche/ITP donne. Même règle que la
+ * création d'une culture et ses écrans (`nbPlantsCulture`, ticket cmvnpkkhp) :
+ * Plants recalcule ce que la fiche aurait dû enregistrer.
  */
 function calculerNbPlants(
   longueur: number | null,
-  largeur: number | null,
+  _largeur: number | null,
   nbRangs: number | null,
   espacement: number | null
 ): number {
-  if (!longueur || !nbRangs || !espacement) return 0
-  // espacement en cm, longueur en m
-  const longueurCm = longueur * 100
-  const nbPlantsParRang = Math.floor(longueurCm / espacement)
-  return nbPlantsParRang * nbRangs
+  return nbPlantsCulture(longueur, nbRangs, espacement) ?? 0
 }
 
 /**
@@ -854,7 +845,7 @@ export async function getRecoltesPrevuesDetail(
 
   // Convertir en tableau
   const result: RecoltePrevue[] = []
-  const maxPeriode = groupBy === 'mois' ? 12 : 52
+  const maxPeriode = groupBy === 'mois' ? 12 : getISOWeeksInYear(new Date(annee, 6, 1))
 
   for (let i = 1; i <= maxPeriode; i++) {
     const group = groupedMap.get(i)
@@ -1038,11 +1029,14 @@ export async function getBesoinsSemences(
   const especeIdsForFallback = [
     ...new Set(culturesPrevues.map(c => c.especeId).filter(Boolean) as string[]),
   ]
+  // Revue 2026-10-20 — ITP visibles du compte seulement : l'itinéraire privé
+  // d'un autre compte ne prête pas ses rangs à ce calcul.
   const itpsForFallback = await prisma.iTP.findMany({
     where: {
       especeId: { in: especeIdsForFallback },
       nbRangs: { not: null },
       espacement: { not: null },
+      AND: [visibiliteReferentiel(userId)],
     },
     select: { especeId: true, nbRangs: true, espacement: true },
     orderBy: { dureeCulture: 'desc' },
@@ -1094,10 +1088,10 @@ export async function getBesoinsSemences(
     varieteId: string | null
     surfaceTotale: number
     nbPlants: number
-    /** Dose de semis (g/m²) portée par l'ITP rattaché, si elle existe. */
-    doseItpGParM2: number | null
-    /** Graines par plant portées par l'ITP rattaché, si elles existent. */
-    grainesParPlantItp: number | null
+    sommeDosePonderee: number
+    doses: Set<number>
+    doseManquante: boolean
+    aDoseItp: boolean
   }
   const densiteFallbackSemences = new Map<string, number>()
   for (const e of especes) {
@@ -1124,20 +1118,31 @@ export async function getBesoinsSemences(
       varieteId: culture.varieteId,
       surfaceTotale: 0,
       nbPlants: 0,
-      doseItpGParM2: null,
-      grainesParPlantItp: null,
+      sommeDosePonderee: 0,
+      doses: new Set<number>(),
+      doseManquante: false,
+      aDoseItp: false,
     }
     cur.surfaceTotale += mesure.surfaceM2
     cur.nbPlants += mesure.nbPlants
-    // Dose de l'itinéraire rattaché : première renseignée du groupe.
-    if (culture.itpId) {
-      const dosesItp = itpDoseMap.get(culture.itpId)
-      if (cur.doseItpGParM2 == null && dosesItp?.doseSemis != null) {
-        cur.doseItpGParM2 = dosesItp.doseSemis
-      }
-      if (cur.grainesParPlantItp == null && dosesItp?.nbGrainesPlant != null) {
-        cur.grainesParPlantItp = dosesItp.nbGrainesPlant
-      }
+    // Chaque culture garde la dose de SA conduite. La moyenne permet de
+    // cumuler le besoin avant marge/arrondi et de déduire le stock une seule
+    // fois, sans dépendre de l'ordre des cultures d'une même variété.
+    const espece = especeMap.get(culture.especeId)
+    const unite = (espece?.uniteDose ?? null) as UniteDoseSemence
+    const dosesItp = culture.itpId ? itpDoseMap.get(culture.itpId) : undefined
+    const doseItp = unite === 'graines_plant'
+      ? dosesItp?.nbGrainesPlant
+      : unite === null || unite === 'g_m2' ? dosesItp?.doseSemis : null
+    const dose = doseItp ?? espece?.doseSemis ?? (
+      espece?.modeSemis === 'plant_repique' && unite === 'graines_plant' ? 1 : null
+    )
+    const poids = unite === 'graines_plant' ? mesure.nbPlants : mesure.surfaceM2
+    cur.aDoseItp ||= doseItp != null
+    if (dose != null) cur.doses.add(dose)
+    if (poids > 0) {
+      if (dose == null || dose <= 0) cur.doseManquante = true
+      else cur.sommeDosePonderee += dose * poids
     }
     accMap.set(key, cur)
   }
@@ -1155,21 +1160,20 @@ export async function getBesoinsSemences(
     // correspond. Une espèce comptée en pièces/m² ou en caïeux/m² garde donc
     // la sienne — substituer des g/m² à des pièces/m² changerait la grandeur.
     const uniteEspece = (espece?.uniteDose ?? null) as UniteDoseSemence
-    const doseItp =
-      uniteEspece === 'graines_plant'
-        ? acc.grainesParPlantItp
-        : uniteEspece === null || uniteEspece === 'g_m2'
-          ? acc.doseItpGParM2
-          : null
-    const doseEffective = doseItp ?? espece?.doseSemis ?? null
+    const poidsTotal = uniteEspece === 'graines_plant' ? acc.nbPlants : acc.surfaceTotale
+    // Une culture sans dose n'annule plus le besoin de tout son couple : comptée
+    // à dose nulle, la moyenne sur toute la surface (ou tous les plants) redonne
+    // la somme des seules cultures dosées. Aucune culture dosée : pas de dose.
+    const doseEffective = acc.doseManquante && acc.sommeDosePonderee <= 0 ? null : poidsTotal > 0
+      ? acc.sommeDosePonderee / poidsTotal
+      : acc.doses.values().next().value ?? null
     const uniteEffective: UniteDoseSemence =
-      doseItp != null && uniteEspece === null ? 'g_m2' : uniteEspece
+      acc.aDoseItp && uniteEspece === null ? 'g_m2' : uniteEspece
 
-    const calc = calculerBesoin({
+    const entree: BesoinSemenceInput = {
       mode: (espece?.modeSemis ?? 'graine_directe') as 'graine_directe' | 'plant_repique' | 'bulbe_caieu' | 'bouture',
       surfaceM2: acc.surfaceTotale,
       nbPlants: acc.nbPlants,
-      doseGParM2: doseEffective,
       uniteDose: uniteEffective,
       tauxGerminationPct: espece?.tauxGermination ?? null,
       // Fallback PMG par espèce si la variété n'a pas de graines/g saisi
@@ -1178,7 +1182,13 @@ export async function getBesoinsSemences(
       margeSecuritePct: espece?.margeSecuritePct ?? 15,
       stockGrammes: stock?.stockGraines ?? 0,
       stockUnites: stock?.stockPlants ?? 0,
-    })
+    }
+    const calc = calculerBesoin({ ...entree, doseGParM2: doseEffective })
+    // Besoin partiel : sans les cultures dosées, la dose manquante l'annulait.
+    // Il garde le statut « Dose manquante » (bandeau qui renvoie au référentiel,
+    // jamais de « OK » sur un besoin sous-estimé) et n'affiche pas de dose.
+    const besoinPartiel = acc.doseManquante && calc.statut !== 'DONNEE_MANQUANTE' &&
+      calculerBesoin({ ...entree, doseGParM2: null }).statut === 'DONNEE_MANQUANTE'
 
     results.push({
       especeId: acc.especeId,
@@ -1197,12 +1207,15 @@ export async function getBesoinsSemences(
       // On expose la valeur réellement utilisée + un flag « estimé » pour la transparence.
       nbGrainesG: variete?.nbGrainesG ?? defaultGrainesParGramme(acc.especeId),
       nbGrainesGEstime: variete?.nbGrainesG == null,
-      doseSemis: doseEffective,
+      // Diluée par les cultures sans dose, la moyenne n'est pas une dose : « - ».
+      doseSemis: acc.doseManquante ? null : doseEffective,
+      doseMoyenne: acc.doses.size > 1,
+      besoinPartiel,
       uniteDose: uniteEffective,
       tauxGerminationPct: espece?.tauxGermination ?? null,
       aCommander: calc.manqueGrammes,
       caieuxACommander: calc.manqueCaieux,
-      statut: calc.statut,
+      statut: besoinPartiel ? 'DONNEE_MANQUANTE' : calc.statut,
       stockDateMaj: stock?.dateStock?.toISOString() ?? null,
     })
   }
@@ -1259,7 +1272,13 @@ export async function getBesoinsPlants(
   // tombait à 0 plants alors qu'elle a 9,6 m² × densité 2/m² = 19).
   const especeIds = [...new Set(culturesAvecPlantation.map(c => c.especeId!).filter(Boolean))]
   const itpsParEspece = await prisma.iTP.findMany({
-    where: { especeId: { in: especeIds }, nbRangs: { not: null }, espacement: { not: null } },
+    where: {
+      especeId: { in: especeIds },
+      nbRangs: { not: null },
+      espacement: { not: null },
+      // ITP visibles du compte seulement (revue 2026-10-20).
+      AND: [visibiliteReferentiel(userId)],
+    },
     select: { especeId: true, nbRangs: true, espacement: true },
     orderBy: { dureeCulture: 'desc' }, // ITP le plus long = plus représentatif
   })
@@ -1359,7 +1378,7 @@ export async function getBesoinsPlants(
     let stockRestant = lignes[0]?.stockActuel ?? 0
     for (const besoin of lignes) {
       // Ajouter 10% de marge pour pertes
-      const nbPlantsAvecMarge = Math.ceil(besoin.nbPlants * 1.1)
+      const nbPlantsAvecMarge = quantiteEntiereAvecMarge(besoin.nbPlants, 10)
       const couvert = Math.min(stockRestant, nbPlantsAvecMarge)
       besoin.stockActuel = couvert
       besoin.aCommander = Math.max(0, nbPlantsAvecMarge - couvert)
@@ -1642,19 +1661,31 @@ export async function creerCulturesBatch(
     // `dates-itp.ts`. Avant, la culture 2028 matérialisée en S31 se relisait en
     // S30 (convention « semaine contenant le 1er janvier »).
     const semaineSemisEff = semaineSemisEffective(itpCalibre)
-    const dateSemis = semaineSemisEff
+    const semisLocal = semaineSemisEff
       ? calculerDateDepuisSemaine(annee, semaineSemisEff)
       : null
-    const datePlantation = itpCalibre.semainePlantation
+    const plantationLocale = itpCalibre.semainePlantation
       ? dateSemaineChrono(annee, itpCalibre.semainePlantation, semaineSemisEff)
       : null
-    const dateRecolte = itpCalibre.semaineRecolte
+    const recolteLocale = itpCalibre.semaineRecolte
       ? dateSemaineChrono(
           annee,
           itpCalibre.semaineRecolte,
           itpCalibre.semainePlantation ?? semaineSemisEff
         )
       : null
+    // Fenêtre de récolte dérivée de l'itinéraire, comme à la création unitaire
+    // (décalage en jours civils locaux, avant la conversion ci-dessous).
+    const finRecolteLocale = finRecolteDepuisItp(recolteLocale, itpCalibre)
+    // Ticket QA cmvnulry1 (2026-10-25) — `semaineVersDate` rend un minuit
+    // LOCAL : écrit tel quel, le semis du lundi 12/04/2027 était stocké le
+    // 11/04 à 22:00 UTC, que le Registre de culture (jour UTC) affichait au
+    // 11 avr. alors que la fiche (jour local) disait le 12. Une date au jour
+    // seul s'écrit à minuit UTC, comme une saisie « Nouvelle culture ».
+    const dateSemis = dateJourSeul(semisLocal)
+    const datePlantation = dateJourSeul(plantationLocale)
+    const dateRecolte = dateJourSeul(recolteLocale)
+    const finRecolte = dateJourSeul(finRecolteLocale)
 
     // QA cmv29cg0h — une culture concrétisée depuis la rotation arrivait sans
     // longueur, espacement ni quantité : la fiche affichait des champs vides
@@ -1667,8 +1698,6 @@ export async function creerCulturesBatch(
     const espacement = itp.espacement && itp.espacement > 0 ? Math.round(itp.espacement) : null
     const nbPlants = calculerNbPlants(longueur, null, itp.nbRangs, espacement)
     const quantite = nbPlants > 0 ? nbPlants : null
-    // Fenêtre de récolte dérivée de l'itinéraire, comme à la création unitaire.
-    const finRecolte = finRecolteDepuisItp(dateRecolte, itpCalibre)
 
     // Revue du 2026-10-11 (QA cmv2r1v63, cmv2r2rl8) — même règle d'occupation
     // que POST /api/cultures : « Créer quand même » une étape de rotation sur

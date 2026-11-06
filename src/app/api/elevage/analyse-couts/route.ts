@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
 import { reconstituerEffectifsLots } from '@/lib/elevage/effectif'
+import { libelleAtelierVentes } from '@/lib/elevage/types-vente'
+import { finJourLivraison } from '@/lib/commercial/dates-stock'
 
 const round = (value: number) => Math.round(value * 100) / 100
 
@@ -37,6 +39,9 @@ export async function GET(request: NextRequest) {
     const start = new Date(annee, 0, 1)
     const end = new Date(annee, 11, 31, 23, 59, 59, 999)
     const period = { gte: start, lte: end }
+    const productionPeriod = {
+      gte: start, lte: new Date(Math.min(end.getTime(), finJourLivraison(new Date()).getTime())),
+    }
 
     const [lots, animals, soins, consommations, abattages, ventes, productionsOeufs, productionsMiel, livraisons, paies] = await Promise.all([
       prisma.lotAnimaux.findMany({ where: { userId }, include: { especeAnimale: { select: { id: true, nom: true } } } }),
@@ -61,7 +66,7 @@ export async function GET(request: NextRequest) {
       }),
       prisma.abattage.findMany({ where: { userId, annule: false, date: period }, select: { lotId: true, animalId: true, prixVente: true, poidsCarcasse: true, quantite: true } }),
       prisma.venteProduit.findMany({ where: { userId, annule: false, date: period }, select: { type: true, prixTotal: true, animalId: true } }),
-      prisma.productionOeuf.findMany({ where: { userId, date: period }, select: { lotId: true, animalId: true, quantite: true } }),
+      prisma.productionOeuf.findMany({ where: { userId, date: productionPeriod }, select: { lotId: true, animalId: true, quantite: true } }),
       // QA cmswxw80j — l'atelier apicole portait ses coûts mais aucune
       // production : son coût unitaire restait « — » malgré 19,3 kg récoltés.
       // Le miel est la sortie de l'atelier ruche ; cire, propolis et pollen ne
@@ -75,6 +80,10 @@ export async function GET(request: NextRequest) {
     ])
 
     const lotById = new Map(lots.map(l => [l.id, l]))
+    // Le même prix dans les ateliers et dans le détail des lots. Zéro est
+    // un coût connu ; seuls les prix absents retombent sur le catalogue.
+    const prixAliment = (c: typeof consommations[number]) =>
+      c.aliment.userStocks[0]?.coutUnitaire ?? c.aliment.userStocks[0]?.prix ?? c.aliment.prix ?? 0
     const animalById = new Map(animals.map(a => [a.id, a]))
     const ateliers = new Map<string, Atelier>()
     const getAtelier = (code: string, libelle: string) => {
@@ -95,15 +104,16 @@ export async function GET(request: NextRequest) {
     // lot (5 chèvres comptées 9). Même source de vérité que la fiche du lot et
     // le dashboard : effectif reconstitué du lot, dont on retire les
     // nominatives présentes, comptées une fois chacune sur leur propre espèce.
-    const effectifsLots = await reconstituerEffectifsLots(
-      userId,
-      lots.filter((l) => l.statut === 'actif'),
-    )
+    // Revue 2026-10-20 — reconstitué pour tous les lots : la ligne par lot
+    // (`data`) sert le même effectif que l'écran Lots, actif ou non.
+    const effectifsLots = await reconstituerEffectifsLots(userId, lots)
+    const effectifLot = (lot: { id: number; quantiteActuelle: number }) =>
+      effectifsLots.get(lot.id)?.effectifCalcule ?? lot.quantiteActuelle
     for (const lot of lots) {
       const a = getAtelier(lot.especeAnimale.id, lot.especeAnimale.nom)
       if (lot.statut === 'actif') {
         const e = effectifsLots.get(lot.id)
-        a.effectif += e ? Math.max(0, e.effectifCalcule - e.nominatifsActifs) : lot.quantiteActuelle
+        a.effectif += e ? e.effectifCollectif : lot.quantiteActuelle
       }
       if (lot.dateArrivee && lot.dateArrivee >= start && lot.dateArrivee <= end) a.couts.achat += lot.prixAchatTotal || 0
     }
@@ -120,11 +130,7 @@ export async function GET(request: NextRequest) {
     for (const soin of soins) speciesFor(soin.lotId, soin.animalId).couts.soins += soin.cout || 0
     for (const c of consommations) {
       const a = c.animal ? getAtelier(c.animal.especeAnimaleId, animalById.get(c.animalId!)?.especeAnimale.nom || c.animal.especeAnimaleId) : c.lot ? getAtelier(c.lot.especeAnimaleId, lotById.get(c.lotId!)?.especeAnimale.nom || c.lot.especeAnimaleId) : getAtelier('non_affecte', 'Non affecté')
-      const prix = c.aliment.userStocks[0]?.coutUnitaire
-        ?? c.aliment.userStocks[0]?.prix
-        ?? c.aliment.prix
-        ?? 0
-      a.couts.alimentation += c.quantite * prix
+      a.couts.alimentation += c.quantite * prixAliment(c)
     }
     for (const abattage of abattages) {
       const a = speciesFor(abattage.lotId, abattage.animalId)
@@ -132,7 +138,7 @@ export async function GET(request: NextRequest) {
       a.production.kgCarcasse += abattage.poidsCarcasse || 0
     }
     for (const vente of ventes) {
-      const a = vente.animalId != null ? speciesFor(null, vente.animalId) : getAtelier(`vente_${vente.type}`, `Ventes ${vente.type.replaceAll('_', ' ')}`)
+      const a = vente.animalId != null ? speciesFor(null, vente.animalId) : getAtelier(`vente_${vente.type}`, libelleAtelierVentes(vente.type))
       a.revenus.ventes += vente.prixTotal
     }
     for (const production of productionsOeufs) speciesFor(production.lotId, production.animalId).production.oeufs += production.quantite
@@ -203,11 +209,15 @@ export async function GET(request: NextRequest) {
       const lotAbattages = abattages.filter(a => a.lotId === lot.id)
       const coutAchat = lot.dateArrivee && lot.dateArrivee >= start && lot.dateArrivee <= end ? lot.prixAchatTotal || 0 : 0
       const coutSoins = lotSoins.reduce((sum, s) => sum + (s.cout || 0), 0)
-      const coutAlimentation = lotConso.reduce((sum, c) => sum + c.quantite * (c.aliment.prix || 0), 0)
+      const coutAlimentation = lotConso.reduce((sum, c) => sum + c.quantite * prixAliment(c), 0)
       const revenus = lotAbattages.reduce((sum, a) => sum + (a.prixVente || 0), 0)
       const total = coutAchat + coutSoins + coutAlimentation
       const totalOeufs = productionsOeufs.filter(p => p.lotId === lot.id).reduce((sum, p) => sum + p.quantite, 0)
-      return { lotId: lot.id, lotNom: lot.nom || `Lot #${lot.id}`, espece: lot.especeAnimale.nom, quantiteActuelle: lot.quantiteActuelle, quantiteInitiale: lot.quantiteInitiale, statut: lot.statut, couts: { achat: round(coutAchat), soins: round(coutSoins), alimentation: round(coutAlimentation), total: round(total) }, revenus: { ventes: round(revenus) }, marge: round(revenus - total), metriques: { coutParAnimal: round(lot.quantiteActuelle ? total / lot.quantiteActuelle : 0), coutParOeuf: totalOeufs ? round(total / totalOeufs) : null, totalOeufs, totalConsoKg: round(lotConso.reduce((sum, c) => sum + c.quantite, 0)), poidsCarcasse: round(lotAbattages.reduce((sum, a) => sum + (a.poidsCarcasse || 0), 0)), nbAbattages: lotAbattages.reduce((sum, a) => sum + a.quantite, 0), nbSoins: lotSoins.length } }
+      // Revue 2026-10-20 — une seule valeur par lot : l'effectif reconstitué
+      // (champ historique `quantiteActuelle` conservé), aussi pour le coût par
+      // animal, au lieu du compteur stocké qui dérive.
+      const effectif = effectifLot(lot)
+      return { lotId: lot.id, lotNom: lot.nom || `Lot #${lot.id}`, espece: lot.especeAnimale.nom, quantiteActuelle: effectif, quantiteInitiale: lot.quantiteInitiale, statut: lot.statut, couts: { achat: round(coutAchat), soins: round(coutSoins), alimentation: round(coutAlimentation), total: round(total) }, revenus: { ventes: round(revenus) }, marge: round(revenus - total), metriques: { coutParAnimal: round(effectif ? total / effectif : 0), coutParOeuf: totalOeufs ? round(total / totalOeufs) : null, totalOeufs, totalConsoKg: round(lotConso.reduce((sum, c) => sum + c.quantite, 0)), poidsCarcasse: round(lotAbattages.reduce((sum, a) => sum + (a.poidsCarcasse || 0), 0)), nbAbattages: lotAbattages.reduce((sum, a) => sum + a.quantite, 0), nbSoins: lotSoins.length } }
     })
     const atelierList = [...ateliers.values()].filter(a => a.effectif || a.couts.total || a.revenus.total || a.production.oeufs || a.production.litresLivres || a.production.kgCarcasse || a.production.kgMiel)
     const totalCouts = atelierList.reduce((sum, a) => sum + a.couts.total, 0)

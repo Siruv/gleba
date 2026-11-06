@@ -8,6 +8,7 @@
  */
 
 import type { QuantiteParUnite } from '@/lib/recolte/quantites'
+import type { VentilationRevenus } from '@/lib/comptabilite/ventilation-revenus'
 
 export interface KPIBase {
   /** Année de référence (ex : 2026). */
@@ -48,6 +49,12 @@ export interface KPIMaraichage extends KPIBase {
   culturesActives: number
   /** Toutes les cultures planifiées pour `year`. */
   culturesPlanifiees: number
+  /**
+   * Cultures de `year` déjà terminées (arrachées). Sans ce compte, l'écart
+   * « planifiées − actives » mêlait les cultures finies aux cultures à venir :
+   * à l'automne, l'accueil annonçait des dizaines de cultures « non démarrées ».
+   */
+  culturesTerminees: number
 
   /** Nombre de planches enregistrées (toutes années). */
   planchesCount: number
@@ -58,6 +65,12 @@ export interface KPIMaraichage extends KPIBase {
 export interface KPICompta extends KPIBase {
   /** Revenus (€ TTC) cumulés du 1er janvier `year` à `asOf`. */
   revenusYtd: number
+  /**
+   * Ventilation par module des mêmes revenus (ticket cmvflua2x) : la somme des
+   * modules est `revenusYtd`, avec la composition du total (ventes, factures
+   * rattachées, factures sans vente, avoirs).
+   */
+  revenusParModuleYtd: VentilationRevenus
   /** Revenus (€ TTC) cumulés de l'année `year - 1` au même jour. */
   revenusN1Ytd: number
   /** Revenus (€ TTC) totaux de l'année `year - 1` (info seulement). */

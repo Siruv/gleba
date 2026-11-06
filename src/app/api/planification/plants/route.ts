@@ -56,11 +56,11 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       data,
       stats: {
-        nbEspeces: besoins.length,
+        nbEspeces: new Set(besoins.map(b => b.especeId)).size,
         totalPlants,
         totalCultures,
         totalACommander,
-        especesSansStock: besoinsSansStock.length,
+        especesSansStock: new Set(besoinsSansStock.map(b => b.especeId)).size,
         parSemaine,
       },
       annee,
@@ -68,7 +68,7 @@ export async function GET(request: NextRequest) {
   } catch (error) {
     console.error('GET /api/planification/plants error:', error)
     return NextResponse.json(
-      { error: 'Erreur lors de la recuperation des besoins en plants', details: "Erreur interne du serveur" },
+      { error: 'Erreur lors de la récupération des besoins en plants', details: "Erreur interne du serveur" },
       { status: 500 }
     )
   }

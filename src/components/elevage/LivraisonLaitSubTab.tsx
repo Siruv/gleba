@@ -11,10 +11,10 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Badge } from "@/components/ui/badge"
 import { useToast } from "@/hooks/use-toast"
 import { confirmDialog } from "@/lib/global-dialog"
-import { todayLocalISO } from "@/lib/format-utils"
+import { envoyerAvecConfirmationLait } from "@/lib/elevage/confirmation-lait"
+import { formatMontantDevise, todayLocalISO } from "@/lib/format-utils"
 import { estimePrimeQualite, montantPaie } from "@/lib/elevage/paie-lait"
 
 const MOIS = ["Jan", "Fév", "Mar", "Avr", "Mai", "Juin", "Juil", "Août", "Sep", "Oct", "Nov", "Déc"]
@@ -60,15 +60,19 @@ export function LivraisonLaitSubTab() {
 
   const submitLiv = async () => {
     if (!livForm.litres) { toast({ variant: "destructive", title: "Litres requis" }); return }
-    const res = await fetch("/api/elevage/livraisons-lait", {
+    const corps = {
+      date: livForm.date, litres: livForm.litres, laiterie: livForm.laiterie || null,
+      tb: livForm.tb || null, tp: livForm.tp || null, cellules: livForm.cellules || null, germes: livForm.germes || null,
+    }
+    // Bilan matière du lait (2026-11-03) : une livraison au-delà de la traite
+    // des 7 derniers jours demande confirmation.
+    const envoi = await envoyerAvecConfirmationLait((confirmer) => fetch("/api/elevage/livraisons-lait", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        date: livForm.date, litres: livForm.litres, laiterie: livForm.laiterie || null,
-        tb: livForm.tb || null, tp: livForm.tp || null, cellules: livForm.cellules || null, germes: livForm.germes || null,
-      }),
-    })
-    if (res.ok) { toast({ title: "Livraison enregistrée" }); setLivForm({ date: todayLocalISO(), litres: "", laiterie: "", tb: "", tp: "", cellules: "", germes: "" }); reload() }
-    else toast({ variant: "destructive", title: "Erreur" })
+      body: JSON.stringify(confirmer ? { ...corps, confirmerLaitIndisponible: true } : corps),
+    }))
+    if (!envoi) return
+    if (envoi.res.ok) { toast({ title: "Livraison enregistrée" }); setLivForm({ date: todayLocalISO(), litres: "", laiterie: "", tb: "", tp: "", cellules: "", germes: "" }); reload() }
+    else toast({ variant: "destructive", title: "Erreur", description: envoi.json.error })
   }
   const delLiv = async (l: Livraison) => {
     if (!(await confirmDialog("Supprimer cette livraison ?"))) return
@@ -152,7 +156,7 @@ export function LivraisonLaitSubTab() {
                       <td className="p-2 text-right">{Number(p.prixBaseMille).toFixed(0)} €</td>
                       <td className="p-2 text-right text-emerald-700">{Number(p.primeQualite) > 0 ? `+${Number(p.primeQualite).toFixed(0)}` : Number(p.primeQualite).toFixed(0)}</td>
                       <td className="p-2 text-right text-red-700">{Number(p.penalite) > 0 ? `−${Number(p.penalite).toFixed(0)}` : "0"}</td>
-                      <td className="p-2 text-right font-semibold">{Number(p.montantHT).toFixed(2)} €</td>
+                      <td className="p-2 text-right font-semibold">{formatMontantDevise(Number(p.montantHT))}</td>
                       <td className="p-2 text-right"><Button variant="ghost" size="sm" onClick={() => delPaie(p)}><Trash2 className="h-4 w-4" /></Button></td>
                     </tr>
                   ))}

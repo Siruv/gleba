@@ -1,3 +1,4 @@
+import { MODELES_STOCK_COMMERCIAL } from '@/lib/commercial/stock-types'
 /**
  * Moteur de transfert de compte — export/import complet des données d'un
  * utilisateur, piloté par le schéma Prisma (DMMF).
@@ -32,6 +33,7 @@
 import { Prisma } from "@prisma/client"
 import prisma from "@/lib/prisma"
 import { visibiliteReferentiel } from "@/lib/referentiel-communaute"
+import { FUSEAU_PAR_DEFAUT, FUSEAUX_PROPOSES, RETENTION_MESURES_JOURS, SEUIL_MESURES_BRUTES_EXPORT } from "@/lib/capteurs/connecteurs"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -44,6 +46,7 @@ const EXCLUDED = new Set<string>([
   "Session",
   "Account",
   "VerificationToken",
+  "EtatConnexionStripe",
   "LoginLog",
   "CookieConsent",
   "BugReport",
@@ -51,8 +54,18 @@ const EXCLUDED = new Set<string>([
   "FeedbackToken",
   "FeedbackResponse",
   "Avis",
+  "PhotoAvis",
+  "TemoignageRecolte",
   "Evolution",
   "EvolutionVote",
+  // Salon de la communauté : conversation entre membres de CETTE instance, qui
+  // n'a pas de sens sur une instance auto-hébergée (ni ses auteurs).
+  "MessageSalon",
+  // Contributions et conversations attachées à la communauté de cette instance.
+  "ContributionEncyclopedie",
+  "RevisionEncyclopedie",
+  "DiscussionEncyclopedie",
+  "ReponseEncyclopedie",
   "ChatMessage",
   "Conversation",
   "GenericCache",
@@ -92,7 +105,28 @@ const REFERENTIAL = new Set<string>([
 
 export const EXPORT_FORMAT_VERSION = "2.0"
 
+/** Brut des capteurs réimporté par lots plutôt que ligne par ligne. */
+const LOT_IMPORT_MESURES = 1000
+
 type Row = Record<string, unknown>
+
+/**
+ * Délégué Prisma atteint par son nom (`prisma.culture`, `tx.recolte`…) : le
+ * moteur est piloté par le DMMF, pas par une liste de modèles typée, d'où ce
+ * contrat minimal commun à tous les délégués.
+ */
+interface DelegueDynamique {
+  findMany: (args?: { where?: Row }) => Promise<Row[]>
+  count: (args?: { where?: Row }) => Promise<number>
+  create: (args: { data: Row }) => Promise<Row>
+  createMany: (args: { data: Row[]; skipDuplicates?: boolean }) => Promise<{ count: number }>
+  upsert: (args: { where: Row; create: Row; update: Row }) => Promise<Row>
+  update: (args: { where: Row; data: Row }) => Promise<Row>
+}
+
+function delegue(client: unknown, nom: string): DelegueDynamique {
+  return (client as Record<string, DelegueDynamique>)[nom]
+}
 
 type ModelClass = "referential" | "owned" | "child" | "excluded"
 
@@ -110,9 +144,10 @@ interface ModelMeta {
   /** propriété du client Prisma (ex. "ITP" → "iTP", "Culture" → "culture") */
   delegate: string
   pkField: string | null
-  pkIsInt: boolean
+  pkIsInteger: boolean
+  pkType: string
   /** champs scalaires à copier (hors PK entière, hors champs relationnels) */
-  scalarFields: { name: string; type: string }[]
+  scalarFields: { name: string; type: string; isList: boolean }[]
   /** clés étrangères (champ scalaire → modèle cible) */
   rels: RelMeta[]
   hasUserId: boolean
@@ -147,26 +182,24 @@ function buildManifest(): Map<string, ModelMeta> {
     const hasCompositePk = !!m.primaryKey && (m.primaryKey.fields?.length ?? 0) > 0
     const hasUserId = m.fields.some((f) => f.name === "userId" && f.kind === "scalar")
 
-    // Champs scalaires (hors relations et listes), avec indicateur de nullité
-    const scalarFieldNames = new Map<string, { type: string; required: boolean }>()
+    // Les listes scalaires font aussi partie des réglages à restaurer.
+    const scalarFieldNames = new Map<string, { type: string; required: boolean; isList: boolean }>()
     for (const f of m.fields) {
-      if (f.kind === "scalar" && !f.isList) {
-        scalarFieldNames.set(f.name, { type: f.type, required: f.isRequired })
+      if (f.kind === "scalar") {
+        scalarFieldNames.set(f.name, { type: f.type, required: f.isRequired, isList: f.isList })
       }
     }
 
-    // Relations many-to-one : un champ objet avec exactement une FK scalaire
+    // Les relations métier peuvent porter [id, userId] pour empêcher une
+    // référence inter-exploitation. userId est réinjecté depuis le tenant.
     const rels: RelMeta[] = []
     for (const f of m.fields) {
-      if (f.kind === "object" && f.relationFromFields && f.relationFromFields.length === 1) {
-        const fkField = f.relationFromFields[0]
-        const scalar = scalarFieldNames.get(fkField)
-        rels.push({
-          fkField,
-          targetModel: f.type,
-          nullable: scalar ? !scalar.required : true,
-        })
-      }
+      if (f.kind !== "object" || !f.relationFromFields?.length) continue
+      const fks = f.relationFromFields.filter((nom) => nom !== 'userId')
+      const fkField = f.relationFromFields.length === 1 ? f.relationFromFields[0] : fks.length === 1 ? fks[0] : null
+      if (!fkField) continue
+      const scalar = scalarFieldNames.get(fkField)
+      rels.push({ fkField, targetModel: f.type, nullable: scalar ? !scalar.required : true })
     }
 
     let klass: ModelClass
@@ -183,16 +216,17 @@ function buildManifest(): Map<string, ModelMeta> {
     // Champs scalaires à copier : on exclut la PK entière (autoincrement) pour
     // laisser la base régénérer ; on garde la PK string (préservée).
     const pkField = idField?.name ?? null
-    const pkIsInt = idField?.type === "Int"
+    const pkIsInteger = idField?.type === "Int" || idField?.type === "BigInt"
     const scalarFields = [...scalarFieldNames.entries()]
-      .filter(([name]) => !(pkIsInt && name === pkField))
-      .map(([name, meta]) => ({ name, type: meta.type }))
+      .filter(([name]) => !(pkIsInteger && name === pkField))
+      .map(([name, meta]) => ({ name, type: meta.type, isList: meta.isList }))
 
     manifest.set(m.name, {
       name: m.name,
       delegate: delegateName(m.name),
       pkField,
-      pkIsInt,
+      pkIsInteger,
+      pkType: idField?.type ?? "String",
       scalarFields,
       rels,
       hasUserId,
@@ -224,21 +258,24 @@ export interface ExportResult {
   /** données : { Modèle: Row[] } */
   data: Record<string, Row[]>
   stats: Record<string, number>
+  /** Contenu volontairement omis (brut des capteurs au-delà du seuil), à montrer à l'utilisateur. */
+  avertissements?: string[]
 }
 
 export async function exportAccount(userId: string, appVersion = "1.0.0"): Promise<ExportResult> {
   const manifest = buildManifest()
   const data: Record<string, Row[]> = {}
   const stats: Record<string, number> = {}
+  const avertissements: string[] = []
 
   // 1) Référentiels : tout, SAUF le privé d'autrui dans les référentiels
   //    communautaires (cf. REFERENTIAL_COMMUNAUTAIRE).
   for (const meta of manifest.values()) {
     if (meta.klass !== "referential") continue
     const where = meta.estCommunautaire ? visibiliteReferentiel(userId) : undefined
-    const rows = (await (prisma as any)[meta.delegate].findMany(
+    const rows = await delegue(prisma, meta.delegate).findMany(
       where ? { where } : undefined
-    )) as Row[]
+    )
     data[meta.name] = rows
     stats[meta.name] = rows.length
   }
@@ -248,10 +285,15 @@ export async function exportAccount(userId: string, appVersion = "1.0.0"): Promi
   const ownedIds = new Map<string, Set<unknown>>() // model → set des PK exportées
   for (const meta of manifest.values()) {
     if (meta.klass !== "owned") continue
-    const rows = (await (prisma as any)[meta.delegate].findMany({
+    const rows = await delegue(prisma, meta.delegate).findMany({
       where: { userId },
-    })) as Row[]
-    data[meta.name] = rows
+    })
+    data[meta.name] = rows.map((row) => {
+      const copie = Object.fromEntries(Object.entries(row).map(([nom, valeur]) => [nom, typeof valeur === 'bigint' ? valeur.toString() : valeur]))
+      // Une sauvegarde de données ne transporte aucun accès bancaire.
+      if (meta.name === 'ConnexionStripe') Object.assign(copie, { jetonChiffre: '', actif: false, verrouSynchroJusqua: null })
+      return copie
+    })
     stats[meta.name] = rows.length
     if (meta.pkField) {
       ownedIds.set(
@@ -288,7 +330,34 @@ export async function exportAccount(userId: string, appVersion = "1.0.0"): Promi
       )
       if (waitingOnChild) continue
 
-      const allRows = (await (prisma as any)[meta.delegate].findMany()) as Row[]
+      const parents = (model: string) => [...(ownedIds.get(model) ?? childExportedIds.get(model) ?? [])]
+      // Filtrer en base : les mesures peuvent être nombreuses. Ne jamais
+      // charger celles de toutes les exploitations avant de trier en mémoire.
+      const where = {
+        AND: ownerRels.map((r) => ({ OR: [
+          { [r.fkField]: { in: parents(r.targetModel) } },
+          ...(r.nullable ? [{ [r.fkField]: null }] : []),
+        ] })),
+        OR: ownerRels.map((r) => ({ [r.fkField]: { in: parents(r.targetModel) } })),
+      }
+      // Au-delà du seuil (`SEUIL_MESURES_BRUTES_EXPORT`), le brut des capteurs
+      // rendrait la sauvegarde irrestaurable : compté sans être chargé, il
+      // reste hors du fichier.
+      if (meta.name === "MesureCapteur" && ownerRels.length) {
+        const nombre = await delegue(prisma, meta.delegate).count({ where })
+        if (nombre > SEUIL_MESURES_BRUTES_EXPORT) {
+          avertissements.push(
+            `Mesures brutes des capteurs non incluses : ${nombre.toLocaleString("fr-FR")} mesures dépassent le seuil de ${SEUIL_MESURES_BRUTES_EXPORT.toLocaleString("fr-FR")} de la sauvegarde. Les connecteurs, les capteurs et leurs agrégats journaliers (minimum, maximum, moyenne) sont sauvegardés ; le détail des mesures brutes (${RETENTION_MESURES_JOURS} derniers jours au plus) ne sera pas restauré.`,
+          )
+          data[meta.name] = []
+          stats[meta.name] = 0
+          childExportedIds.set(meta.name, new Set())
+          done.add(meta.name)
+          progress = true
+          continue
+        }
+      }
+      const allRows = ownerRels.length ? await delegue(prisma, meta.delegate).findMany({ where }) : []
       const kept = allRows.filter((row) => {
         // garder la ligne si, pour chaque FK propriétaire non nulle, l'id
         // référencé fait partie des données exportées de l'utilisateur
@@ -331,6 +400,15 @@ export async function exportAccount(userId: string, appVersion = "1.0.0"): Promi
     }
   }
 
+  // JSON n'a pas d'entier 64 bits : une chaîne décimale conserve la précision
+  // des BigInt (PK et FK), sans modifier les identifiants utilisés ci-dessus
+  // pour sélectionner les enfants. L'import les relit selon le DMMF.
+  for (const [model, rows] of Object.entries(data)) {
+    data[model] = rows.map((row) => Object.fromEntries(
+      Object.entries(row).map(([key, value]) => [key, typeof value === "bigint" ? value.toString() : value]),
+    ))
+  }
+
   return {
     format: EXPORT_FORMAT_VERSION,
     exportDate: new Date().toISOString(),
@@ -338,6 +416,7 @@ export async function exportAccount(userId: string, appVersion = "1.0.0"): Promi
     sourceUserId: userId,
     data,
     stats,
+    avertissements,
   }
 }
 
@@ -406,6 +485,12 @@ function coerceValue(value: unknown, type: string): unknown {
   if (type === "DateTime") {
     return value instanceof Date ? value : new Date(value as string)
   }
+  if (type === "BigInt") {
+    if (typeof value === "bigint") return value
+    if (typeof value === "string" && /^-?\d+$/.test(value)) return BigInt(value)
+    if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value)
+    throw new Error("Entier BigInt invalide ou sans précision suffisante dans la sauvegarde")
+  }
   return value
 }
 
@@ -439,6 +524,7 @@ export async function importAccount(
 
   const runner = async (tx: Prisma.TransactionClient) => {
     const pending: PendingPatch[] = []
+    const referencesStock: { delegate: string; pkField: string; newPk: unknown; type: string; oldId: string }[] = []
 
     // 1) RÉFÉRENTIELS — upsert par id (préservé). idMap = identité.
     // Sécurité (audit 2026-07 #21) : les référentiels sont GLOBAUX et partagés.
@@ -488,14 +574,14 @@ export async function importAccount(
       const map = ensureMap(meta.name)
       let count = 0
       for (const row of rows) {
-        const pk = row[meta.pkField]
+        const pk = coerceValue(row[meta.pkField], meta.pkType)
         if (pk === null || pk === undefined) continue
-        const createData = buildScalarData(meta, row, userId)
+        const createData = buildScalarData(meta, row)
         const updateData = { ...createData }
         delete (updateData as Row)[meta.pkField]
         try {
           await tx.$executeRawUnsafe("SAVEPOINT sp_ref")
-          await (tx as any)[meta.delegate].upsert({
+          await delegue(tx, meta.delegate).upsert({
             where: { [meta.pkField]: pk },
             create: createData,
             update: updateData,
@@ -524,16 +610,54 @@ export async function importAccount(
 
     for (const meta of ordered) {
       if (!meta.pkField) continue
-      const rows = data[meta.name] ?? []
+      const rows = [...(data[meta.name] ?? [])]
+      if (meta.name === 'MouvementStockCommercial') rows.sort((a, b) => Number(!!a.origineRetourId) - Number(!!b.origineRetourId))
       const map = ensureMap(meta.name)
       let count = 0
       let skip = 0
+      // Brut des capteurs : inséré par lots, pas ligne par ligne (trois
+      // allers-retours par ligne dans une transaction de 120 s). Aucune table
+      // ne le référence : ni id à reporter, ni patch différé.
+      const lot: Row[] = []
+      const viderLot = async () => {
+        const lignes = lot.splice(0)
+        if (!lignes.length) return
+        try {
+          await tx.$executeRawUnsafe("SAVEPOINT sp_lot")
+          const { count: crees } = await delegue(tx, meta.delegate).createMany({ data: lignes, skipDuplicates: true })
+          await tx.$executeRawUnsafe("RELEASE SAVEPOINT sp_lot")
+          count += crees
+          skip += lignes.length - crees
+        } catch (e) {
+          await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT sp_lot").catch(() => {})
+          skip += lignes.length
+          warnings.push(`${meta.name} : ${lignes.length} ligne(s) ignorée(s) (${(e as Error).message.split("\n")[0]})`)
+        }
+      }
 
       for (const row of rows) {
-        const oldPk = row[meta.pkField]
-        const createData = buildScalarData(meta, row, userId)
+        const oldPk = coerceValue(row[meta.pkField], meta.pkType)
+        const createData = buildScalarData(meta, row)
+        // Connexion Stripe : arrive inactive, sans jeton ni bail. Nouvel id
+        // (revue du 2026-10-30) : sur la même instance, la source peut encore
+        // exister ; l'unicité par exploitation et l'index partiel `WHERE actif`
+        // laissent coexister cette ligne inactive, l'id d'origine non. Les
+        // comptes bancaires suivent le nouvel id par idMap.
+        if (meta.name === 'ConnexionStripe') {
+          Object.assign(createData, { jetonChiffre: '', actif: false, verrouSynchroJusqua: null })
+          delete createData[meta.pkField]
+        }
+        if (meta.name === 'CibleReglement') createData.cle = 'transfert:' + String(row.id)
+        // Fuseau recopié dans `AT TIME ZONE` par l'agrégation nocturne : seule
+        // la liste fermée de l'écran est acceptée, comme par la route du connecteur.
+        if (meta.name === 'ConnecteurCapteurs' && !FUSEAUX_PROPOSES.includes(String(createData.fuseau))) {
+          if (createData.fuseau !== undefined) {
+            warnings.push(`Connecteur de capteurs « ${String(row.nom ?? '').slice(0, 80)} » : fuseau « ${String(createData.fuseau).slice(0, 64)} » inconnu, remplacé par ${FUSEAU_PAR_DEFAUT}. Corrigez-le si besoin dans Paramètres > Capteurs.`)
+          }
+          createData.fuseau = FUSEAU_PAR_DEFAUT
+        }
         // PK : on retire l'entière (autoincrement) ; on garde la string (cuid).
-        if (meta.pkIsInt) {
+        if (meta.pkIsInteger) {
           delete createData[meta.pkField]
         }
 
@@ -542,6 +666,11 @@ export async function importAccount(
           createData.userId = userId
         }
 
+        // Les références polymorphes de stock ne doivent jamais garder un ID numérique de l'instance source.
+        if (['LigneFacture', 'LigneDocumentCommercial', 'MouvementStockCommercial'].includes(meta.name) && MODELES_STOCK_COMMERCIAL[String(row.articleStockType)]) {
+          createData.articleStockId = meta.name === 'MouvementStockCommercial' ? `archive:${row.articleStockId}` : null
+          if (meta.name !== 'MouvementStockCommercial') createData.articleStockType = null
+        }
         // Résolution des FK. Les FK différées (référence en avant / cycle /
         // auto-référence) sont mises à null puis reconnectées en 2e passage.
         const deferredForRow: { fkField: string; targetModel: string; oldValue: unknown }[] = []
@@ -578,18 +707,28 @@ export async function importAccount(
           continue
         }
 
+        if (meta.name === 'MesureCapteur') {
+          lot.push(createData)
+          if (lot.length >= LOT_IMPORT_MESURES) await viderLot()
+          continue
+        }
+
         try {
           // Savepoint par ligne : sinon la 1re erreur avorte toute la
           // transaction et les créations suivantes échouent en silence tandis
           // que la fonction renvoyait quand même « N importés » (audit #50).
           await tx.$executeRawUnsafe("SAVEPOINT sp_row")
-          const created = (await (tx as any)[meta.delegate].create({
+          const created = await delegue(tx, meta.delegate).create({
             data: createData,
-          })) as Row
+          })
           await tx.$executeRawUnsafe("RELEASE SAVEPOINT sp_row")
           const newPk = created[meta.pkField]
           if (oldPk !== null && oldPk !== undefined) map.set(oldPk, newPk)
           count++
+
+          if (['LigneFacture', 'LigneDocumentCommercial', 'MouvementStockCommercial'].includes(meta.name) && typeof row.articleStockType === 'string' && typeof row.articleStockId === 'string' && MODELES_STOCK_COMMERCIAL[row.articleStockType]) {
+            referencesStock.push({ delegate: meta.delegate, pkField: meta.pkField, newPk, type: row.articleStockType, oldId: row.articleStockId })
+          }
 
           for (const d of deferredForRow) {
             pending.push({
@@ -610,6 +749,8 @@ export async function importAccount(
         }
       }
 
+      await viderLot()
+
       imported[meta.name] = count
       if (skip) skipped[meta.name] = skip
     }
@@ -622,7 +763,7 @@ export async function importAccount(
       if (newFk === undefined) continue // cible jamais importée → reste null
       try {
         await tx.$executeRawUnsafe("SAVEPOINT sp_patch")
-        await (tx as any)[p.delegate].update({
+        await delegue(tx, p.delegate).update({
           where: { [p.pkField]: p.newPk },
           data: { [p.fkField]: newFk },
         })
@@ -632,6 +773,53 @@ export async function importAccount(
         /* ligne disparue / contrainte : on laisse la FK à null (savepoint) */
         await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT sp_patch").catch(() => {})
       }
+    }
+    for (const reference of referencesStock) {
+      const cible = MODELES_STOCK_COMMERCIAL[reference.type]
+      const typeSource = manifest.get(cible)?.pkType
+      const sourceId = typeSource === "Int" ? Number(reference.oldId) : coerceValue(reference.oldId, typeSource ?? "String")
+      const nouveau = idMap.get(cible)?.get(sourceId)
+      if (nouveau !== undefined) await delegue(tx, reference.delegate).update({ where: { [reference.pkField]: reference.newPk }, data: { articleStockType: reference.type, articleStockId: String(nouveau) } })
+    }
+    // Les clés du journal de règlements désignent des pièces polymorphes.
+    // Leurs identifiants suivent les pièces remappées sur l'instance cible.
+    const sourcesReglements: Record<string, string> = {
+      vente_produit: 'VenteProduit', recolte: 'Recolte', recolte_arbre: 'RecolteArbre',
+      production_bois: 'ProductionBois', abattage: 'Abattage', achat_animal: 'LotAnimaux',
+      achat_animal_individuel: 'Animal', consommation_aliment: 'ConsommationAliment',
+      soin_animal: 'SoinAnimal', fertilisation: 'Fertilisation', intervention: 'Intervention',
+      campagne_plantation: 'CampagnePlantation', operation_arbre: 'OperationArbre',
+    }
+    const miroirsRemappes: { delegate: string; pk: unknown; sourceId: unknown }[] = []
+    for (const nom of ['VenteManuelle', 'DepenseManuelle']) {
+      for (const row of data[nom] ?? []) {
+        if (!row.auto || row.sourceId == null) continue
+        const pk = idMap.get(nom)?.get(row.id)
+        const sourceId = idMap.get(sourcesReglements[String(row.sourceType)])?.get(row.sourceId)
+        if (pk !== undefined && sourceId !== undefined) miroirsRemappes.push({ delegate: delegateName(nom), pk, sourceId })
+      }
+    }
+    // Libérer les anciennes clés avant d'appliquer une permutation d'IDs.
+    for (const m of miroirsRemappes) await delegue(tx, m.delegate).update({ where: { id: m.pk }, data: { sourceId: null } })
+    for (const m of miroirsRemappes) await delegue(tx, m.delegate).update({ where: { id: m.pk }, data: { sourceId: m.sourceId } })
+    for (const row of data.CibleReglement ?? []) {
+      const pk = idMap.get('CibleReglement')?.get(row.id)
+      if (pk === undefined) continue
+      const type = String(row.type), ancienneCle = String(row.cle)
+      let reference = idMap.get(type)?.get(Number(row.reference))
+      let cle = ancienneCle
+      if (ancienneCle.startsWith('[')) {
+        const [nature, source, mode, ancienId] = JSON.parse(ancienneCle) as string[]
+        const nouveauId = mode === 'id' ? idMap.get(sourcesReglements[source])?.get(Number(ancienId)) : undefined
+        cle = JSON.stringify([nature, source, mode, String(nouveauId ?? ancienId)])
+        if (reference === undefined && ['VenteManuelle', 'DepenseManuelle'].includes(type)) {
+          const miroir = (data[type] ?? []).find((m) => m.auto && m.sourceType === source && String(mode === 'ref' ? m.sourceRef : m.sourceId) === ancienId)
+          if (miroir) reference = idMap.get(type)?.get(miroir.id)
+        }
+      } else if (reference !== undefined) {
+        cle = type === 'Facture' ? 'facture:' + reference : (type === 'VenteManuelle' ? 'vente' : 'depense') + ':manuel:' + reference
+      }
+      await delegue(tx, 'cibleReglement').update({ where: { id: pk }, data: { cle, ...(reference !== undefined ? { reference: String(reference) } : {}) } })
     }
     if (patched) warnings.push(`${patched} référence(s) différée(s) reconnectée(s).`)
 
@@ -652,11 +840,14 @@ export async function importAccount(
 }
 
 /** Construit l'objet de données scalaires (typage Date/Decimal géré). */
-function buildScalarData(meta: ModelMeta, row: Row, _userId: string): Row {
+function buildScalarData(meta: ModelMeta, row: Row): Row {
   const out: Row = {}
   for (const f of meta.scalarFields) {
     if (!(f.name in row)) continue
-    out[f.name] = coerceValue(row[f.name], f.type)
+    const value = row[f.name]
+    out[f.name] = f.isList && Array.isArray(value)
+      ? value.map((v) => coerceValue(v, f.type))
+      : coerceValue(value, f.type)
   }
   return out
 }

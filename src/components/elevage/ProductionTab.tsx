@@ -5,8 +5,14 @@
  */
 
 import * as React from "react"
+import { ReglementsDialog } from "@/components/comptabilite/ReglementsDialog"
+import Link from "next/link"
+import { ChampsEncaissement } from "@/components/comptabilite/ChampsEncaissement"
+import { encaissementVenteInitial } from "@/lib/comptabilite/encaissement-vente"
 import { useSession } from "next-auth/react"
 import { updateDashboardSearchParams } from "@/lib/dashboard-navigation"
+import { useSearchParams } from "next/navigation"
+import { ONGLETS_PRODUCTION, ongletProductionDepuisSub } from "@/lib/elevage/onglets-production"
 import {
   Egg,
   ShoppingCart,
@@ -15,19 +21,16 @@ import {
   Pencil,
   RefreshCw,
   Package,
-  TrendingUp,
-  Calendar,
-  Trash2,
   Filter,
   X,
   Milk,
-  Wheat,
   Euro,
   Flower2,
 } from "lucide-react"
 import { LaitSubTab } from "./LaitSubTab"
 import { SelecteurPeriodeExercice, parametreAnnee, type PeriodeListe } from "./SelecteurPeriodeExercice"
 import { EconomieLaitSubTab } from "./EconomieLaitSubTab"
+import { TYPES_VENTE_LABELS } from "@/lib/elevage/types-vente"
 import { ProduitsRucheSubTab } from "./ProduitsRucheSubTab"
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -54,8 +57,10 @@ import { useToast } from "@/hooks/use-toast"
 import { oeufsAttendusJour } from "@/lib/elevage/taux-ponte"
 import { labelStatutLot, labelUnite } from "@/lib/elevage/labels"
 import { confirmDialog } from "@/lib/global-dialog"
-import { todayLocalISO } from '@/lib/format-utils'
+import { envoyerAvecConfirmationLait } from "@/lib/elevage/confirmation-lait"
+import { formatMontantDevise, todayLocalISO } from '@/lib/format-utils'
 import { tauxTvaVenteProduitParDefaut } from '@/lib/elevage/produits-ruche'
+import { jourCivilStocke } from '@/lib/jour-civil'
 
 // ============================================================
 // Composant principal
@@ -65,7 +70,7 @@ import { tauxTvaVenteProduitParDefaut } from '@/lib/elevage/produits-ruche'
 // pour que Dashboard et Production partagent la même fenêtre temporelle.
 
 const PROD_TAB_KEY = "gleba:elevage:production-tab"
-const PROD_TABS = ["oeufs", "lait", "ruche", "ventes", "abattages", "economie"] as const
+const PROD_TABS = ONGLETS_PRODUCTION
 
 // QA cmswug6di — un Select Radix contrôlé à "" n'émet AUCUNE <option value="">
 // dans son <select> natif caché : le navigateur retombe sur la première option
@@ -84,6 +89,7 @@ export function ProductionTab({ year }: { year?: number } = {}) {
   const productionTabKey = sessionStatus === "loading"
     ? null
     : `${PROD_TAB_KEY}:user:${session?.user?.id || "anonymous"}`
+  const subUrl = useSearchParams().get("sub")
 
   React.useEffect(() => {
     if (!productionTabKey) return
@@ -91,6 +97,13 @@ export function ProductionTab({ year }: { year?: number } = {}) {
     // ouvre l'onglet Abattages, quel que soit le dernier onglet mémorisé.
     if (new URLSearchParams(window.location.search).get("editAbattage")) {
       setActive("abattages")
+      return
+    }
+    // Revue du 2026-11-01 — un lien direct (`?sub=ventes`, catalogue des
+    // stocks…) prime sur l'onglet mémorisé et sur le profil du cheptel.
+    const cible = ongletProductionDepuisSub(subUrl)
+    if (cible) {
+      setActive(cible)
       return
     }
     let annule = false
@@ -112,11 +125,18 @@ export function ProductionTab({ year }: { year?: number } = {}) {
       })
       .catch(() => {})
     return () => { annule = true }
-  }, [productionTabKey])
+  }, [productionTabKey, subUrl])
 
   const handleChange = (v: string) => {
     setActive(v)
     if (productionTabKey) window.localStorage.setItem(productionTabKey, v)
+    // Une URL arrivée par lien direct suit l'onglet choisi : un rechargement
+    // ne ramène pas sur l'ancienne cible.
+    const params = new URLSearchParams(window.location.search)
+    if (params.has("sub")) {
+      params.set("sub", v)
+      updateDashboardSearchParams(params, "replace")
+    }
   }
 
   return (
@@ -191,6 +211,8 @@ interface LotVolaille {
   nom: string | null
   quantiteActuelle: number
   effectifCalcule?: number
+  /** Effectif pondeur (sans les jeunes nés dans le lot ni les mâles), QA cmv5jfsol. */
+  effectifPondeuses?: number | null
   statut: string | null
   especeAnimale: { nom: string; type: string }
 }
@@ -225,6 +247,7 @@ interface LotStockOeufs {
   limiteVente: string
   dcr: string
   statut: "commercialisable" | "a_consumer" | "perime" | "bloque_attente_veto"
+  finAttenteVeto: string | null
   remiseEnVente: string | null
   mouvements: MouvementStockOeufs[]
 }
@@ -237,7 +260,9 @@ interface StockTraceOeufs {
     perimes: number
     stockPhysique: number
     bloquesVeto?: number
+    aVenir?: number
   }
+  pontesFutures?: { id: number; datePonte: string; lot: { id: number; nom: string } | null; oeufs: number }[]
 }
 
 // Ticket cms1vcc6f — taux de ponte remonté par /api/elevage/stats (observé
@@ -395,10 +420,25 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
   // un 422 COLLECTE_OVER_SEUIL.
   // QA 2026-05-15 — étendu pour supporter le mode édition (PATCH) :
   // si `editingId` est passé, on appelle PATCH au lieu de POST.
+  // Corps d'un refus de la route tel que l'écran le lit (422 nommés, sinon
+  // `error` seul : 400 « Données invalides », 404…).
+  type RefusProduction =
+    | {
+        code: 'COLLECTE_OVER_SEUIL'
+        error: string
+        details: { quantite: number; seuilMax: number; effectif: number; espece: string | null; lotNom: string | null; message: string }
+      }
+    | {
+        code: 'DOUBLON_DATE_LOT'
+        error: string
+        details: { idExistant: number; quantiteExistante: number; dateLue: string; message: string }
+      }
+    | { code: 'LOT_TERMINE'; error: string; details: { lotNom: string | null; statut: string; message: string } }
+    | { code?: undefined; error?: string; details?: unknown }
   const postProduction = async (
     payload: Record<string, unknown>,
     options: { override?: boolean; editingId?: number | null } = {}
-  ): Promise<{ ok: true } | { ok: false; status: number; body: any }> => {
+  ): Promise<{ ok: true } | { ok: false; status: number; body: RefusProduction }> => {
     const isEdit = options.editingId != null
     const finalPayload = options.override
       ? { ...payload, overrideCoherence: true }
@@ -521,7 +561,7 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
               <span>
                 Le lot <strong>« {result.body.details.lotNom} »</strong> est{' '}
                 <strong>{result.body.details.statut}</strong>. Réactivez-le (statut « actif »)
-                avant d'enregistrer une nouvelle collecte, ou forcez la saisie si le statut est
+                avant d&apos;enregistrer une nouvelle collecte, ou forcez la saisie si le statut est
                 erroné.
               </span>
             ),
@@ -553,14 +593,17 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
 
   const handleOverrideConfirm = async () => {
     if (!overrideState) return
-    const result = await postProduction(overrideState.payload, { override: true })
+    // Revue 2026-10-20 — en mode édition, la saisie forcée rejoue le PATCH de la
+    // collecte (qui applique désormais le même plafond que le POST) ; sans
+    // `editingId`, elle créait une seconde collecte au lieu de corriger.
+    const result = await postProduction(overrideState.payload, { editingId, override: true })
     if (result.ok) {
       toast({
         title: "Saisie forcée enregistrée",
         description: `${overrideState.quantite} œufs — au-delà du plafond plausible (${overrideState.seuilMax}).`,
       })
       setIsDialogOpen(false)
-      setFormData({ lotId: formData.lotId, date: todayLocalISO(), quantite: "", casses: "0", sales: "0", calibre: "", notes: "" })
+      resetForm()
       fetchData()
     } else {
       toast({ variant: "destructive", title: "Erreur", description: "Impossible d'enregistrer (override refusé)" })
@@ -664,7 +707,7 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
     commercialisable: { label: "Vente autorisée", className: "bg-green-100 text-green-800" },
     a_consumer: { label: "À consommer", className: "bg-amber-100 text-amber-800" },
     perime: { label: "DCR dépassée", className: "bg-red-100 text-red-800" },
-    bloque_attente_veto: { label: "Délai véto", className: "bg-red-100 text-red-800" },
+    bloque_attente_veto: { label: "Écartés (délai véto)", className: "bg-red-100 text-red-800" },
   } as const
 
   return (
@@ -680,7 +723,7 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
             <CardContent className="pb-3 px-4">
               <p className="text-xs text-white/80">
                 {stockTrace
-                  ? `${stockTrace.stats.stockPhysique} en stock physique${(stockTrace.stats.bloquesVeto ?? 0) > 0 ? ` · ${stockTrace.stats.bloquesVeto} bloqués (délai véto)` : ""}`
+                  ? `${stockTrace.stats.stockPhysique} en stock physique${(stockTrace.stats.bloquesVeto ?? 0) > 0 ? ` · ${stockTrace.stats.bloquesVeto} écartés (délai véto)` : ""}`
                   : "œufs disponibles"}
               </p>
             </CardContent>
@@ -793,7 +836,7 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
                   <Input name="date" type="date" value={formData.date} onChange={(e) => setFormData(f => ({ ...f, date: e.target.value }))} />
                 </div>
                 <div className="space-y-2">
-                  <Label>Nombre d'œufs *</Label>
+                  <Label>Nombre d&apos;œufs *</Label>
                   <Input name="quantite" type="number" min="0" value={formData.quantite} onChange={(e) => setFormData(f => ({ ...f, quantite: e.target.value }))} placeholder="0" className="text-2xl font-bold text-center" />
                 </div>
               </div>
@@ -805,15 +848,24 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
                 const lot = lots.find((l) => l.id.toString() === formData.lotId)
                 const effectif = lot ? (lot.effectifCalcule ?? lot.quantiteActuelle) : 0
                 if (!lot || effectif <= 0) return null
+                // QA cmv5jfsol — l'attendu se base sur l'effectif pondeur (sans
+                // les jeunes nés dans le lot ni les mâles), pas sur tout le lot.
+                // `effectifPondeuses` est null hors espèce pondeuse (volaille de
+                // chair) : on garde alors le libellé d'espèce.
+                const pondeuses = lot.effectifPondeuses ?? effectif
+                const exclues = lot.effectifPondeuses == null ? 0 : Math.max(0, effectif - pondeuses)
                 const attendu = oeufsAttendusJour(
-                  effectif,
+                  pondeuses,
                   lot.especeAnimale.nom,
                   formData.date ? new Date(formData.date) : new Date()
                 )
                 return (
                   <p className="text-xs text-muted-foreground -mt-2">
-                    ~{attendu} œuf{attendu > 1 ? 's' : ''}/jour attendu pour {effectif}{' '}
-                    {lot.especeAnimale.nom} à cette période
+                    ~{attendu} œuf{attendu > 1 ? 's' : ''}/jour attendu pour {pondeuses}{' '}
+                    {lot.effectifPondeuses == null ? lot.especeAnimale.nom : pondeuses > 1 ? 'pondeuses' : 'pondeuse'} à cette période
+                    {exclues > 0
+                      ? ` (${effectif} ${lot.especeAnimale.nom}, dont ${exclues} trop jeune${exclues > 1 ? 's' : ''} ou mâle${exclues > 1 ? 's' : ''})`
+                      : ''}
                   </p>
                 )
               })()}
@@ -867,7 +919,7 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
           </DialogTrigger>
           <DialogContent className="max-w-md">
             <DialogHeader>
-              <DialogTitle>Sortie du stock d'œufs</DialogTitle>
+              <DialogTitle>Sortie du stock d&apos;œufs</DialogTitle>
               <DialogDescription>Déduire une vente, consommation ou perte du lot de ponte exact.</DialogDescription>
             </DialogHeader>
             <form onSubmit={handleSortieSubmit} className="space-y-4">
@@ -944,16 +996,33 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
           <CardHeader>
             <CardTitle className="text-sm">Traçabilité du stock</CardTitle>
             <CardDescription>
-              Vente jusqu'à J+21 · consommation jusqu'à la DCR J+28 · les plus urgents sont affichés en premier.
+              Vente jusqu&apos;à J+21 · consommation jusqu&apos;à la DCR J+28 · les plus urgents sont affichés en premier.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            <div className="grid grid-cols-2 gap-2 text-sm sm:grid-cols-4">
+            {/* Les écartés (délai véto) ont leur tuile : sans elle, les tuiles
+                ne faisaient pas le stock physique (ticket cmv9dy2ow). */}
+            <div className={`grid grid-cols-2 gap-2 text-sm ${(stockTrace.stats.bloquesVeto ?? 0) > 0 ? "sm:grid-cols-5" : "sm:grid-cols-4"}`}>
               <div className="rounded-md border p-2"><strong>{stockTrace.stats.commercialisables}</strong><br /><span className="text-muted-foreground">commercialisables</span></div>
               <div className="rounded-md border p-2"><strong>{stockTrace.stats.aConsommer}</strong><br /><span className="text-muted-foreground">à consommer</span></div>
               <div className="rounded-md border p-2"><strong>{stockTrace.stats.perimes}</strong><br /><span className="text-muted-foreground">DCR dépassée</span></div>
+              {(stockTrace.stats.bloquesVeto ?? 0) > 0 && (
+                <div className="rounded-md border p-2"><strong>{stockTrace.stats.bloquesVeto}</strong><br /><span className="text-muted-foreground">écartés (délai véto)</span></div>
+              )}
               <div className="rounded-md border p-2"><strong>{stockTrace.stats.stockPhysique}</strong><br /><span className="text-muted-foreground">stock physique</span></div>
             </div>
+            {(stockTrace.stats.aVenir ?? 0) > 0 && (
+              <p className="rounded-md border border-amber-300 bg-amber-50 p-2 text-sm text-amber-900" data-testid="pontes-futures">
+                {(() => {
+                  const n = stockTrace.stats.aVenir ?? 0
+                  const pontes = stockTrace.pontesFutures ?? []
+                  const detail = pontes.length > 0
+                    ? ` (${pontes.length > 1 ? "pontes du" : "ponte du"} ${pontes.map((p) => `${new Date(p.datePonte).toLocaleDateString("fr-FR")}${p.lot ? ` · ${p.lot.nom}` : ""}`).join(", ")})`
+                    : ""
+                  return `${n} œuf${n > 1 ? "s" : ""} daté${n > 1 ? "s" : ""} après aujourd’hui ${n > 1 ? "ne sont" : "n’est"} pas compté${n > 1 ? "s" : ""} dans le stock${detail}. Vérifiez la date de ${pontes.length > 1 ? "ces collectes" : "cette collecte"}.`
+                })()}
+              </p>
+            )}
             <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
@@ -972,13 +1041,17 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
                       <TableCell>{new Date(lot.datePonte).toLocaleDateString("fr-FR")}</TableCell>
                       <TableCell>{lot.lot?.nom || `Collecte #${lot.id}`}</TableCell>
                       <TableCell className="text-right font-semibold">{lot.restant}</TableCell>
-                      <TableCell>{new Date(lot.limiteVente).toLocaleDateString("fr-FR")}</TableCell>
+                      <TableCell>{lot.statut === "bloque_attente_veto" ? "-" : new Date(lot.limiteVente).toLocaleDateString("fr-FR")}</TableCell>
                       <TableCell>{new Date(lot.dcr).toLocaleDateString("fr-FR")}</TableCell>
                       <TableCell>
                         <Badge className={statutStock[lot.statut].className}>{statutStock[lot.statut].label}</Badge>
-                        {lot.statut === "bloque_attente_veto" && lot.remiseEnVente && (
+                        {/* Ticket cmv9dy2ow — « vendables dès le 14/10 » sur des
+                            œufs pondus pendant le délai, donc jamais vendables :
+                            la remise en vente ne vaut que pour les pontes
+                            suivantes. On nomme la fin du délai qui les écarte. */}
+                        {lot.statut === "bloque_attente_veto" && lot.finAttenteVeto && (
                           <p className="mt-0.5 text-xs text-muted-foreground">
-                            vendables dès le {new Date(lot.remiseEnVente).toLocaleDateString("fr-FR")}
+                            Pondus pendant le délai d&apos;attente (fin le {new Date(lot.finAttenteVeto).toLocaleDateString("fr-FR", { timeZone: "UTC" })}) : jamais vendables.
                           </p>
                         )}
                       </TableCell>
@@ -1073,7 +1146,7 @@ function OeufsSubTab({ year }: { year?: number } = {}) {
               peuvent pas pondre <strong>{overrideState.quantite} œufs</strong> en 1 jour
               (plafond plausible ≈ <strong>{overrideState.seuilMax}</strong>).
               <br />
-              Si c'est une saisie de rattrapage (2 jours d'un coup), confirmez pour forcer.
+              Si c&apos;est une saisie de rattrapage (2 jours d&apos;un coup), confirmez pour forcer.
               Sinon, corrigez la quantité.
             </span>
           ) : null
@@ -1115,24 +1188,16 @@ interface Vente {
   prixTotal: number
   client: string | null
   paye: boolean
+  montantRegle?: number | null
+  resteAPayer?: number | null
+  modeReglement?: string | null
+  factureId?: number | null
   tauxTVA: number
   notes: string | null
 }
 
-const TYPE_LABELS: Record<string, string> = {
-  oeufs: "Œufs",
-  viande: "Viande",
-  animal_vivant: "Animal vivant",
-  lait: "Lait",
-  fromage: "Fromage",
-  miel: "Miel",
-  cire: "Cire",
-  propolis: "Propolis",
-  pollen: "Pollen",
-  gelee_royale: "Gelée royale",
-  autre_ruche: "Autre produit de la ruche",
-  autre: "Autre",
-}
+// Libellés partagés avec la page Économie (src/lib/elevage/types-vente.ts).
+const TYPE_LABELS = TYPES_VENTE_LABELS
 
 const TYPE_VENTE_UNITE_DEFAUT: Record<string, string> = {
   oeufs: "douzaine",
@@ -1164,7 +1229,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
   const anneeExercice = year ?? new Date().getFullYear()
   const [periode, setPeriode] = React.useState<PeriodeListe>("exercice")
   const [ventes, setVentes] = React.useState<Vente[]>([])
-  const [stats, setStats] = React.useState<any>(null)
+  const [stats, setStats] = React.useState<{ totalVentes: number; nbVentes: number } | null>(null)
   const [isDialogOpen, setIsDialogOpen] = React.useState(false)
   // QA 2026-05-15 — édition par ligne
   const [editingId, setEditingId] = React.useState<number | null>(null)
@@ -1173,7 +1238,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
   const [formData, setFormData] = React.useState({
     date: todayLocalISO(),
     type: "oeufs", description: "", quantite: "", unite: "douzaine",
-    prixUnitaire: "", client: "", paye: true, notes: "",
+    prixUnitaire: "", client: "", notes: "", ...encaissementVenteInitial(),
     tauxTVA: "5.5",
     // Ticket cms1vqsqu — don / autoconsommation d'un animal vivant.
     cessionGratuite: false,
@@ -1184,7 +1249,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
 
   const resetForm = () => {
     setEditingId(null)
-    setFormData({ date: todayLocalISO(), type: "oeufs", description: "", quantite: "", unite: "douzaine", prixUnitaire: "", client: "", paye: true, notes: "", tauxTVA: "5.5", cessionGratuite: false, animalId: "" })
+    setFormData({ date: todayLocalISO(), type: "oeufs", description: "", quantite: "", unite: "douzaine", prixUnitaire: "", client: "", notes: "", ...encaissementVenteInitial(), tauxTVA: "5.5", cessionGratuite: false, animalId: "" })
   }
 
   // Ticket cmsog7lrc — animaux actifs pour le sélecteur « Animal vendu »,
@@ -1211,6 +1276,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
       prixUnitaire: v.prixUnitaire.toString(),
       client: v.client ?? "",
       paye: v.paye,
+      modeReglement: v.modeReglement ?? "",
       notes: v.notes ?? "",
       tauxTVA: String(v.tauxTVA ?? tauxTvaVenteProduitParDefaut(v.type)),
       // Ticket cms1vqsqu — la case reflète la convention notes préfixées.
@@ -1304,6 +1370,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
         prixUnitaire: formData.prixUnitaire ? parseFloat(formData.prixUnitaire) : 0,
         client: formData.client || null,
         paye: formData.paye,
+        modeReglement: formData.modeReglement || null,
         tauxTVA: Number.parseFloat(formData.tauxTVA),
         notes,
         // Ticket cms1vqsqu — cessionGratuite + marqueur `validationVente` qui
@@ -1318,12 +1385,15 @@ function VentesSubTab({ year }: { year?: number } = {}) {
             : {}),
         }),
       }
-      const response = await fetch('/api/elevage/ventes', {
+      // Bilan matière du lait (2026-11-03) : une vente de lait cru au-delà de
+      // la traite des 7 derniers jours demande confirmation.
+      const envoi = await envoyerAvecConfirmationLait((confirmer) => fetch('/api/elevage/ventes', {
         method: isEdit ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      const json = await response.json().catch(() => ({}))
+        body: JSON.stringify(confirmer ? { ...body, confirmerLaitIndisponible: true } : body),
+      }))
+      if (!envoi) return
+      const { res: response, json } = envoi
       if (!response.ok) {
         // Ticket cms1vqsqu — afficher le message précis de l'API (garde-fous).
         toast({ variant: "destructive", title: "Erreur", description: json?.error || "Impossible d'enregistrer" })
@@ -1332,7 +1402,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
       const total = parseFloat(formData.quantite) * parseFloat(formData.prixUnitaire)
       toast({
         title: "Vente enregistrée",
-        description: formData.cessionGratuite ? "Cession à titre gratuit" : `${total.toFixed(2)} €`,
+        description: formData.cessionGratuite ? "Cession à titre gratuit" : formatMontantDevise(total),
       })
       // Review caprin 2026-07-22 — alerte délai d'attente lait sur vente de lait cru.
       if (json?.warning) toast({ variant: "destructive", title: "Attention lait", description: json.warning })
@@ -1371,8 +1441,8 @@ function VentesSubTab({ year }: { year?: number } = {}) {
         <div className="grid gap-3 grid-cols-1 sm:grid-cols-3">
           <Card className="bg-gradient-to-br from-emerald-500 to-emerald-600 text-white">
             <CardHeader className="pb-1 pt-3 px-4">
-              <CardDescription className="text-emerald-100 text-xs">Chiffre d'affaires</CardDescription>
-              <CardTitle className="text-2xl">{stats.totalVentes.toFixed(2)} &euro;</CardTitle>
+              <CardDescription className="text-emerald-100 text-xs">Chiffre d&apos;affaires</CardDescription>
+              <CardTitle className="text-2xl">{formatMontantDevise(stats.totalVentes)}</CardTitle>
             </CardHeader>
           </Card>
           <Card>
@@ -1384,7 +1454,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
           <Card>
             <CardHeader className="pb-1 pt-3 px-4">
               <CardDescription className="text-xs">Panier moyen</CardDescription>
-              <CardTitle className="text-2xl">{stats.nbVentes > 0 ? (stats.totalVentes / stats.nbVentes).toFixed(2) : 0} &euro;</CardTitle>
+              <CardTitle className="text-2xl">{formatMontantDevise(stats.nbVentes > 0 ? stats.totalVentes / stats.nbVentes : 0)}</CardTitle>
             </CardHeader>
           </Card>
         </div>
@@ -1414,7 +1484,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
                 <div className="space-y-2">
                   <Label>Type *</Label>
                   {/* Ticket cms1vqsqu — quitter « Animal vivant » décoche la cession gratuite. */}
-                  <Select value={formData.type} onValueChange={(v) => setFormData(f => ({
+                  <Select value={formData.type} disabled={editingId !== null} onValueChange={(v) => setFormData(f => ({
                     ...f,
                     type: v,
                     unite: TYPE_VENTE_UNITE_DEFAUT[v] ?? f.unite,
@@ -1438,6 +1508,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
                       <SelectItem value="autre">Autre</SelectItem>
                     </SelectContent>
                   </Select>
+                  {editingId !== null && <p className="text-xs text-muted-foreground">Pour changer le type de produit, annulez cette vente puis saisissez une nouvelle vente.</p>}
                 </div>
               </div>
               <div className="space-y-2">
@@ -1465,7 +1536,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
                 <div className="space-y-2">
                   <Label>Prix unit. *</Label>
                   {/* Ticket cms1vqsqu — prix verrouillé à 0 quand cession gratuite. */}
-                  <Input type="number" step="0.01" value={formData.prixUnitaire} onChange={(e) => setFormData(f => ({ ...f, prixUnitaire: e.target.value }))} placeholder={'€'} disabled={formData.cessionGratuite} />
+                  <Input type="number" step="any" value={formData.prixUnitaire} onChange={(e) => setFormData(f => ({ ...f, prixUnitaire: e.target.value }))} placeholder={'€'} disabled={formData.cessionGratuite} />
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="vente-taux-tva">TVA *</Label>
@@ -1499,7 +1570,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
                     emptyLabel="— Sélectionner un animal —"
                   />
                   <p className="text-xs text-muted-foreground">
-                    L'animal passera au statut « vendu » à l'enregistrement.
+                    L&apos;animal passera au statut « vendu » à l&apos;enregistrement.
                   </p>
                 </div>
               )}
@@ -1525,7 +1596,7 @@ function VentesSubTab({ year }: { year?: number } = {}) {
                 <div className="text-center py-2 bg-green-50 rounded-lg">
                   <span className="text-sm text-muted-foreground">Total: </span>
                   <span className="text-xl font-bold text-green-700">
-                    {(parseFloat(formData.quantite) * parseFloat(formData.prixUnitaire)).toFixed(2)} &euro;
+                    {formatMontantDevise(parseFloat(formData.quantite) * parseFloat(formData.prixUnitaire))}
                   </span>
                 </div>
               )}
@@ -1538,6 +1609,11 @@ function VentesSubTab({ year }: { year?: number } = {}) {
                   aria-required={formData.type === 'animal_vivant'}
                 />
               </div>
+              <ChampsEncaissement
+                idPrefix="vente"
+                value={formData}
+                onChange={(changement) => setFormData(f => ({ ...f, ...changement }))}
+              />
               <div className="flex justify-end gap-2 pt-4">
                 <Button type="button" variant="outline" onClick={() => setIsDialogOpen(false)}>Annuler</Button>
                 {/* Ticket cmsog7lrc — pas de soumission sans animal pour ce type. */}
@@ -1577,19 +1653,23 @@ function VentesSubTab({ year }: { year?: number } = {}) {
                     <TableCell><Badge variant="outline">{TYPE_LABELS[vente.type] || vente.type}</Badge></TableCell>
                     <TableCell>{vente.description || '-'}</TableCell>
                     <TableCell className="text-right">{vente.quantite} {labelUnite(vente.unite)}</TableCell>
-                    <TableCell className="text-right">{vente.prixUnitaire.toFixed(2)} &euro;</TableCell>
-                    <TableCell className="text-right font-bold text-green-600">{vente.prixTotal.toFixed(2)} &euro;</TableCell>
+                    <TableCell className="text-right">{formatMontantDevise(vente.prixUnitaire)}</TableCell>
+                    <TableCell className="text-right font-bold text-green-600">{formatMontantDevise(vente.prixTotal)}</TableCell>
                     <TableCell>{vente.client || '-'}</TableCell>
                     <TableCell>
                       <Badge className={vente.paye ? "bg-green-100 text-green-800" : "bg-orange-100 text-orange-800"}>
-                        {vente.paye ? "Payé" : "À payer"}
+                        {vente.factureId ? "Facturée" : (vente.montantRegle ?? 0) > 0 && (vente.resteAPayer ?? 0) > 0 ? "Partiellement encaissé" : vente.paye ? vente.montantRegle == null ? "Déclaré encaissé" : "Encaissé" : "À encaisser"}
                       </Badge>
+                      {!vente.factureId && vente.paye && vente.montantRegle == null && <p className="mt-1 text-xs text-muted-foreground">Pointage sans détail de règlement. À vérifier dans Règlements.</p>}
+                      {!vente.factureId && vente.montantRegle != null && <p className="mt-1 text-xs">Reçu : {formatMontantDevise(vente.montantRegle)} · reste : {formatMontantDevise(vente.resteAPayer ?? 0)}</p>}
+                      <p className="mt-1 text-xs text-muted-foreground">{vente.factureId ? 'Voir la facture' : vente.modeReglement || 'Mode non renseigné'}</p>
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center gap-1 justify-end">
-                        <Button variant="ghost" size="sm" onClick={() => handleEdit(vente)} title="Modifier" className="text-slate-600 hover:text-slate-900">
+                        {vente.prixTotal > 0 && <ReglementsDialog type={vente.factureId ? "Facture" : "VenteProduit"} id={vente.factureId ?? vente.id} onChange={fetchData} />}
+                        {vente.factureId ? <Link href="/comptabilite/factures" className="text-xs underline">Suivre la facture</Link> : <Button variant="ghost" size="sm" onClick={() => handleEdit(vente)} title="Modifier" className="text-slate-600 hover:text-slate-900">
                           <Pencil className="h-3.5 w-3.5" />
-                        </Button>
+                        </Button>}
                         <Button variant="ghost" size="sm" onClick={() => handleDelete(vente.id)} className="text-red-600 hover:text-red-700" title="Supprimer">&times;</Button>
                       </div>
                     </TableCell>
@@ -1626,7 +1706,10 @@ interface Abattage {
   lot: { id: number; nom: string; especeAnimale: { id: string; nom: string; couleur: string | null } } | null
 }
 
-interface LotActif { id: number; nom: string | null; quantiteActuelle: number; especeAnimale: { nom: string } }
+// `effectifCollectif` (têtes anonymes, plafond d'un abattage de lot) est servi
+// par GET /api/elevage/lots ; repli sur le compteur stocké pour un lot non enrichi.
+interface LotActif { id: number; nom: string | null; quantiteActuelle: number; effectifCollectif?: number; especeAnimale: { nom: string } }
+const partCollectiveLotActif = (lot: LotActif) => lot.effectifCollectif ?? lot.quantiteActuelle
 
 const DEST_LABELS: Record<string, string> = {
   auto_consommation: "Auto-consommation",
@@ -1648,7 +1731,6 @@ function AbattagesSubTab({ year }: { year?: number } = {}) {
   const [periode, setPeriode] = React.useState<PeriodeListe>("exercice")
   const [abattages, setAbattages] = React.useState<Abattage[]>([])
   const [lots, setLots] = React.useState<LotActif[]>([])
-  const [stats, setStats] = React.useState<any>(null)
   const [isDialogOpen, setIsDialogOpen] = React.useState(false)
   const [especeFilter, setEspeceFilter] = React.useState<Set<string>>(new Set())
   // QA 2026-05-15 — édition par ligne
@@ -1670,7 +1752,9 @@ function AbattagesSubTab({ year }: { year?: number } = {}) {
     setEditingId(a.id)
     setFormData({
       lotId: a.lot?.id ? a.lot.id.toString() : "",
-      date: a.date.split('T')[0],
+      // Jour civil, celui que le PATCH compare : `split('T')` lisait la veille
+      // d'un abattage horodaté entre minuit et 2 h (heure de Paris).
+      date: jourCivilStocke(a.date) ?? "",
       quantite: a.quantite.toString(),
       poidsVif: a.poidsVif ? a.poidsVif.toString() : "",
       poidsCarcasse: a.poidsCarcasse ? a.poidsCarcasse.toString() : "",
@@ -1690,7 +1774,7 @@ function AbattagesSubTab({ year }: { year?: number } = {}) {
         fetch(`/api/elevage/abattages?limit=500&${parametreAnnee(periode, anneeExercice)}`),
         fetch('/api/elevage/lots?statut=actif'),
       ])
-      if (abatRes.ok) { const r = await abatRes.json(); setAbattages(r.data); setStats(r.stats) }
+      if (abatRes.ok) { const r = await abatRes.json(); setAbattages(r.data) }
       if (lotsRes.ok) setLots((await lotsRes.json()).data)
     } catch {
       toast({ variant: "destructive", title: "Erreur", description: "Impossible de charger les données" })
@@ -1780,7 +1864,14 @@ function AbattagesSubTab({ year }: { year?: number } = {}) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      if (!response.ok) throw new Error('Erreur')
+      if (!response.ok) {
+        // Revue 2026-10-20 — le refus de la route (plafond des têtes
+        // collectives, temps d'attente…) se lit tel quel, comme dans AnimauxTab.
+        const p = await response.json().catch(() => null)
+        const detail = p?.details?.message ?? (typeof p?.details === 'string' ? p.details : null) ?? p?.error
+        toast({ variant: "destructive", title: "Abattage refusé", description: detail || "Impossible d'enregistrer" })
+        return
+      }
       toast({ title: isEdit ? "Abattage mis à jour" : "Abattage enregistré" })
       setIsDialogOpen(false)
       resetForm()
@@ -1824,7 +1915,7 @@ function AbattagesSubTab({ year }: { year?: number } = {}) {
           <Card className="bg-gradient-to-br from-emerald-500 to-emerald-600 text-white">
             <CardHeader className="pb-1 pt-3 px-4">
               <CardDescription className="text-emerald-100 text-xs">Revenus vente</CardDescription>
-              <CardTitle className="text-2xl">{revenusVente.toFixed(2)} &euro;</CardTitle>
+              <CardTitle className="text-2xl">{formatMontantDevise(revenusVente)}</CardTitle>
             </CardHeader>
           </Card>
         </div>
@@ -1883,13 +1974,21 @@ function AbattagesSubTab({ year }: { year?: number } = {}) {
                   <SelectTrigger><SelectValue placeholder="— Sélectionner un lot —" /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value={LOT_NON_CHOISI}>— Sélectionner un lot —</SelectItem>
-                    {lots.map(l => <SelectItem key={l.id} value={l.id.toString()}>{l.nom || `Lot #${l.id}`} ({l.quantiteActuelle} {l.especeAnimale.nom})</SelectItem>)}
+                    {lots.map(l => {
+                      const collectif = partCollectiveLotActif(l)
+                      return <SelectItem key={l.id} value={l.id.toString()}>{l.nom || `Lot #${l.id}`} — {l.especeAnimale.nom} ({collectif} tête{collectif > 1 ? "s" : ""} collective{collectif > 1 ? "s" : ""})</SelectItem>
+                    })}
                   </SelectContent>
                 </Select>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2"><Label>Date</Label><Input type="date" value={formData.date} onChange={(e) => setFormData(f => ({ ...f, date: e.target.value }))} /></div>
-                <div className="space-y-2"><Label>Quantité</Label><Input type="number" min="1" value={formData.quantite} onChange={(e) => setFormData(f => ({ ...f, quantite: e.target.value }))} /></div>
+                <div className="space-y-2"><Label>Quantité</Label><Input type="number" min="1" max={(() => {
+                  // Plafond de la route (POST) : part collective du lot choisi. Une
+                  // modification (PATCH) n'est pas plafonnée par la route.
+                  const lot = editingId === null ? lots.find((l) => l.id.toString() === formData.lotId) : undefined
+                  return lot ? partCollectiveLotActif(lot) || undefined : undefined
+                })()} value={formData.quantite} onChange={(e) => setFormData(f => ({ ...f, quantite: e.target.value }))} /></div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2"><Label>Poids vif (kg)</Label><Input type="number" step="0.1" value={formData.poidsVif} onChange={(e) => setFormData(f => ({ ...f, poidsVif: e.target.value }))} /></div>
@@ -1909,6 +2008,7 @@ function AbattagesSubTab({ year }: { year?: number } = {}) {
                 </div>
                 <div className="space-y-2"><Label>Prix vente</Label><Input type="number" step="0.01" value={formData.prixVente} onChange={(e) => setFormData(f => ({ ...f, prixVente: e.target.value }))} disabled={formData.destination !== 'vente'} /></div>
               </div>
+              {formData.destination === 'vente' && <p className="text-sm text-muted-foreground">La vente est enregistrée payée. Pour une vente à crédit, décochez « Encaissement confirmé » depuis Comptabilité &gt; Transactions, bouton « Règlement et pièce ».</p>}
               {/* Ticket cmsog52qx — lieu et notes étaient persistés (formData/API) mais absents du dialog. */}
               <div className="space-y-2"><Label>Lieu</Label><Input value={formData.lieu} onChange={(e) => setFormData(f => ({ ...f, lieu: e.target.value }))} placeholder="Abattoir, à la ferme…" /></div>
               <div className="space-y-2">
@@ -1974,7 +2074,7 @@ function AbattagesSubTab({ year }: { year?: number } = {}) {
                     <TableCell className="text-right">{a.poidsVif ? `${a.poidsVif} kg` : '-'}</TableCell>
                     <TableCell className="text-right">{a.poidsCarcasse ? `${a.poidsCarcasse} kg` : '-'}</TableCell>
                     <TableCell><Badge variant="outline">{DEST_LABELS[a.destination] || a.destination}</Badge></TableCell>
-                    <TableCell className="text-right text-green-600">{a.prixVente ? `${a.prixVente.toFixed(2)} €` : '-'}</TableCell>
+                    <TableCell className="text-right text-green-600">{a.prixVente ? formatMontantDevise(a.prixVente) : '-'}</TableCell>
                     <TableCell className="text-right">
                       <Button variant="ghost" size="sm" onClick={() => handleEdit(a)} title="Modifier" className="text-slate-600 hover:text-slate-900">
                         <Pencil className="h-3.5 w-3.5" />

@@ -1,7 +1,7 @@
 "use client"
 
 /**
- * Page d'édition d'une recolte
+ * Page d'édition d'une récolte
  */
 
 import * as React from "react"
@@ -26,7 +26,13 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useToast } from "@/hooks/use-toast"
 import { confirmDialog } from "@/lib/global-dialog"
+import { BoutonPartagerRecolte } from "@/components/avis/PartagerRecolte"
 import { AppHeader, PageToolbar } from "@/components/shell/AppHeader"
+import {
+  libelleUniteQuantite,
+  UNITES_QUANTITE,
+  type UniteQuantite,
+} from "@/lib/recolte/projection"
 
 interface RecolteFormData {
   date: string
@@ -48,6 +54,13 @@ export default function EditRecoltePage() {
     especeId: string
     especeNom?: string
     cultureId: number
+    /**
+     * Unité FIGÉE sur la récolte à sa saisie (kg, tige, pièce, botte ; null =
+     * kg). La quantité se modifie dans cette unité : « Quantité (kg) » en dur
+     * faisait lire 19 tiges comme 19 kilos. Le PUT ne l'envoie pas (la route
+     * ne la reçoit jamais du client) et la conserve.
+     */
+    unite: UniteQuantite
   } | null>(null)
 
   const form = useForm<RecolteFormData>({
@@ -70,6 +83,10 @@ export default function EditRecoltePage() {
           especeId: data.especeId,
           especeNom: data.espece?.nom ?? data.especeId,
           cultureId: data.cultureId,
+          unite:
+            typeof data.unite === "string" && (UNITES_QUANTITE as readonly string[]).includes(data.unite)
+              ? (data.unite as UniteQuantite)
+              : "kg",
         })
         form.reset({
           date: data.date ? format(new Date(data.date), "yyyy-MM-dd") : format(new Date(), "yyyy-MM-dd"),
@@ -142,7 +159,7 @@ export default function EditRecoltePage() {
   }
 
   const handleDelete = async () => {
-    if (!(await confirmDialog(`Supprimer cette recolte ?`))) return
+    if (!(await confirmDialog(`Supprimer cette récolte ?`))) return
 
     try {
       const response = await fetch(`/api/recoltes/${recolteId}`, {
@@ -207,6 +224,7 @@ export default function EditRecoltePage() {
 
       {/* Form */}
       <main className="container mx-auto px-4 py-6 max-w-md">
+        <div className="mb-4 flex justify-end"><BoutonPartagerRecolte recolteId={Number(recolteId)} /></div>
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
             <Card>
@@ -256,7 +274,7 @@ export default function EditRecoltePage() {
                   name="quantite"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Quantité (kg)</FormLabel>
+                      <FormLabel>Quantité ({libelleUniteQuantite(recolteInfo?.unite ?? "kg")})</FormLabel>
                       <FormControl>
                         <Input
                           type="number"
@@ -270,6 +288,12 @@ export default function EditRecoltePage() {
                           }
                         />
                       </FormControl>
+                      {recolteInfo && (
+                        <p className="text-xs text-muted-foreground" data-testid="modifier-recolte-unite">
+                          Unité figée à la saisie de la récolte : {libelleUniteQuantite(recolteInfo.unite)}.
+                          Changer l&apos;unité de l&apos;espèce ne modifie pas les récoltes déjà saisies.
+                        </p>
+                      )}
                       <FormMessage />
                     </FormItem>
                   )}

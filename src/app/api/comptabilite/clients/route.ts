@@ -6,7 +6,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { Prisma } from '@prisma/client'
 import { createClientSchema, updateClientSchema } from '@/lib/validations/client'
+import { compterVentesParClient } from '@/lib/comptabilite/ventes-client'
 
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
@@ -20,7 +22,7 @@ export async function GET(request: NextRequest) {
 
     const userId = session.user.id
 
-    const where: any = { userId }
+    const where: Prisma.ClientWhereInput = { userId }
     if (type) where.type = type
     if (actif !== null && actif !== '') where.actif = actif === 'true'
     if (search) {
@@ -31,15 +33,17 @@ export async function GET(request: NextRequest) {
       ]
     }
 
-    const clients = await prisma.client.findMany({
+    const fiches = await prisma.client.findMany({
       where,
       orderBy: { nom: 'asc' },
-      include: {
-        _count: {
-          select: { ventesManuelles: true, factures: true }
-        }
-      }
     })
+
+    // Ticket cmvgeecem (2026-10-20) — `nbVentes` compte toutes les ventes
+    // rattachées par `clientId` (écritures et factures, dont une vente de
+    // récolte facturée, qui n'a pas d'écriture) ; `_count.ventesManuelles`
+    // laissait à « 0 ventes » le client d'une vente facturée.
+    const ventesParClient = await compterVentesParClient(userId, fiches.map((c) => c.id))
+    const clients = fiches.map((c) => ({ ...c, nbVentes: ventesParClient.get(c.id) ?? 0 }))
 
     // Ticket cmsx64vcw (QA 2026-08-17) — les cartes de tête mélangeaient deux
     // périmètres : « Total clients » comptait la liste FILTRÉE tandis que la
@@ -184,7 +188,7 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json({ error: 'Client non trouvé' }, { status: 404 })
     }
 
-    const updateData: any = {}
+    const updateData: Prisma.ClientUncheckedUpdateInput = {}
     if (updates.nom !== undefined) updateData.nom = updates.nom
     if (updates.type !== undefined) updateData.type = updates.type
     if (updates.email !== undefined) updateData.email = updates.email
@@ -206,6 +210,21 @@ export async function PATCH(request: NextRequest) {
     if (updates.exonererTVA !== undefined) updateData.exonererTVA = updates.exonererTVA
     if (updates.notes !== undefined) updateData.notes = updates.notes
     if (updates.actif !== undefined) updateData.actif = updates.actif
+
+    // Facturation électronique : un client professionnel garde un SIRET ou un
+    // SIREN (identifiant de l'acheteur, BT-47) dès que la mise à jour touche
+    // son type ou ses identifiants ; les autres champs restent modifiables.
+    if (updates.type !== undefined || updates.siret !== undefined || updates.siren !== undefined) {
+      const typeFinal = updateData.type ?? existing.type
+      const siretFinal = updateData.siret !== undefined ? updateData.siret : existing.siret
+      const sirenFinal = updateData.siren !== undefined ? updateData.siren : existing.siren
+      if (typeFinal === 'professionnel' && !siretFinal && !sirenFinal) {
+        return NextResponse.json(
+          { error: 'SIRET ou SIREN requis pour un client professionnel (identifiant de l’acheteur obligatoire sur une facture électronique)' },
+          { status: 400 }
+        )
+      }
+    }
 
     const client = await prisma.client.update({
       where: { id },

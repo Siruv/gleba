@@ -1,3 +1,5 @@
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
 /**
  * Auto-Comptabilite - Generation automatique d'ecritures comptables
  *
@@ -12,6 +14,12 @@ import type { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
 import { libelleUniteQuantite, type UniteQuantite } from '@/lib/recolte/projection'
 import { formatQuantite } from '@/lib/recolte/quantites'
+import { selectSuiviConserve, suiviConserve, type SuiviVente } from '@/lib/comptabilite/ecriture-derivee'
+import { libellesVenteBois } from '@/lib/verger/production-bois'
+import { montantVenteFruit } from '@/lib/verger/montant-vente'
+import { TAUX_TVA_BOIS_PAR_DEFAUT } from '@/lib/verger/tva-bois'
+import { cleSourceReglement } from '@/lib/comptabilite/cle-reglement'
+import { synchroniserReglementSource, verifierSuppressionSourceReglee, rattacherReglementsFacture } from '@/lib/comptabilite/suivi-reglement-source'
 
 // ============================================================
 // HELPERS
@@ -19,11 +27,58 @@ import { formatQuantite } from '@/lib/recolte/quantites'
 
 type AutoComptaTx = Prisma.TransactionClient
 
+/**
+ * Tous les miroirs de dépense naissent payés : « payé » n'y apprend rien
+ * (opérations d'arbre et campagnes de plantation alignées le 2026-10-30). La
+ * garde du 2026-10-28, qui refusait de corriger le coût d'un miroir payé sans
+ * versement détaillé, bloquait donc toute modification de la source
+ * (régression P1, revue du 2026-10-29) : une correction garde le pointage
+ * existant ; un journal de versements détaillés reste géré par
+ * `synchroniserReglementSource`.
+ */
+async function suiviDuMiroirDepense(db: AutoComptaTx, where: { userId: string; sourceType: string; sourceId: number; auto: true }, montant?: number) {
+  await verrouillerReglements(db, where.userId)
+  await db.$queryRaw`SELECT id FROM depenses_manuelles WHERE user_id = ${where.userId} AND source_type = ${where.sourceType} AND source_id = ${where.sourceId} AND auto = true FOR UPDATE`
+  const ancienne = await db.depenseManuelle.findFirst({
+    where,
+    select: { paye: true, modeReglement: true, numeroPiece: true, journal: true, pjUrl: true, notes: true, refFacture: true, dateEcheance: true },
+  })
+  const cle = cleSourceReglement('depense', where.sourceType, where.sourceId)
+  const reglement = montant !== undefined ? await synchroniserReglementSource(db, where.userId, cle, montant) : {}
+  // Le montant appartient à la source ; seul le suivi est reporté.
+  const suivi = ancienne ? { paye: ancienne.paye, modeReglement: ancienne.modeReglement, numeroPiece: ancienne.numeroPiece,
+    journal: ancienne.journal, pjUrl: ancienne.pjUrl, notes: ancienne.notes, refFacture: ancienne.refFacture, dateEcheance: ancienne.dateEcheance } : {}
+  return { ...suivi, ...reglement }
+}
+
 function inAutoComptaTransaction<T>(
   tx: AutoComptaTx | undefined,
   operation: (db: AutoComptaTx) => Promise<T>,
 ): Promise<T> {
   return tx ? operation(tx) : prisma.$transaction(operation)
+}
+
+/**
+ * Suivi (règlement, pièce, journal, justificatif, notes) saisi sur le miroir
+ * qu'une source va régénérer, à reporter sur le nouveau (ticket cmvgdzsf7,
+ * 2026-10-20). Les fonctions ci-dessous suppriment puis recréent le miroir à
+ * chaque modification de la source : la pièce saisie dans Comptabilité >
+ * Transactions aurait disparu à la modification suivante de la vente.
+ */
+async function suiviDuMiroirVente(
+  db: AutoComptaTx,
+  where: Prisma.VenteManuelleWhereInput,
+  montant?: number,
+  conserverPointage = false,
+): Promise<SuiviVente & { paye?: boolean }> {
+  if (typeof where.userId === 'string') await verrouillerReglements(db, where.userId)
+  const ancienne = await db.venteManuelle.findFirst({
+    where,
+    select: { ...selectSuiviConserve(), ...(conserverPointage ? { paye: true } : {}) } as Prisma.VenteManuelleSelect,
+  })
+  const identite = typeof where.userId === 'string' && typeof where.sourceType === 'string' && (typeof where.sourceId === 'number' || typeof where.sourceRef === 'string')
+  const reglement = montant !== undefined && identite ? await synchroniserReglementSource(db, where.userId as string, cleSourceReglement('vente', where.sourceType as string, (where.sourceId ?? where.sourceRef) as number | string, where.sourceId == null), montant) : {}
+  return { ...suiviConserve(ancienne), ...(conserverPointage && ancienne ? { paye: ancienne.paye } : {}), ...reglement }
 }
 
 /**
@@ -61,12 +116,17 @@ export async function deleteAutoEntry(
   userId?: string,
   tx?: AutoComptaTx,
 ) {
-  const where = { sourceType, sourceId, auto: true, ...(userId ? { userId } : {}) }
-  if (table === 'vente') {
-    return (tx ?? prisma).venteManuelle.deleteMany({ where })
-  } else {
-    return (tx ?? prisma).depenseManuelle.deleteMany({ where })
-  }
+  return inAutoComptaTransaction(tx, async (db) => {
+    const where = { sourceType, sourceId, auto: true, ...(userId ? { userId } : {}) }
+    const proprietaires = userId ? [userId] : (table === 'vente'
+      ? await db.venteManuelle.findMany({ where, select: { userId: true } })
+      : await db.depenseManuelle.findMany({ where, select: { userId: true } })).map((l) => l.userId)
+    for (const proprietaire of [...new Set(proprietaires)].sort()) {
+      await verrouillerReglements(db, proprietaire)
+      await verifierSuppressionSourceReglee(db, proprietaire, cleSourceReglement(table, sourceType, sourceId))
+    }
+    return table === 'vente' ? db.venteManuelle.deleteMany({ where }) : db.depenseManuelle.deleteMany({ where })
+  })
 }
 
 export async function deleteAutoEntryByRef(
@@ -76,10 +136,12 @@ export async function deleteAutoEntryByRef(
   userId: string,
   tx?: AutoComptaTx,
 ) {
-  const where = { sourceType, sourceRef, auto: true, userId }
-  return table === 'vente'
-    ? (tx ?? prisma).venteManuelle.deleteMany({ where })
-    : (tx ?? prisma).depenseManuelle.deleteMany({ where })
+  return inAutoComptaTransaction(tx, async (db) => {
+    await verrouillerReglements(db, userId)
+    const where = { sourceType, sourceRef, auto: true, userId }
+    await verifierSuppressionSourceReglee(db, userId, cleSourceReglement(table, sourceType, sourceRef, true))
+    return table === 'vente' ? db.venteManuelle.deleteMany({ where }) : db.depenseManuelle.deleteMany({ where })
+  })
 }
 
 /**
@@ -120,26 +182,34 @@ export async function createVenteFromRecolte(
     clientId?: number | null
     dateVente?: Date | string | null
     factureId?: number | null
-  }
+  },
+  tx?: AutoComptaTx,
 ) {
   // Contrat anti-double-comptage (cf. kpi/compta.ts) : une vente facturée est
   // comptée via sa Facture — pas d'écriture auto en plus.
   if (recolte.factureId) {
-    await deleteAutoEntry('recolte', recolte.id, 'vente')
-    return null
+    return inAutoComptaTransaction(tx, async (db) => {
+      await rattacherReglementsFacture(db, userId, 'vente', 'recolte', recolte.id, recolte.factureId!)
+      await deleteAutoEntry('recolte', recolte.id, 'vente', userId, db)
+      return null
+    })
   }
 
-  const montantTTC = recolte.prixTotal || (recolte.quantite * (recolte.prixKg || 0))
-  if (montantTTC <= 0) return null
+  const montantTTC = recolte.prixTotal ?? (recolte.quantite * (recolte.prixKg || 0))
+  if (montantTTC <= 0) { await deleteAutoEntry('recolte', recolte.id, 'vente', userId, tx); return null }
 
   const uniteVente = (recolte.unite ?? 'kg') as UniteQuantite
   const { montantHT, montantTVA } = calculTVA(montantTTC, 5.5)
 
   // Transaction atomique : supprimer l'ancien + creer le nouveau
-  return prisma.$transaction(async (tx) => {
-    await tx.venteManuelle.deleteMany({
-      where: { sourceType: 'recolte', sourceId: recolte.id, auto: true },
-    })
+  return inAutoComptaTransaction(tx, async (tx) => {
+    // Scopé au compte, comme la lecture du suivi (revue du 2026-10-20).
+    const miroir = { userId, sourceType: 'recolte', sourceId: recolte.id, auto: true }
+    // La récolte ne porte pas son paiement : le miroir le porte. Une
+    // régénération garde le pointage (une vente dépointée restait sinon
+    // repassée payée), comme les ventes du verger (2026-10-30).
+    const suivi = await suiviDuMiroirVente(tx, miroir, montantTTC, true)
+    await tx.venteManuelle.deleteMany({ where: miroir })
 
     return tx.venteManuelle.create({
       data: {
@@ -161,6 +231,7 @@ export async function createVenteFromRecolte(
         sourceType: 'recolte',
         sourceId: recolte.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -184,6 +255,7 @@ export async function createDepenseFromLotAnimaux(
 ) {
   const montantTTC = lot.prixAchatTotal || 0
   return inAutoComptaTransaction(tx, async (db) => {
+    const suivi = await suiviDuMiroirDepense(db, { userId, sourceType: 'achat_animal', sourceId: lot.id, auto: true }, montantTTC)
     await db.depenseManuelle.deleteMany({
       where: { userId, sourceType: 'achat_animal', sourceId: lot.id, auto: true },
     })
@@ -207,6 +279,7 @@ export async function createDepenseFromLotAnimaux(
         sourceType: 'achat_animal',
         sourceId: lot.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -227,26 +300,32 @@ export async function createVenteFromRecolteArbre(
     dateVente?: Date | string | null
     arbre?: { nom?: string; espece?: string | null } | null
     factureId?: number | null
-  }
+  },
+  tx?: AutoComptaTx,
 ) {
   // Vente facturée ⇒ comptée via la Facture, pas d'écriture auto (cf. kpi/compta.ts).
   if (recolteArbre.factureId) {
-    await deleteAutoEntry('recolte_arbre', recolteArbre.id, 'vente')
-    return null
+    return inAutoComptaTransaction(tx, async (db) => {
+      await rattacherReglementsFacture(db, userId, 'vente', 'recolte_arbre', recolteArbre.id, recolteArbre.factureId!)
+      await deleteAutoEntry('recolte_arbre', recolteArbre.id, 'vente', userId, db)
+      return null
+    })
   }
 
-  const montantTTC = recolteArbre.prixTotal || (recolteArbre.quantite * (recolteArbre.prixKg || 0))
-  if (montantTTC <= 0) return null
+  const montantTTC = montantVenteFruit(recolteArbre)
+  if (montantTTC <= 0) { await deleteAutoEntry('recolte_arbre', recolteArbre.id, 'vente', userId, tx); return null }
 
   const { montantHT, montantTVA } = calculTVA(montantTTC, 5.5)
 
   const arbreNom = recolteArbre.arbre?.nom || 'Fruits'
   const especeNom = recolteArbre.arbre?.espece || ''
 
-  return prisma.$transaction(async (tx) => {
-    await tx.venteManuelle.deleteMany({
-      where: { sourceType: 'recolte_arbre', sourceId: recolteArbre.id, auto: true },
-    })
+  return inAutoComptaTransaction(tx, async (tx) => {
+    // Scopé au compte, comme la lecture du suivi (revue du 2026-10-20).
+    const miroir = { userId, sourceType: 'recolte_arbre', sourceId: recolteArbre.id, auto: true }
+    const ancien = await tx.venteManuelle.findFirst({ where: miroir, select: { paye: true } })
+    const suivi = await suiviDuMiroirVente(tx, miroir, montantTTC)
+    await tx.venteManuelle.deleteMany({ where: miroir })
 
     return tx.venteManuelle.create({
       data: {
@@ -264,10 +343,11 @@ export async function createVenteFromRecolteArbre(
         clientId: recolteArbre.clientId || null,
         clientNom: recolteArbre.clientNom || null,
         module: 'verger',
-        paye: true,
+        paye: ancien?.paye ?? false,
         sourceType: 'recolte_arbre',
         sourceId: recolteArbre.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -291,13 +371,17 @@ export async function createVenteFromVenteProduit(
     tauxTVA?: number | null
     factureId?: number | null
     paye?: boolean | null
+    modeReglement?: string | null
   },
   tx?: AutoComptaTx,
 ) {
   // Vente facturée ⇒ comptée via la Facture, pas d'écriture auto (cf. kpi/compta.ts).
   if (venteProduit.factureId) {
-    await deleteAutoEntry('vente_produit', venteProduit.id, 'vente', userId, tx)
-    return null
+    return inAutoComptaTransaction(tx, async (db) => {
+      await rattacherReglementsFacture(db, userId, 'vente', 'vente_produit', venteProduit.id, venteProduit.factureId!)
+      await deleteAutoEntry('vente_produit', venteProduit.id, 'vente', userId, db)
+      return null
+    })
   }
 
   const montantTTC = venteProduit.prixTotal
@@ -324,6 +408,7 @@ export async function createVenteFromVenteProduit(
   }
 
   return inAutoComptaTransaction(tx, async (db) => {
+    const suivi = await suiviDuMiroirVente(db, { userId, sourceType: 'vente_produit', sourceId: venteProduit.id, auto: true }, montantTTC)
     await db.venteManuelle.deleteMany({
       where: { userId, sourceType: 'vente_produit', sourceId: venteProduit.id, auto: true },
     })
@@ -343,10 +428,13 @@ export async function createVenteFromVenteProduit(
         montant: montantTTC,
         clientNom: venteProduit.client || null,
         module: 'elevage',
+        // Vente présumée payée sans statut explicite (décision du 2026-10-30).
         paye: venteProduit.paye ?? true,
         sourceType: 'vente_produit',
         sourceId: venteProduit.id,
         auto: true,
+        ...suivi,
+        ...(venteProduit.modeReglement !== undefined ? { modeReglement: venteProduit.modeReglement } : {}),
       },
     })
   })
@@ -403,9 +491,7 @@ export async function upsertVenteFromPaieLait(
     // Paie à 0 (ou négative après pénalités) : pas de revenu, on purge une
     // éventuelle écriture précédente (mois ré-enregistré à 0). Scopé userId :
     // le sourceId synthétique est partagé entre tenants.
-    await tx.venteManuelle.deleteMany({
-      where: { sourceType: 'paie_lait', sourceId, auto: true, userId },
-    })
+    await deleteAutoEntry('paie_lait', sourceId, 'vente', userId, tx)
     return null
   }
 
@@ -417,6 +503,7 @@ export async function upsertVenteFromPaieLait(
   const moisLabel = `${String(paie.mois).padStart(2, '0')}/${paie.annee}`
 
   // Scopé userId : sourceId (annee*100+mois) est commun à tous les tenants.
+  const suivi = await suiviDuMiroirVente(tx, { sourceType: 'paie_lait', sourceId, auto: true, userId }, montantTTC)
   await tx.venteManuelle.deleteMany({
     where: { sourceType: 'paie_lait', sourceId, auto: true, userId },
   })
@@ -444,12 +531,18 @@ export async function upsertVenteFromPaieLait(
         sourceType: 'paie_lait',
         sourceId,
         auto: true,
+        ...suivi,
     },
   })
 }
 
 /**
  * Cree une VenteManuelle quand un Abattage a une vente (destination = "vente")
+ *
+ * Une nouvelle vente d'abattage est présumée payée, comme avant le 2026-10-28
+ * (décision du 2026-10-30). La source ne porte pas de pointage : celui du
+ * miroir existant est conservé à chaque régénération, un impayé saisi ne
+ * redevient jamais payé.
  */
 export async function createVenteFromAbattage(
   userId: string,
@@ -469,8 +562,11 @@ export async function createVenteFromAbattage(
 ) {
   // Vente facturée ⇒ comptée via la Facture, pas d'écriture auto (cf. kpi/compta.ts).
   if (abattage.factureId) {
-    await deleteAutoEntry('abattage', abattage.id, 'vente', userId, tx)
-    return null
+    return inAutoComptaTransaction(tx, async (db) => {
+      await rattacherReglementsFacture(db, userId, 'vente', 'abattage', abattage.id, abattage.factureId!)
+      await deleteAutoEntry('abattage', abattage.id, 'vente', userId, db)
+      return null
+    })
   }
 
   // Uniquement si destination = vente et qu'il y a un prix
@@ -487,6 +583,7 @@ export async function createVenteFromAbattage(
   const animalInfo = abattage.animal?.nom || abattage.lot?.nom || 'Abattage'
 
   return inAutoComptaTransaction(tx, async (db) => {
+    const suivi = await suiviDuMiroirVente(db, { userId, sourceType: 'abattage', sourceId: abattage.id, auto: true }, montantTTC, true)
     await db.venteManuelle.deleteMany({
       where: { userId, sourceType: 'abattage', sourceId: abattage.id, auto: true },
     })
@@ -508,6 +605,7 @@ export async function createVenteFromAbattage(
         sourceType: 'abattage',
         sourceId: abattage.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -529,48 +627,58 @@ export async function createVenteFromProductionBois(
     dateVente?: Date | string | null
     arbre?: { nom?: string; espece?: string | null } | null
     factureId?: number | null
-  }
+  },
+  tx?: AutoComptaTx,
 ) {
   // Vente facturée ⇒ comptée via la Facture, pas d'écriture auto (cf. kpi/compta.ts).
   if (productionBois.factureId) {
-    await deleteAutoEntry('production_bois', productionBois.id, 'vente')
-    return null
+    return inAutoComptaTransaction(tx, async (db) => {
+      await rattacherReglementsFacture(db, userId, 'vente', 'production_bois', productionBois.id, productionBois.factureId!)
+      await deleteAutoEntry('production_bois', productionBois.id, 'vente', userId, db)
+      return null
+    })
   }
 
   const montantTTC = productionBois.prixVente || 0
-  if (montantTTC <= 0) return null
+  if (montantTTC <= 0) { await deleteAutoEntry('production_bois', productionBois.id, 'vente', userId, tx); return null }
 
-  const { montantHT, montantTVA } = calculTVA(montantTTC, 10) // Bois = TVA 10%
+  const { montantHT, montantTVA } = calculTVA(montantTTC, TAUX_TVA_BOIS_PAR_DEFAUT)
 
-  const typeLabel = productionBois.type || 'Bois'
-  const arbreNom = productionBois.arbre?.nom || ''
-  const volumeInfo = productionBois.volumeM3 ? `${productionBois.volumeM3} m³` : ''
-  const descParts = [`Vente bois - ${typeLabel}`, arbreNom, volumeInfo].filter(Boolean)
+  // QA cmvnp0dm9 — même libellé que l'écran et la facture (« Élagage »).
+  const { description } = libellesVenteBois({
+    type: productionBois.type,
+    volumeM3: productionBois.volumeM3,
+    poidsKg: productionBois.poidsKg,
+    arbreNom: productionBois.arbre?.nom,
+  })
 
-  return prisma.$transaction(async (tx) => {
-    await tx.venteManuelle.deleteMany({
-      where: { sourceType: 'production_bois', sourceId: productionBois.id, auto: true },
-    })
+  return inAutoComptaTransaction(tx, async (tx) => {
+    // Scopé au compte, comme la lecture du suivi (revue du 2026-10-20).
+    const miroir = { userId, sourceType: 'production_bois', sourceId: productionBois.id, auto: true }
+    const ancien = await tx.venteManuelle.findFirst({ where: miroir, select: { paye: true } })
+    const suivi = await suiviDuMiroirVente(tx, miroir, montantTTC)
+    await tx.venteManuelle.deleteMany({ where: miroir })
 
     return tx.venteManuelle.create({
       data: {
         userId,
         date: productionBois.dateVente ? new Date(productionBois.dateVente) : new Date(),
         categorie: 'bois',
-        description: descParts.join(' - '),
+        description,
         quantite: productionBois.volumeM3 || productionBois.poidsKg || null,
         unite: productionBois.volumeM3 ? 'm³' : (productionBois.poidsKg ? 'kg' : null),
-        tauxTVA: 10,
+        tauxTVA: TAUX_TVA_BOIS_PAR_DEFAUT,
         montantHT,
         montantTVA,
         montant: montantTTC,
         clientId: productionBois.clientId || null,
         clientNom: productionBois.clientNom || null,
         module: 'verger',
-        paye: true,
+        paye: ancien?.paye ?? false,
         sourceType: 'production_bois',
         sourceId: productionBois.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -589,8 +697,39 @@ export async function createVenteFromProductionBois(
  */
 
 /**
+ * Achat d'un arbre : même date et montant que la fiche. Présumé réglé comme les
+ * achats d'animaux et de lots (décision du 2026-10-30) : hors de la garde des
+ * paiements déclarés. Une régénération garde le taux, la catégorie et le
+ * pointage du miroir existant (la reprise de mai l'avait classé à 5,5 % en
+ * « achats ») ; seuls montant, HT et TVA suivent la fiche.
+ */
+export async function createDepenseFromAchatArbre(userId: string, arbre: {
+  id: number; nom: string; prixAchat: number | null; fournisseur: string | null;
+  dateAchat: Date | null; datePlantation: Date | null; createdAt: Date
+}, tx?: AutoComptaTx) {
+  const montant = arbre.prixAchat ?? 0
+  if (!Number.isFinite(montant) || montant < 0) throw new ErreurReglement('Le prix d’achat doit être positif ou nul.', 400)
+  return inAutoComptaTransaction(tx, async db => {
+    const where = { userId, sourceType: 'achat_arbre', sourceId: arbre.id, auto: true as const }
+    const suivi = await suiviDuMiroirDepense(db, where, montant)
+    const existant = await db.depenseManuelle.findFirst({ where, select: { tauxTVA: true, categorie: true } })
+    await db.depenseManuelle.deleteMany({ where })
+    if (montant === 0) return null
+    const tauxTVA = typeof existant?.tauxTVA === 'number' && Number.isFinite(existant.tauxTVA) ? existant.tauxTVA : 10
+    const tva = calculTVA(montant, tauxTVA)
+    return db.depenseManuelle.create({ data: {
+      ...where, date: arbre.dateAchat ?? arbre.datePlantation ?? arbre.createdAt,
+      categorie: existant?.categorie || 'plants', description: `Achat ${arbre.nom}`,
+      fournisseurNom: arbre.fournisseur, montant, montantHT: tva.montantHT, montantTVA: tva.montantTVA,
+      tauxTVA, tvaInferee: true, journal: 'AC', module: 'verger', comptable: true, paye: true, ...suivi,
+    } })
+  })
+}
+
+/**
  * Cree une DepenseManuelle quand une OperationArbre a un coût (taille,
  * traitement, greffe...). TVA : 20 % traitement (intrants), 10 % sinon (service).
+ * Présumée réglée comme les soins et les interventions (2026-10-30).
  */
 export async function createDepenseFromOperationArbre(
   userId: string,
@@ -601,13 +740,15 @@ export async function createDepenseFromOperationArbre(
     cout?: number | null
     date?: Date | string | null
     fait?: boolean | null
-  }
+  },
+  tx?: AutoComptaTx,
 ) {
   // Une opération planifiée (fait=false) n'est pas une dépense réelle.
   const montantTTC = operation.fait === false ? 0 : operation.cout || 0
-  return prisma.$transaction(async (tx) => {
+  return inAutoComptaTransaction(tx, async (tx) => {
+    const suivi = await suiviDuMiroirDepense(tx, { userId, sourceType: 'operation_arbre', sourceId: operation.id, auto: true }, montantTTC)
     await tx.depenseManuelle.deleteMany({
-      where: { sourceType: 'operation_arbre', sourceId: operation.id, auto: true },
+      where: { userId, sourceType: 'operation_arbre', sourceId: operation.id, auto: true },
     })
     if (montantTTC <= 0) return null
     const tauxTVA = operation.type === 'traitement' ? 20 : 10
@@ -628,6 +769,7 @@ export async function createDepenseFromOperationArbre(
         sourceType: 'operation_arbre',
         sourceId: operation.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -635,7 +777,8 @@ export async function createDepenseFromOperationArbre(
 
 /**
  * Cree une DepenseManuelle quand une CampagnePlantation a un coût réel.
- * TVA 10 % (végétaux vivants).
+ * TVA 10 % (végétaux vivants). Présumée réglée comme les achats d'arbres
+ * (2026-10-30).
  */
 export async function createDepenseFromCampagnePlantation(
   userId: string,
@@ -645,15 +788,22 @@ export async function createDepenseFromCampagnePlantation(
     coutReel?: number | null
     datePlantationReelle?: Date | string | null
     datePlantationPrevue?: Date | string | null
-  }
+    createdAt?: Date | string | null
+  },
+  tx?: AutoComptaTx,
 ) {
   const montantTTC = campagne.coutReel || 0
-  return prisma.$transaction(async (tx) => {
+  return inAutoComptaTransaction(tx, async (tx) => {
+    const suivi = await suiviDuMiroirDepense(tx, { userId, sourceType: 'campagne_plantation', sourceId: campagne.id, auto: true }, montantTTC)
     await tx.depenseManuelle.deleteMany({
-      where: { sourceType: 'campagne_plantation', sourceId: campagne.id, auto: true },
+      where: { userId, sourceType: 'campagne_plantation', sourceId: campagne.id, auto: true },
     })
     if (montantTTC <= 0) return null
     const { montantHT, montantTVA } = calculTVA(montantTTC, 10)
+    // Sans date de plantation, la date de création de la campagne, comme la
+    // liste Transactions : la date du jour déplaçait la dépense à chaque sauvegarde.
+    const creation = campagne.datePlantationReelle || campagne.datePlantationPrevue ? null
+      : campagne.createdAt ?? (await tx.campagnePlantation.findFirst({ where: { id: campagne.id, userId }, select: { createdAt: true } }))?.createdAt
     return tx.depenseManuelle.create({
       data: {
         userId,
@@ -661,7 +811,7 @@ export async function createDepenseFromCampagnePlantation(
           ? new Date(campagne.datePlantationReelle)
           : campagne.datePlantationPrevue
             ? new Date(campagne.datePlantationPrevue)
-            : new Date(),
+            : creation ? new Date(creation) : new Date(),
         categorie: 'plants',
         description: `Campagne de plantation - ${campagne.nom || `#${campagne.id}`}`,
         tauxTVA: 10,
@@ -674,6 +824,7 @@ export async function createDepenseFromCampagnePlantation(
         sourceType: 'campagne_plantation',
         sourceId: campagne.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -707,6 +858,7 @@ export async function createDepenseFromConsommationAliment(
       aliment?.userStocks?.[0]?.coutUnitaire ?? aliment?.userStocks?.[0]?.prix ?? aliment?.prix ?? 0
     const montantTTC = consommation.quantite * prixUnitaire
 
+    const suivi = await suiviDuMiroirDepense(db, { userId, sourceType: 'consommation_aliment', sourceId: consommation.id, auto: true }, montantTTC)
     await db.depenseManuelle.deleteMany({
       where: { userId, sourceType: 'consommation_aliment', sourceId: consommation.id, auto: true },
     })
@@ -730,6 +882,7 @@ export async function createDepenseFromConsommationAliment(
         sourceType: 'consommation_aliment',
         sourceId: consommation.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -753,6 +906,7 @@ export async function createDepenseFromSoinAnimal(
   // Un soin planifié (fait=false) n'est pas une dépense réelle.
   const montantTTC = soin.fait === false ? 0 : soin.cout || 0
   return inAutoComptaTransaction(tx, async (db) => {
+    const suivi = await suiviDuMiroirDepense(db, { userId, sourceType: 'soin_animal', sourceId: soin.id, auto: true }, montantTTC)
     await db.depenseManuelle.deleteMany({
       where: { userId, sourceType: 'soin_animal', sourceId: soin.id, auto: true },
     })
@@ -776,6 +930,7 @@ export async function createDepenseFromSoinAnimal(
         sourceType: 'soin_animal',
         sourceId: soin.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -800,6 +955,7 @@ export async function createDepenseFromAchatAnimal(
 ) {
   const montantTTC = animal.prixAchatInclusDansLot ? 0 : animal.prixAchat || 0
   return inAutoComptaTransaction(tx, async (db) => {
+    const suivi = await suiviDuMiroirDepense(db, { userId, sourceType: 'achat_animal_individuel', sourceId: animal.id, auto: true }, montantTTC)
     await db.depenseManuelle.deleteMany({
       where: { userId, sourceType: 'achat_animal_individuel', sourceId: animal.id, auto: true },
     })
@@ -823,6 +979,7 @@ export async function createDepenseFromAchatAnimal(
         sourceType: 'achat_animal_individuel',
         sourceId: animal.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -849,11 +1006,19 @@ export async function upsertVenteFromReservationElevage(
   userId: string,
   reservation: ReservationComptaInput,
 ) {
+  const refs = [`${reservation.id}:acompte`, `${reservation.id}:solde`]
+  const suiviParRef = new Map<string, SuiviVente>()
+  for (const sourceRef of refs) {
+    suiviParRef.set(
+      sourceRef,
+      await suiviDuMiroirVente(tx, { userId, sourceType: 'reservation_elevage', sourceRef, auto: true }),
+    )
+  }
   await tx.venteManuelle.deleteMany({
     where: {
       userId,
       sourceType: 'reservation_elevage',
-      sourceRef: { in: [`${reservation.id}:acompte`, `${reservation.id}:solde`] },
+      sourceRef: { in: refs },
       auto: true,
     },
   })
@@ -912,6 +1077,7 @@ export async function upsertVenteFromReservationElevage(
         sourceType: 'reservation_elevage',
         sourceRef: row.sourceRef,
         auto: true,
+        ...suiviParRef.get(row.sourceRef),
       },
     }))
   }
@@ -954,8 +1120,9 @@ export async function createDepenseFromFertilisation(
   const montantTTC = fertilisation.quantite * prixUnitaire
 
   return prisma.$transaction(async (tx) => {
+    const suivi = await suiviDuMiroirDepense(tx, { userId, sourceType: 'fertilisation', sourceId: fertilisation.id, auto: true }, montantTTC)
     await tx.depenseManuelle.deleteMany({
-      where: { sourceType: 'fertilisation', sourceId: fertilisation.id, auto: true },
+      where: { userId, sourceType: 'fertilisation', sourceId: fertilisation.id, auto: true },
     })
     if (montantTTC <= 0) return null
     const { montantHT, montantTVA } = calculTVA(montantTTC, 20)
@@ -975,6 +1142,7 @@ export async function createDepenseFromFertilisation(
         sourceType: 'fertilisation',
         sourceId: fertilisation.id,
         auto: true,
+        ...suivi,
       },
     })
   })
@@ -998,13 +1166,14 @@ export async function createDepenseFromIntervention(
     plancheId?: string | null
     arbreId?: number | null
     fait?: boolean | null
-  }
+  },
+  tx?: AutoComptaTx,
 ) {
   // Audit compta 2026-06 (#9) : une intervention planifiée (fait=false)
   // n'est pas une dépense réelle — elle faussait dépenses et TVA déductible.
   const montantTTC = intervention.fait === false ? 0 : intervention.coutTotal || 0
   if (montantTTC <= 0) {
-    await deleteAutoEntry('intervention', intervention.id, 'depense')
+    await deleteAutoEntry('intervention', intervention.id, 'depense', userId, tx)
     return null
   }
 
@@ -1020,9 +1189,9 @@ export async function createDepenseFromIntervention(
   }
 
   // Determiner le module selon le contexte
-  let module = 'potager'
+  let moduleCible = 'potager'
   if (intervention.arbreId) {
-    module = 'verger'
+    moduleCible = 'verger'
   }
 
   const { montantHT, montantTVA } = calculTVA(montantTTC, tauxTVA)
@@ -1030,9 +1199,10 @@ export async function createDepenseFromIntervention(
   const desc = intervention.description
     || `${intervention.type}${intervention.intrantNom ? ` - ${intervention.intrantNom}` : ''}`
 
-  return prisma.$transaction(async (tx) => {
+  return inAutoComptaTransaction(tx, async (tx) => {
+    const suivi = await suiviDuMiroirDepense(tx, { userId, sourceType: 'intervention', sourceId: intervention.id, auto: true }, montantTTC)
     await tx.depenseManuelle.deleteMany({
-      where: { sourceType: 'intervention', sourceId: intervention.id, auto: true },
+      where: { userId, sourceType: 'intervention', sourceId: intervention.id, auto: true },
     })
 
     return tx.depenseManuelle.create({
@@ -1045,11 +1215,12 @@ export async function createDepenseFromIntervention(
         montantHT,
         montantTVA,
         montant: montantTTC,
-        module,
+        module: moduleCible,
         paye: true,
         sourceType: 'intervention',
         sourceId: intervention.id,
         auto: true,
+        ...suivi,
       },
     })
   })

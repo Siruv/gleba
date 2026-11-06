@@ -7,14 +7,12 @@
 import * as React from "react"
 import { useSession } from "next-auth/react"
 import {
-  Settings,
   Plus,
   RefreshCw,
   Pencil,
   Trash2,
   Bird,
   ArrowRight,
-  Calculator,
   BarChart3,
 } from "lucide-react"
 
@@ -46,6 +44,7 @@ import {
 import { useElevageModes } from "@/hooks/use-elevage-modes"
 import { FILIERE_LABELS, type Filiere } from "@/lib/elevage/filiere"
 import { capacites } from "@/lib/elevage/filiere-ui"
+import { rendementCarcasseDepuisSaisie, rendementCarcassePourSaisie } from "@/lib/elevage/rendement-carcasse"
 import { useFiliereSelection, filiereMatch } from "@/lib/elevage/filiere-context"
 
 interface EspeceAnimale {
@@ -125,8 +124,8 @@ function normaliserIdentifiantEspece(valeur: string): string {
 export function EspecesTab() {
   const { toast } = useToast()
   const { data: session } = useSession()
-  const currentUserId = (session?.user as any)?.id as string | undefined
-  const isAdmin = (session?.user as any)?.role === "ADMIN"
+  const currentUserId = session?.user?.id
+  const isAdmin = session?.user?.role === "ADMIN"
   const [isLoading, setIsLoading] = React.useState(true)
   const [especes, setEspeces] = React.useState<EspeceAnimale[]>([])
   const [filteredEspeces, setFilteredEspeces] = React.useState<EspeceAnimale[]>([])
@@ -204,7 +203,8 @@ export function EspecesTab() {
       dureeCouvaison: e.dureeCouvaison?.toString() || "",
       dureeElevage: e.dureeElevage?.toString() || "",
       poidsAdulte: e.poidsAdulte?.toString() || "",
-      rendementCarcasse: e.rendementCarcasse?.toString() || "",
+      // QA cmvgeif10 — stocké en ratio (0,72), saisi en pourcentage (72).
+      rendementCarcasse: rendementCarcassePourSaisie(e.rendementCarcasse),
       ponteAnnuelle: e.ponteAnnuelle?.toString() || "",
       consommationJour: e.consommationJour?.toString() || "",
       prixAchat: e.prixAchat?.toString() || "",
@@ -224,7 +224,6 @@ export function EspecesTab() {
       ["poidsAdulte", "Poids adulte : nombre supérieur à 0 (ex. 0,25).", 0, Number.POSITIVE_INFINITY],
       ["consommationJour", "Consommation par jour : nombre positif (ex. 0,12).", 0, Number.POSITIVE_INFINITY],
       ["prixAchat", "Prix d'achat : nombre positif (ex. 12,90).", 0, Number.POSITIVE_INFINITY],
-      ["rendementCarcasse", "Rendement carcasse : ratio entre 0 et 1 (ex. 0,72).", 0, 1],
     ]
     for (const [champ, message, mini, maxi] of nombresAControler) {
       const brut = (formData as unknown as Record<string, string>)[champ]
@@ -240,9 +239,14 @@ export function EspecesTab() {
         return
       }
     }
+    const rendementSaisi = rendementCarcasseDepuisSaisie(formData.rendementCarcasse)
+    if (!rendementSaisi.ok) {
+      setEspeceSubmitError(rendementSaisi.erreur)
+      return
+    }
     setIsSavingEspece(true)
     try {
-      const payload: any = {
+      const payload = {
         id: normaliserIdentifiantEspece(formData.id),
         nom: formData.nom, type: formData.type, filiere: formData.filiere,
         production: capacites((formData.filiere || 'rente') as Filiere).productionRente ? formData.production : 'compagnie',
@@ -254,7 +258,7 @@ export function EspecesTab() {
         dureeCouvaison: formData.dureeCouvaison ? parseInt(formData.dureeCouvaison) : null,
         dureeElevage: formData.dureeElevage ? parseInt(formData.dureeElevage) : null,
         poidsAdulte: formData.poidsAdulte ? parseFloat(formData.poidsAdulte) : null,
-        rendementCarcasse: formData.rendementCarcasse ? parseFloat(formData.rendementCarcasse) : null,
+        rendementCarcasse: rendementSaisi.ratio,
         ponteAnnuelle: formData.ponteAnnuelle ? parseInt(formData.ponteAnnuelle) : null,
         consommationJour: formData.consommationJour ? parseFloat(formData.consommationJour) : null,
         prixAchat: formData.prixAchat ? parseFloat(formData.prixAchat) : null,
@@ -278,8 +282,8 @@ export function EspecesTab() {
       setFormData(emptyForm)
       setEditingId(null)
       fetchData()
-    } catch (error: any) {
-      const message = error.message || "Impossible de sauvegarder"
+    } catch (error) {
+      const message = (error instanceof Error && error.message) || "Impossible de sauvegarder"
       // Le message reste dans le formulaire : un toast seul disparaît et laisse
       // croire à une saisie perdue.
       setEspeceSubmitError(message)
@@ -560,17 +564,19 @@ export function EspecesTab() {
               ) : (
                 <div className="space-y-2"><Label>Gestation (j)</Label><Input type="number" min="0" value={formData.dureeGestation} onChange={(e) => setFormData(f => ({ ...f, dureeGestation: e.target.value }))} placeholder="31" /></div>
               )}
-              <div className="space-y-2"><Label>Élevage (j)</Label><Input type="number" min="0" value={formData.dureeElevage} onChange={(e) => setFormData(f => ({ ...f, dureeElevage: e.target.value }))} placeholder="90" /></div>
+              {/* QA cmv5jfsol — pour une espèce pondeuse ou mixte, ce champ sert
+                  d'âge d'entrée en ponte (src/lib/elevage/pondeuses.ts). */}
+              <div className="space-y-2"><Label>Élevage (j)</Label><Input type="number" min="0" value={formData.dureeElevage} onChange={(e) => setFormData(f => ({ ...f, dureeElevage: e.target.value }))} placeholder="90" title="Jours jusqu'à maturité ou abattage ; pour une espèce pondeuse ou mixte, âge d'entrée en ponte (150 j si vide)" /></div>
               <div /> {/* placeholder pour conserver la grille à 3 cols */}
             </div>
             <div className="grid grid-cols-3 gap-4">
               <div className="space-y-2"><Label>Poids adulte (kg)</Label><Input type="number" min="0" step="any" value={formData.poidsAdulte} onChange={(e) => setFormData(f => ({ ...f, poidsAdulte: e.target.value }))} placeholder="3.5" /></div>
-              {prodRente && <div className="space-y-2"><Label>Rendement carc. (%)</Label><Input type="number" min="0" max="1" step="0.01" value={formData.rendementCarcasse} onChange={(e) => setFormData(f => ({ ...f, rendementCarcasse: e.target.value }))} placeholder="0.72" /></div>}
+              {prodRente && <div className="space-y-2"><Label>Rendement carc. (%)</Label><Input type="number" min="1" max="100" step="any" value={formData.rendementCarcasse} onChange={(e) => setFormData(f => ({ ...f, rendementCarcasse: e.target.value }))} placeholder="72" title="Poids de carcasse en pourcentage du poids vif (ex. 72 pour 72 %)" /></div>}
               {prodRente && <div className="space-y-2"><Label>Ponte/an</Label><Input type="number" min="0" value={formData.ponteAnnuelle} onChange={(e) => setFormData(f => ({ ...f, ponteAnnuelle: e.target.value }))} placeholder="280" /></div>}
             </div>
             <div className="grid grid-cols-2 gap-4">
               {prodRente && <div className="space-y-2"><Label>Conso/jour (kg)</Label><Input type="number" min="0" step="any" value={formData.consommationJour} onChange={(e) => setFormData(f => ({ ...f, consommationJour: e.target.value }))} placeholder="0.12" /></div>}
-              <div className="space-y-2"><Label>Prix d'achat (&euro;)</Label><Input type="number" min="0" step="any" value={formData.prixAchat} onChange={(e) => setFormData(f => ({ ...f, prixAchat: e.target.value }))} placeholder="15" /></div>
+              <div className="space-y-2"><Label>Prix d&apos;achat (&euro;)</Label><Input type="number" min="0" step="any" value={formData.prixAchat} onChange={(e) => setFormData(f => ({ ...f, prixAchat: e.target.value }))} placeholder="15" /></div>
             </div>
             {!isAdmin ? (
               <label className="flex items-center gap-2 text-sm text-slate-600">

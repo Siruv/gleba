@@ -57,6 +57,11 @@ import { useToast } from "@/hooks/use-toast"
 import { confirmDialog } from "@/lib/global-dialog"
 import { AppHeader, PageToolbar } from "@/components/shell/AppHeader"
 import {
+  ANCRE_CHEZ_MOI,
+  estOngletFicheEspece,
+  type OngletFicheEspece,
+} from "@/lib/especes/fiche-url"
+import {
   updateEspeceSchema,
   type UpdateEspeceInput,
   ESPECE_CATEGORIES,
@@ -74,6 +79,7 @@ import {
 } from "@/lib/validations/espece"
 import {
   libelleUniteObjectif,
+  libelleUniteQuantite,
   uniteQuantiteRecolte,
   type UniteQuantite,
 } from "@/lib/recolte/projection"
@@ -81,6 +87,7 @@ import { formatQuantite, formatQuantiteParUnite } from "@/lib/recolte/quantites"
 import { StarRating } from "@/components/avis/StarRating"
 import { AvisDialog } from "@/components/avis/AvisDialog"
 import type { AvisStatsListe } from "@/lib/avis/types"
+import { valeurRenseignee } from "@/lib/referentiel-valeur"
 import {
   useReferentielActions,
   OrigineControls,
@@ -88,6 +95,16 @@ import {
   filtrerParOrigine,
   type FiltreOrigineValue,
 } from "@/components/referentiel/catalogue-communaute"
+
+/** Stock de récolte du compte pour l'espèce (`monStock` de la fiche). */
+interface MonStock {
+  stockNet: number
+  unite: UniteQuantite
+  detail: { inventaire: number; recoltes: number; consommations: number; sortiesCommerciales?: number }
+  autresUnites: Partial<Record<UniteQuantite, number>>
+  inventaire: number | null
+  dateInventaire: string | null
+}
 
 interface Variete {
   id: string
@@ -134,10 +151,37 @@ export default function EditEspecePage() {
   const especeId = decodeURIComponent(params.id as string)
   const { toast } = useToast()
   const { data: session } = useSession()
-  const currentUserId = (session?.user as any)?.id as string | undefined
+  const currentUserId = (session?.user as { id?: string } | undefined)?.id
   const [familles, setFamilles] = React.useState<{ id: string }[]>([])
   const [isLoading, setIsLoading] = React.useState(true)
   const [isSubmitting, setIsSubmitting] = React.useState(false)
+
+  // L'URL porte l'onglet (`?tab=`, lu au montage, réécrit par
+  // history.replaceState pour ne pas remonter la page par le routeur) ; la
+  // saisie de récolte ouvre la carte « Chez moi » (`lienChezMoiEspece`).
+  const [onglet, setOnglet] = React.useState<OngletFicheEspece>("general")
+  const ancreTraitee = React.useRef(false)
+  React.useEffect(() => {
+    const demande = new URLSearchParams(window.location.search).get("tab")
+    if (estOngletFicheEspece(demande)) setOnglet(demande)
+  }, [])
+  React.useEffect(() => {
+    if (isLoading || ancreTraitee.current) return
+    if (window.location.hash !== `#${ANCRE_CHEZ_MOI}` || onglet !== "recolte") return
+    ancreTraitee.current = true
+    requestAnimationFrame(() => {
+      document.getElementById(ANCRE_CHEZ_MOI)?.scrollIntoView({ block: "start" })
+    })
+  }, [isLoading, onglet])
+  const changerOnglet = (valeur: string) => {
+    if (!estOngletFicheEspece(valeur)) return
+    setOnglet(valeur)
+    const url = new URL(window.location.href)
+    if (valeur === "general") url.searchParams.delete("tab")
+    else url.searchParams.set("tab", valeur)
+    url.hash = ""
+    window.history.replaceState(window.history.state, "", url.toString())
+  }
 
   // Variétés
   const [varietes, setVarietes] = React.useState<Variete[]>([])
@@ -249,8 +293,65 @@ export default function EditEspecePage() {
   const [objectifFermeSaisi, setObjectifFermeSaisi] = React.useState<string>("")
   const [enregistrementFerme, setEnregistrementFerme] = React.useState(false)
 
+  /**
+   * Stock de récolte DU COMPTE pour cette espèce (`UserStockEspece`), servi par
+   * la fiche avec `calculerStocksNet`, le même que Stocks > Récoltes. Le champ
+   * « Stock actuel » écrivait `Espece.inventaire`, colonne du référentiel
+   * partagé que rien ne lit, et ne la rechargeait jamais (revue QA du
+   * 2026-10-20) : il vit désormais ici, enregistré par `PATCH /api/stocks`
+   * comme un comptage daté du jour.
+   */
+  const [monStock, setMonStock] = React.useState<MonStock | null>(null)
+  const [stockSaisi, setStockSaisi] = React.useState<string>("")
+  const [enregistrementStock, setEnregistrementStock] = React.useState(false)
+  const stockAffiche = monStock?.stockNet != null ? String(monStock.stockNet) : ""
+
+  const enregistrerMonStock = async () => {
+    setEnregistrementStock(true)
+    try {
+      const response = await fetch("/api/stocks", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: "recolte",
+          id: especeId,
+          stock: stockSaisi.trim() === "" ? null : parseFloat(stockSaisi),
+        }),
+      })
+      if (!response.ok) {
+        const erreur = await response.json().catch(() => ({}))
+        throw new Error(erreur.error || "Enregistrement du stock impossible")
+      }
+      // Le stock net se relit par la fiche (même calcul que Stocks > Récoltes) :
+      // un comptage effacé rend aux récoltes antérieures leur place.
+      const fiche = await fetch(`/api/especes/${encodeURIComponent(especeId)}`)
+      const donnees = fiche.ok ? await fiche.json() : null
+      const stock: MonStock | null = donnees?.monStock ?? null
+      setMonStock(stock)
+      setStockSaisi(stock?.stockNet != null ? String(stock.stockNet) : "")
+      toast({
+        title: "Stock enregistré",
+        description:
+          stock != null
+            ? `Stocks > Récoltes affiche désormais ${formatQuantite(stock.stockNet, stock.unite)}.`
+            : "Plus de comptage manuel pour cette espèce.",
+      })
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Erreur",
+        description: error instanceof Error ? error.message : "Réessayez.",
+      })
+    } finally {
+      setEnregistrementStock(false)
+    }
+  }
+
   const uniteFermeEffective =
     uniteFermeSaisie || monRendement?.uniteRendement || uniteEffective || "kg_m2"
+  // Unité du stock : celle que le serveur a retenue pour le stock net (même
+  // dérivation que les sorties), sinon celle qui découle du rendement choisi.
+  const uniteStock: UniteQuantite = monStock?.unite ?? uniteQuantiteRecolte(uniteFermeEffective)
 
   const enregistrerMonRendement = async (remiseAZero = false) => {
     setEnregistrementFerme(true)
@@ -316,6 +417,10 @@ export default function EditEspecePage() {
         )
         setMonRendement(especeData.monRendement ?? null)
         setRealiseAnnee(especeData.realiseAnnee ?? null)
+        setMonStock(especeData.monStock ?? null)
+        setStockSaisi(
+          especeData.monStock?.stockNet != null ? String(especeData.monStock.stockNet) : ""
+        )
         setRendementFermeSaisi(
           especeData.monRendement?.rendement != null
             ? String(especeData.monRendement.rendement)
@@ -342,19 +447,21 @@ export default function EditEspecePage() {
           besoinEau: especeData.besoinEau || null,
           aPlanifier: especeData.aPlanifier ?? true,
           couleur: especeData.couleur || null,
-          description: especeData.description || null,
+          // Ticket QA cmvnu7ad8 — une sentinelle d'import (« NON_TROUVE ») ne
+          // pré-remplit pas un champ texte : elle se lit comme absente.
+          description: valeurRenseignee(especeData.description),
           categorie: especeData.categorie || null,
           niveau: especeData.niveau || null,
           densite: especeData.densite || null,
           etalement: especeData.etalement || null,
           doseSemis: especeData.doseSemis || null,
           tauxGermination: especeData.tauxGermination || null,
-          temperatureGerm: especeData.temperatureGerm || null,
+          temperatureGerm: valeurRenseignee(especeData.temperatureGerm),
           joursLevee: especeData.joursLevee || null,
-          irrigation: especeData.irrigation || null,
+          irrigation: valeurRenseignee(especeData.irrigation),
           conservation: especeData.conservation || null,
-          effet: especeData.effet || null,
-          usages: especeData.usages || null,
+          effet: valeurRenseignee(especeData.effet),
+          usages: valeurRenseignee(especeData.usages),
           objectifAnnuel: especeData.objectifAnnuel || null,
           prixKg: especeData.prixKg || null,
           semaineTaille: especeData.semaineTaille || null,
@@ -382,7 +489,7 @@ export default function EditEspecePage() {
 
       if (!response.ok) {
         const error = await response.json()
-        throw new Error(error.error || "Erreur lors de la mise a jour")
+        throw new Error(error.error || "Erreur lors de la mise à jour")
       }
 
       toast({
@@ -448,7 +555,7 @@ export default function EditEspecePage() {
       prixGraine: v.prixGraine?.toString() || "",
       stockGraines: v.userStockGraines?.toString() || "",
       stockPlants: v.userStockPlants?.toString() || "",
-      description: v.description || "",
+      description: valeurRenseignee(v.description) ?? "",
     })
     setShowVarieteDialog(true)
   }
@@ -620,7 +727,7 @@ export default function EditEspecePage() {
       <main className="container mx-auto px-4 py-6 max-w-4xl">
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-            <Tabs defaultValue="general" className="w-full">
+            <Tabs value={onglet} onValueChange={changerOnglet} className="w-full">
               <TabsList className="grid w-full grid-cols-7">
                 <TabsTrigger value="general">Général</TabsTrigger>
                 <TabsTrigger value="culture">Culture</TabsTrigger>
@@ -1238,7 +1345,12 @@ export default function EditEspecePage() {
                         name="prixKg"
                         render={({ field }) => (
                           <FormItem>
-                            <FormLabel>Prix de vente (euro/kg)</FormLabel>
+                            {/* `prixKg` est un prix PAR UNITÉ de l'espèce
+                                (stocks-unifies.ts) : « €/kg » en dur était faux
+                                pour une espèce comptée en tiges (2026-10-20). */}
+                            <FormLabel>
+                              Prix de vente (€/{libelleUniteQuantite(uniteQuantiteRecolte(uniteEffective), 1)})
+                            </FormLabel>
                             <FormControl>
                               <Input
                                 type="number"
@@ -1256,28 +1368,8 @@ export default function EditEspecePage() {
                         )}
                       />
 
-                      <FormField
-                        control={form.control}
-                        name="inventaire"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Stock actuel (kg)</FormLabel>
-                            <FormControl>
-                              <Input
-                                type="number"
-                                step="0.1"
-                                placeholder="Ex: 10"
-                                {...field}
-                                value={field.value ?? ""}
-                                onChange={(e) =>
-                                  field.onChange(e.target.value ? parseFloat(e.target.value) : null)
-                                }
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
+                      {/* Le stock n'est pas une donnée du catalogue : il vit dans
+                          la carte « Chez moi » ci-dessous (stock du compte). */}
                     </div>
                   </CardContent>
                 </Card>
@@ -1289,7 +1381,7 @@ export default function EditEspecePage() {
                   et de la conduite. C'est aussi le seul chemin d'accès aux
                   unités en tiges, pièces ou bottes pour une espèce officielle.
                 */}
-                <Card className="mt-6 border-emerald-200">
+                <Card id={ANCRE_CHEZ_MOI} className="mt-6 border-emerald-200 scroll-mt-24">
                   <CardHeader>
                     <CardTitle className="text-base">Chez moi</CardTitle>
                     <p className="text-sm text-slate-500">
@@ -1410,6 +1502,52 @@ export default function EditEspecePage() {
                           Revenir au catalogue
                         </Button>
                       )}
+                    </div>
+
+                    {/*
+                      Stock de récolte du compte : un comptage daté, auquel
+                      Stocks > Récoltes ajoute les récoltes en stock et retranche
+                      les sorties postérieures. Enregistrer la valeur affichée
+                      pose un nouveau comptage daté du jour.
+                    */}
+                    <div className="border-t pt-4 space-y-3">
+                      <div className="grid gap-4 sm:grid-cols-[1fr_auto] sm:items-end">
+                        <div className="space-y-2">
+                          <Label htmlFor="stock-ferme">
+                            Mon stock actuel ({libelleUniteQuantite(uniteStock, 2)})
+                          </Label>
+                          <Input
+                            id="stock-ferme"
+                            type="number"
+                            min={0}
+                            step={uniteStock === "kg" ? "0.1" : "1"}
+                            placeholder="Ex: 10"
+                            value={stockSaisi}
+                            onChange={(e) => setStockSaisi(e.target.value)}
+                          />
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={enregistrerMonStock}
+                          disabled={enregistrementStock || stockSaisi.trim() === stockAffiche}
+                        >
+                          <Save className="h-4 w-4 mr-2" />
+                          Enregistrer mon stock
+                        </Button>
+                      </div>
+                      <p className="text-xs text-slate-500">
+                        {monStock == null
+                          ? "Aucun stock suivi pour cette espèce chez vous : saisissez un comptage, ou enregistrez une récolte."
+                          : monStock.dateInventaire
+                            ? `Dernier comptage : ${formatQuantite(monStock.detail.inventaire, monStock.unite)} le ${new Date(monStock.dateInventaire).toLocaleDateString("fr-FR")}, puis ${formatQuantite(monStock.detail.recoltes, monStock.unite)} récoltés et ${formatQuantite(monStock.detail.consommations + (monStock.detail.sortiesCommerciales || 0), monStock.unite)} sortis.`
+                            : `Sans comptage manuel : ${formatQuantite(monStock.detail.recoltes, monStock.unite)} récoltés en stock, ${formatQuantite(monStock.detail.consommations + (monStock.detail.sortiesCommerciales || 0), monStock.unite)} sortis.`}{" "}
+                        Même stock que{" "}
+                        <Link href="/maraichage/stocks" className="underline">
+                          Stocks &gt; Récoltes
+                        </Link>
+                        .
+                      </p>
                     </div>
                   </CardContent>
                 </Card>

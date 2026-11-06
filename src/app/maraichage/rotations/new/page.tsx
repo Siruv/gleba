@@ -133,7 +133,7 @@ export default function NewRotationPage() {
       toast({
         variant: "destructive",
         title: "Erreur",
-        description: error instanceof Error ? error.message : "Erreur lors de la creation",
+        description: error instanceof Error ? error.message : "Erreur lors de la création",
       })
     } finally {
       setIsSubmitting(false)
@@ -172,7 +172,7 @@ export default function NewRotationPage() {
             <Card>
               <CardHeader>
                 <CardTitle>Identification</CardTitle>
-                <CardDescription>Nom et etat de la rotation</CardDescription>
+                <CardDescription>Nom et état de la rotation</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 <FormField
@@ -241,7 +241,7 @@ export default function NewRotationPage() {
               <CardHeader>
                 <CardTitle>Plan de rotation</CardTitle>
                 <CardDescription>
-                  Définissez l'ITP pour chaque année du cycle
+                  Définissez l&apos;ITP pour chaque année du cycle
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">

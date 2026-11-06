@@ -20,12 +20,19 @@ vi.mock("@/lib/kpi", () => ({ invalidateKpi: vi.fn() }))
 vi.mock("@/lib/auto-compta", () => ({ createVenteFromRecolte: vi.fn(), deleteAutoEntry: vi.fn() }))
 vi.mock("@/lib/facture-utils", () => ({ creerFacture: mocks.creerFacture, annulerFactureLiee: vi.fn() }))
 vi.mock("@/lib/prisma", () => {
-  const tx = { recolte: { update: mocks.recolteUpdate, create: mocks.recolteCreate } }
+  const tx = {
+    culture: { findUnique: mocks.cultureFindUnique },
+    recolte: { findFirst: mocks.recolteFindUnique, update: mocks.recolteUpdate, create: mocks.recolteCreate },
+    venteManuelle: { findFirst: vi.fn().mockResolvedValue(null) },
+    produitBoutique: { count: vi.fn().mockResolvedValue(0) },
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    $executeRaw: vi.fn().mockResolvedValue(1),
+  }
   return {
     default: {
       recolte: { findUnique: mocks.recolteFindUnique },
       culture: { findUnique: mocks.cultureFindUnique },
-      produitBoutique: { findFirst: vi.fn().mockResolvedValue(null) },
+      produitBoutique: { findFirst: vi.fn().mockResolvedValue(null), count: vi.fn().mockResolvedValue(0) },
       $transaction: async (fn: (t: typeof tx) => unknown) => fn(tx),
     },
   }
@@ -114,6 +121,22 @@ describe("PUT /api/recoltes/[id] — date de récolte et cycle de la culture", (
     expect(res.status).toBe(400)
     expect(mocks.cultureFindUnique.mock.calls[0][0].where).toEqual({ id: 999, userId: "u1" })
     expect(mocks.recolteUpdate).not.toHaveBeenCalled()
+  })
+
+  // 2026-10-20 — la fiche affiche désormais « Quantité (tiges) » : la quantité
+  // retouchée reste dans l'unité figée à la saisie, que le PUT ne réécrit pas.
+  it("conserve l'unité figée de la récolte (corps de la fiche, unité forgée ignorée)", async () => {
+    mocks.recolteFindUnique.mockResolvedValue({ ...RECOLTE, unite: "tige" })
+    mocks.recolteUpdate.mockImplementation(async ({ data }) => ({ ...RECOLTE, unite: "tige", ...data }))
+
+    const res = await modifier({ date: "2027-01-20T00:00:00.000Z", quantite: 19, notes: null })
+    expect(res.status).toBe(200)
+    expect(mocks.recolteUpdate.mock.calls[0][0].data).not.toHaveProperty("unite")
+    expect((await res.json()).unite).toBe("tige")
+
+    const forge = await modifier({ date: "2027-01-20T00:00:00.000Z", quantite: 19, notes: null, unite: "kg" })
+    expect(forge.status).toBe(200)
+    expect(mocks.recolteUpdate.mock.calls[1][0].data).not.toHaveProperty("unite")
   })
 })
 

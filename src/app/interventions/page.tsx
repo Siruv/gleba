@@ -6,8 +6,8 @@
  */
 
 import * as React from "react"
+import { PageEntete, ConteneurPage } from "@/components/shell/PageEntete"
 import Link from "next/link"
-import Image from "next/image"
 import { useSession } from "next-auth/react"
 import { getAvailableYears } from "@/components/year-selector"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -26,7 +26,7 @@ import {
   DialogTrigger,
   DialogDescription,
 } from "@/components/ui/dialog"
-import { UserMenu } from "@/components/auth/UserMenu"
+import { AppHeader } from "@/components/shell/AppHeader"
 
 import { useToast } from "@/hooks/use-toast"
 import { confirmDialog } from "@/lib/global-dialog"
@@ -34,13 +34,14 @@ import { libelleCulture } from "@/lib/cultures/label"
 import { ZntFieldset } from "@/components/phyto/ZntFieldset"
 import { todayLocalISO } from '@/lib/format-utils'
 import { TYPES_INTERVENTION, libelleTypeIntervention } from "@/lib/interventions/types"
+import {
+  libellesEmplacement,
+  termesRecherche,
+  texteContientTermes,
+  texteRechercheIntervention,
+} from "@/lib/interventions/recherche"
 import { EVENEMENT_NOUVELLE_INTERVENTION } from "@/lib/accueil/evenements"
 import {
-  Sprout,
-  TreeDeciduous,
-  Bird,
-  Wallet,
-  Settings,
   Calendar,
   Clock,
   Euro,
@@ -725,20 +726,36 @@ export default function InterventionsPage() {
   // Filtered interventions (client-side text search)
   // ============================================================
 
+  const culturesParId = React.useMemo(
+    () => new Map(cultures.map((c) => [c.id, c])),
+    [cultures],
+  )
+
+  // Ticket QA du 2026-10-19 : la recherche ignorait la colonne « Culture /
+  // Planche » (« Courge » ne retrouvait pas les arrosages de la courge). Elle
+  // porte désormais sur ce que la ligne affiche, sans casse ni accents
+  // (`src/lib/interventions/recherche.ts`). Elle filtre ce que l'API a
+  // renvoyé pour l'année et les filtres de type, dates et statut : au plus
+  // 500 interventions saisies (les plus récentes) plus les lignes dérivées.
+  // Le texte replié de chaque ligne est calculé une fois par chargement.
+  const lignesRecherche = React.useMemo(
+    () =>
+      interventions.map((intervention) => ({
+        intervention,
+        texte: texteRechercheIntervention(
+          intervention,
+          intervention.cultureId ? culturesParId.get(intervention.cultureId) : null,
+        ),
+      })),
+    [interventions, culturesParId],
+  )
   const filteredInterventions = React.useMemo(() => {
-    if (!searchText) return interventions
-    const lower = searchText.toLowerCase()
-    return interventions.filter((i) => {
-      const typeLabel = libelleTypeIntervention(i.type)
-      return (
-        typeLabel.toLowerCase().includes(lower) ||
-        (i.description && i.description.toLowerCase().includes(lower)) ||
-        (i.plancheId && i.plancheId.toLowerCase().includes(lower)) ||
-        (i.intrantNom && i.intrantNom.toLowerCase().includes(lower)) ||
-        (i.notes && i.notes.toLowerCase().includes(lower))
-      )
-    })
-  }, [interventions, searchText])
+    const termes = termesRecherche(searchText)
+    if (termes.length === 0) return interventions
+    return lignesRecherche
+      .filter((ligne) => texteContientTermes(ligne.texte, termes))
+      .map((ligne) => ligne.intervention)
+  }, [interventions, lignesRecherche, searchText])
 
   // ============================================================
   // Render
@@ -755,97 +772,10 @@ export default function InterventionsPage() {
   return (
     <div className="min-h-screen bg-slate-50 aurora-bg-subtle">
       <div className="fixed inset-0 dot-grid opacity-40 pointer-events-none" aria-hidden="true" />
-      {/* Header global */}
-      <header className="border-b bg-white/95 backdrop-blur-sm sticky top-0 z-50">
-        <div className="container mx-auto px-4 py-2.5 flex items-center justify-between max-w-[1600px]">
-          <Link href="/" className="flex items-center hover:opacity-90 transition-opacity">
-            <Image
-              src="/gleba-logo.png"
-              alt="Gleba"
-              width={120}
-              height={80}
-              className="h-10 w-auto rounded-lg"
-              priority
-            />
-          </Link>
-          <div className="flex items-center gap-2">
-            {/* Navigation modules */}
-            <div className="flex items-center border rounded-lg overflow-hidden">
-              <Link href="/">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="rounded-none text-emerald-700 hover:text-emerald-800 hover:bg-emerald-50 border-r"
-                >
-                  <Sprout className="h-4 w-4 mr-1" />
-                  <span className="hidden sm:inline">Maraîchage</span>
-                </Button>
-              </Link>
-              <Link href="/verger">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="rounded-none text-lime-700 hover:text-lime-800 hover:bg-lime-50 border-r"
-                >
-                  <TreeDeciduous className="h-4 w-4 mr-1" />
-                  <span className="hidden sm:inline">Verger</span>
-                </Button>
-              </Link>
-              <Link href="/elevage">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="rounded-none text-amber-700 hover:text-amber-800 hover:bg-amber-50 border-r"
-                >
-                  <Bird className="h-4 w-4 mr-1" />
-                  <span className="hidden sm:inline">Élevage</span>
-                </Button>
-              </Link>
-              <Link href="/comptabilite">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="rounded-none text-blue-700 hover:text-blue-800 hover:bg-blue-50 border-r"
-                >
-                  <Wallet className="h-4 w-4 mr-1" />
-                  <span className="hidden sm:inline">Compta</span>
-                </Button>
-              </Link>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="rounded-none bg-orange-50 text-orange-700"
-              >
-                <Hammer className="h-4 w-4 mr-1" />
-                <span className="hidden sm:inline">Interventions</span>
-              </Button>
-            </div>
-            <Link href="/parametres">
-              <Button variant="ghost" size="sm">
-                <Settings className="h-4 w-4" />
-              </Button>
-            </Link>
-            {session?.user && <UserMenu user={session.user} />}
-          </div>
-        </div>
-      </header>
-
-      <main className="container mx-auto px-4 py-6 max-w-[1600px]">
-        {/* Title + Year + Add button */}
-        {/* QA cmswxlath — cette ligne ne repliait pas : titre (≈180 px) + année +
-            bouton « Nouvelle intervention » (≈195 px) ne tiennent pas dans les
-            344 px utiles d'un écran de 375 px, et rien ici n'est réductible
-            (min-width auto). Le document mesurait 502 px et la saisie au champ
-            partait hors écran. */}
-        <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-orange-100 flex items-center justify-center">
-              <Hammer className="h-5 w-5 text-orange-700" />
-            </div>
-            <h1 className="text-xl font-semibold text-slate-800">Interventions</h1>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
+      <AppHeader />
+      <PageEntete id="interventions" actions={<div className="flex flex-wrap items-center gap-2">
             <select
+              aria-label="Année affichée"
               value={selectedYear}
               onChange={(e) => changerAnnee(parseInt(e.target.value))}
               className="h-9 rounded-md border border-input bg-background px-3 text-sm"
@@ -891,9 +821,9 @@ export default function InterventionsPage() {
                       est déclenchée depuis une observation santé verger. */}
                   {form.observationLieeId && (
                     <div className="rounded-md border border-orange-300 bg-orange-50 p-3 text-sm text-orange-900">
-                      <p className="font-medium">🔗 Lié à l'observation santé #{form.observationLieeId}</p>
+                      <p className="font-medium">🔗 Lié à l&apos;observation santé #{form.observationLieeId}</p>
                       <p className="text-xs mt-1">
-                        L'arbre cible et la justification sont pré-remplis. Vous pouvez les ajuster avant validation.
+                        L&apos;arbre cible et la justification sont pré-remplis. Vous pouvez les ajuster avant validation.
                       </p>
                     </div>
                   )}
@@ -1257,8 +1187,16 @@ export default function InterventionsPage() {
                 </form>
               </DialogContent>
             </Dialog>
-          </div>
-        </div>
+          </div>} />
+
+      <ConteneurPage className="py-6">
+        {/* Title + Year + Add button */}
+        {/* QA cmswxlath — cette ligne ne repliait pas : titre (≈180 px) + année +
+            bouton « Nouvelle intervention » (≈195 px) ne tiennent pas dans les
+            344 px utiles d'un écran de 375 px, et rien ici n'est réductible
+            (min-width auto). Le document mesurait 502 px et la saisie au champ
+            partait hors écran. */}
+
 
         {/* Stats cards */}
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 mb-6">
@@ -1453,11 +1391,11 @@ export default function InterventionsPage() {
                       // Try to find culture name
                       const isVirtual = intervention.source !== 'intervention'
                       const culture = intervention.cultureId
-                        ? cultures.find((c) => c.id === intervention.cultureId)
+                        ? culturesParId.get(intervention.cultureId)
                         : null
-                      const cultureLabel = intervention.cultureNom
-                        || (culture ? libelleCulture(culture) : null)
-                      const plancheLabel = intervention.plancheNom || intervention.plancheId || null
+                      // Mêmes libellés que la recherche (`libellesEmplacement`).
+                      const { culture: cultureLabel, planche: plancheLabel } =
+                        libellesEmplacement(intervention, culture)
 
                       return (
                         <React.Fragment key={intervention.id}>
@@ -1597,7 +1535,7 @@ export default function InterventionsPage() {
                                     </p>
                                     {intervention.coutMainOeuvre !== null && (
                                       <p>
-                                        <span className="text-muted-foreground">Coût main d'œuvre :</span>{" "}
+                                        <span className="text-muted-foreground">Coût main d&apos;œuvre :</span>{" "}
                                         {formatEuro(intervention.coutMainOeuvre)}
                                       </p>
                                     )}
@@ -1732,7 +1670,7 @@ export default function InterventionsPage() {
             )}
           </CardContent>
         </Card>
-      </main>
+      </ConteneurPage>
 
       {/* Footer */}
       <footer className="border-t mt-8 py-4 text-center text-sm text-slate-500">

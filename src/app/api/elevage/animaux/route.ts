@@ -1,3 +1,5 @@
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
 /**
  * API Animaux
  * GET /api/elevage/animaux - Liste des animaux
@@ -17,7 +19,11 @@ import { normaliserSexe, SEXES_ANIMAL } from '@/lib/elevage/sexe'
 import { verifierLienParenteSansCycle } from '@/lib/elevage/genealogie-validation'
 import { effacementSortieSiActif, erreurMereSortieAvantNaissance } from '@/lib/elevage/sortie-animal'
 import { visibiliteReferentiel } from '@/lib/referentiel-communaute'
+import { especeAnimaleAccessible } from '@/lib/elevage/espece-accessible'
+// Motif partagé avec la garde de suppression, qui ne compte pas ce mouvement automatique.
+import { MOTIF_AFFECTATION_INITIALE } from '@/lib/elevage/traces-animal'
 import { invalidateKpi } from '@/lib/kpi'
+import { masquerReferentielsEmbarques } from '@/lib/referentiel-embarque'
 
 /** JJ/MM/AAAA déterministe (sans dépendre de l'ICU du runtime). */
 const formatDateFr = (d: Date) => d.toISOString().slice(0, 10).split('-').reverse().join('/')
@@ -114,6 +120,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({ data: animaux })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('GET /api/elevage/animaux error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la récupération des animaux', details: "Erreur interne du serveur" },
@@ -168,13 +175,11 @@ export async function POST(request: NextRequest) {
       parcelleGeoId,
     } = parsed.data
 
-    // Vérifier que l'espece animale existe
-    const espece = await prisma.especeAnimale.findUnique({
-      where: { id: especeAnimaleId },
-    })
-    if (!espece) {
+    // L'espèce doit exister ET être visible du compte (catalogue, communauté
+    // ou fiche perso), comme au PATCH.
+    if (!await especeAnimaleAccessible(session.user.id, especeAnimaleId)) {
       return NextResponse.json(
-        { error: `Espèce animale "${especeAnimaleId}" introuvable` },
+        { error: `Espèce animale "${especeAnimaleId}" introuvable`, champ: 'especeAnimaleId' },
         { status: 400 }
       )
     }
@@ -246,6 +251,7 @@ export async function POST(request: NextRequest) {
     }
 
     const animal = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
       const created = await tx.animal.create({
         data: {
         userId: session.user.id,
@@ -292,7 +298,7 @@ export async function POST(request: NextRequest) {
         data: {
           userId: session.user.id, animalId: created.id,
           parcelleAvantId: null, parcelleApresId: created.parcelleGeoId,
-          date: created.dateArrivee ?? created.createdAt, motif: 'Affectation initiale',
+          date: created.dateArrivee ?? created.createdAt, motif: MOTIF_AFFECTATION_INITIALE,
         },
       })
       await createDepenseFromAchatAnimal(session.user.id, {
@@ -321,14 +327,17 @@ export async function POST(request: NextRequest) {
         : null,
     ].filter((message): message is string => Boolean(message))
 
+    // Espèce animale embarquée : jamais l'id de l'auteur d'un profil partagé
+    // par un autre compte (revue 2026-10-20).
     return NextResponse.json(
       {
-        data: animal,
+        data: masquerReferentielsEmbarques(animal, session.user.id),
         warning: avertissements.length ? avertissements.join(' ') : null,
       },
       { status: 201 },
     )
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('POST /api/elevage/animaux error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la création', details: "Erreur interne du serveur" },
@@ -360,17 +369,8 @@ export async function PATCH(request: NextRequest) {
     // Ticket utilisateur 2026-07-22 — le formulaire envoyait bien la nouvelle
     // espèce/type de production, mais PATCH l'ignorait silencieusement.
     // Vérifier aussi que la nouvelle référence est visible avant de l'appliquer.
-    if (especeAnimaleId !== undefined) {
-      const espece = await prisma.especeAnimale.findFirst({
-        where: {
-          id: especeAnimaleId,
-          AND: [visibiliteReferentiel(session.user.id)],
-        },
-        select: { id: true },
-      })
-      if (!espece) {
-        return NextResponse.json({ error: 'Espèce animale invalide' }, { status: 400 })
-      }
+    if (especeAnimaleId !== undefined && !await especeAnimaleAccessible(session.user.id, especeAnimaleId)) {
+      return NextResponse.json({ error: 'Espèce animale invalide', champ: 'especeAnimaleId' }, { status: 400 })
     }
 
     const especeCible = especeAnimaleId ?? existing.especeAnimaleId
@@ -391,7 +391,8 @@ export async function PATCH(request: NextRequest) {
     if (
       lotCible !== null &&
       (lotCible !== existing.lotId || especeCible !== existing.especeAnimaleId) &&
-      !await isAssignableAnimalLot(session.user.id, lotCible, especeCible)
+      // Lot conservé : compatible suffit, même réformé ou terminé (PR #47).
+      !await isAssignableAnimalLot(session.user.id, lotCible, especeCible, { lotConserve: lotCible === existing.lotId })
     ) {
       return NextResponse.json({ error: 'Lot invalide' }, { status: 400 })
     }
@@ -469,7 +470,10 @@ export async function PATCH(request: NextRequest) {
       }
     }
     if (statut !== undefined) updateData.statut = statut
-    if (lotId !== undefined) updateData.lotId = lotId ? parseInt(lotId) : null
+    // La valeur VALIDÉE (`lotCible`), jamais une seconde conversion : `parseInt`
+    // et `Number` divergent sur « 1e3 », et l'écart contournait le contrôle
+    // d'appartenance du lot (2026-10-19).
+    if (lotId !== undefined) updateData.lotId = lotCible
     if (prixAchatInclusDansLot !== undefined || lotId !== undefined) {
       updateData.prixAchatInclusDansLot = inclusFinal
     }
@@ -583,6 +587,7 @@ export async function PATCH(request: NextRequest) {
     Object.assign(updateData, effacementSortieSiActif(statut))
 
     const animal = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
       const updated = await tx.animal.update({
         where: { id: parseInt(id) },
         data: updateData,
@@ -617,6 +622,7 @@ export async function PATCH(request: NextRequest) {
 
     return NextResponse.json({ data: animal })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('PATCH /api/elevage/animaux error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la mise à jour', details: "Erreur interne du serveur" },

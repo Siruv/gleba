@@ -13,6 +13,8 @@ import prisma from "@/lib/prisma"
 import { requireAuthApi } from "@/lib/auth-utils"
 import PDFDocument from "pdfkit"
 import { identifiantLegalAffichage } from "@/lib/territoires"
+import { applicateurPhyto } from "@/lib/tracabilite/projection-phyto"
+import { jourCivilStocke } from "@/lib/jour-civil"
 
 type Format = "pdf" | "csv"
 
@@ -137,7 +139,9 @@ export async function GET(request: NextRequest) {
     const variete = culture?.variete?.nom ?? culture?.variete?.id ?? arbre?.variete ?? null
     return {
       source: "intervention",
-      date: i.date.toISOString().slice(0, 10),
+      // Jour civil, comme l'écran du registre (cmvnulry1) : `slice(0, 10)` de
+      // l'ISO donnait la veille d'un traitement saisi entre minuit et 2 h à Paris.
+      date: jourCivilStocke(i.date) ?? "",
       parcelle: i.parcelle?.nom ?? planche?.nom ?? null,
       espece,
       variete,
@@ -165,7 +169,8 @@ export async function GET(request: NextRequest) {
       epiPortes: i.epiPortes,
       zntRespectee: i.zntRespectee,
       zntDistanceM: i.zntDistanceM ?? null,
-      operateur: i.operateur?.name || i.operateur?.email || i.user.name || i.user.email,
+      // QA cmvgeltj1 — opérateur saisi en texte libre (notes) avant le titulaire du compte.
+      operateur: applicateurPhyto(i),
       certiphytoNum: i.certiphytoNum ?? null,
       certiphytoValidite: i.certiphytoValidite?.toISOString().slice(0, 10) ?? null,
       justification: i.justification ?? null,
@@ -174,7 +179,7 @@ export async function GET(request: NextRequest) {
 
   const lignesObservation = observations.map((o) => ({
     source: "observation_sante",
-    date: o.date.toISOString().slice(0, 10),
+    date: jourCivilStocke(o.date) ?? "",
     parcelle: o.parcelle?.nom ?? null,
     espece: o.arbre?.espece ?? null,
     variete: o.arbre?.variete ?? null,
@@ -198,7 +203,7 @@ export async function GET(request: NextRequest) {
     epiPortes: o.epiPortes,
     zntRespectee: o.zntRespectee,
     zntDistanceM: o.zntDistanceM ?? null,
-    operateur: o.operateur?.name || o.operateur?.email || o.user.name || o.user.email,
+    operateur: applicateurPhyto(o),
     certiphytoNum: o.certiphytoNum ?? null,
     certiphytoValidite: null as string | null,
     justification: o.traitement ?? null,
@@ -231,11 +236,7 @@ type Exploitation = {
 // CSV — UTF-8 avec BOM, séparateur `;` (Excel FR)
 // ─────────────────────────────────────────────────────────────────────────────
 
-type Ligne = ReturnType<typeof slugRow>
-function slugRow(_x: unknown) {
-  // Utilitaire de typage uniquement.
-  return {} as Record<string, string | number | boolean | null>
-}
+type Ligne = Record<string, string | number | boolean | null>
 
 function escapeCsv(value: unknown): string {
   if (value === null || value === undefined) return ""
@@ -580,8 +581,6 @@ async function buildPdf(
   })
 }
 
-// Évite un warning ESLint "_x defined but never used" sur slugRow.
-void slugRow
 
 // Type util pour le tooling.
 export type RegistrePhytoLigne = Ligne

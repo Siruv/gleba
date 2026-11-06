@@ -20,6 +20,10 @@ export interface JourLunaire {
   phase: string          // Nom de la phase (Nouvelle Lune, etc.)
   phaseIndex: number     // 0-7 (0=nouvelle lune, 4=pleine lune)
   illumination: number   // 0-100 %
+  /** Vrai tant que la pleine lune vraie n'est pas passée (SSOT : `phaseVraieDuJour`). */
+  croissante: boolean
+  /** Instant (ISO UTC) de l'événement du jour : nouvelle lune, quartier ou pleine lune ; `null` sinon. */
+  instantEvenement: string | null
   age: number            // Jours depuis nouvelle lune (0-29.5)
   emoji: string          // 🌑🌒🌓🌔🌕🌖🌗🌘
   typeJour: TypeJour
@@ -84,20 +88,75 @@ const TYPE_JOUR_CONFIG: Record<TypeJour, { couleur: string; conseil: string }> =
 // ── Cache mémoire (TTL 7 jours) ──────────────────────────
 
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+/** Clé : fuseau du lecteur (vide : fuseau du serveur) et jour civil. */
 const cache = new Map<string, { data: JourLunaire; cachedAt: number }>()
 
-function getCached(dateStr: string): JourLunaire | null {
-  const entry = cache.get(dateStr)
+function getCached(cle: string): JourLunaire | null {
+  const entry = cache.get(cle)
   if (!entry) return null
   if (Date.now() - entry.cachedAt > CACHE_TTL_MS) {
-    cache.delete(dateStr)
+    cache.delete(cle)
     return null
   }
   return entry.data
 }
 
-function setCache(dateStr: string, data: JourLunaire): void {
-  cache.set(dateStr, { data, cachedAt: Date.now() })
+function setCache(cle: string, data: JourLunaire): void {
+  cache.set(cle, { data, cachedAt: Date.now() })
+}
+
+// ── Jour civil du lecteur ─────────────────────────────────
+
+/*
+ * Revue du 2026-10-28 : jours et « aujourd'hui » étaient découpés au fuseau du
+ * serveur (Europe/Paris). À 22:30 UTC le 12/08/2026, un lecteur de Guadeloupe,
+ * encore le 12 (nouvelle lune), recevait le 13 et « Premier croissant ». Le
+ * lecteur transmet désormais son fuseau (et son jour) ; les instants des
+ * phases restent communs, seul leur rattachement à un jour civil en dépend.
+ */
+
+/** Fuseau IANA reconnu, sous sa forme canonique ; null sinon. */
+export function fuseauValide(fuseau: string | null | undefined): string | null {
+  if (!fuseau || fuseau.length > 64) return null
+  try {
+    return new Intl.DateTimeFormat('en-US', { timeZone: fuseau }).resolvedOptions().timeZone
+  } catch {
+    return null
+  }
+}
+
+const formatsFuseau = new Map<string, Intl.DateTimeFormat>()
+
+/** Date et heure murales de l'instant `t` (ms) dans `fuseau`. */
+function heureMurale(t: number, fuseau: string): { a: number; m: number; j: number; ms: number } {
+  let format = formatsFuseau.get(fuseau)
+  if (!format) {
+    format = new Intl.DateTimeFormat('en-US', {
+      timeZone: fuseau, hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    })
+    formatsFuseau.set(fuseau, format)
+  }
+  const p = Object.fromEntries(format.formatToParts(new Date(t)).map((x) => [x.type, x.value]))
+  const [a, m, j] = [Number(p.year), Number(p.month), Number(p.day)]
+  return { a, m, j, ms: Date.UTC(a, m - 1, j, Number(p.hour), Number(p.minute), Number(p.second)) }
+}
+
+/** Jour civil (AAAA-MM-JJ) de l'instant `date` dans `fuseau`. */
+export function jourDansFuseau(date: Date, fuseau: string): string {
+  const { a, m, j } = heureMurale(date.getTime(), fuseau)
+  return `${a}-${String(m).padStart(2, '0')}-${String(j).padStart(2, '0')}`
+}
+
+/** Midi du jour civil `jour` (AAAA-MM-JJ) dans `fuseau`, heure d'été comprise. */
+export function midiDansFuseau(jour: string, fuseau: string): Date {
+  const [a, m, j] = jour.split('-').map(Number)
+  const midiMural = Date.UTC(a, m - 1, j, 12)
+  // Décalage du fuseau à l'instant visé, repris une fois au cas où un
+  // changement d'heure sépare midi UTC du midi local.
+  const decalage = (t: number) => heureMurale(t, fuseau).ms - Math.floor(t / 1000) * 1000
+  const approche = midiMural - decalage(midiMural)
+  return new Date(midiMural - decalage(approche))
 }
 
 // ── Calcul local des phases lunaires (syzygies vraies) ─────
@@ -136,7 +195,10 @@ export function instantPhaseVraie(k: number): number {
       (nm ? 0.17241 : 0.17302) * E * Math.sin(M) +
       (nm ? 0.01608 : 0.01614) * Math.sin(2 * Mp) +
       (nm ? 0.01039 : 0.01043) * Math.sin(2 * F) +
-      (nm ? -0.00739 : -0.00734) * E * Math.sin(Mp - M) +
+      // QA cmvno0s5d (2026-10-25) : signes de Meeus (table 49.A), +E sin(M'−M)
+      // et −E sin(M'+M). Inversés, ils décalaient les syzygies de 10 à 20 min
+      // (exemple 49.a : somme des termes −0,29394 au lieu de −0,28916).
+      (nm ? 0.00739 : 0.00734) * E * Math.sin(Mp - M) -
       (nm ? 0.00514 : 0.00515) * E * Math.sin(Mp + M) +
       (nm ? 0.00208 : 0.00209) * E * E * Math.sin(2 * M) -
       0.00111 * Math.sin(Mp - 2 * F) -
@@ -195,26 +257,59 @@ function evenementsAutour(dateMs: number): EvenementLunaire[] {
  * civile [midi−12 h, midi+12 h) ; sinon phase intermédiaire, déterminée par le
  * dernier événement écoulé. L'âge est recalé sur la dernière nouvelle lune
  * vraie (l'ancien âge moyen dérivait de ±14 h).
+ *
+ * SEULE source du sens et de l'illumination (QA cmvno0s5d, 2026-10-25) : le
+ * 25/10/2026, la carte affichait « Gibbeuse croissante » (événements vrais) et
+ * « Lune décroissante, 100 % » (âge comparé à la demi-lunaison MOYENNE de
+ * 14,77 j, illumination tirée de la fraction du cycle). Or la pleine lune vraie
+ * tombe 15,5 j après la nouvelle lune ce mois-là (26/10 04:12 UTC) : la durée
+ * nouvelle → pleine lune varie de 13,9 à 15,6 j. Sens et illumination se
+ * lisent donc sur les mêmes instants vrais que le nom de la phase :
+ * - élongation interpolée entre les deux événements vrais qui encadrent
+ *   l'instant (0°, 90°, 180°, 270°) ;
+ * - croissante tant que la pleine lune vraie n'est pas passée (élongation
+ *   < 180°) ;
+ * - illumination = (1 − cos élongation) / 2.
  */
-export function phaseVraieDuJour(midiLocal: Date): { phaseIndex: number; age: number; illumination: number } {
+export function phaseVraieDuJour(midiLocal: Date): {
+  phaseIndex: number
+  age: number
+  illumination: number
+  croissante: boolean
+  /** Instant (ms) de l'événement qui donne son icône au jour, `null` un jour intermédiaire. */
+  instantEvenement: number | null
+} {
   const midi = midiLocal.getTime()
   const debutJour = midi - JOUR_MS / 2
   const finJour = midi + JOUR_MS / 2
   const evts = evenementsAutour(midi)
 
   const nmAvant = [...evts].reverse().find((e) => e.index === 0 && e.t <= midi)
-  const nmApres = evts.find((e) => e.index === 0 && e.t > midi)
-  const cycleMs = nmAvant && nmApres ? nmApres.t - nmAvant.t : SYNODIC_PERIOD * JOUR_MS
   const age = nmAvant ? (midi - nmAvant.t) / JOUR_MS : 0
-  const illumination = Math.round(((1 - Math.cos(2 * Math.PI * ((midi - (nmAvant?.t ?? midi)) / cycleMs))) / 2) * 100)
+
+  const precedent = [...evts].reverse().find((e) => e.t <= midi)
+  const suivant = evts.find((e) => e.t > midi)
+  // `evenementsAutour` couvre trois lunaisons autour de l'instant : les deux
+  // bornes existent toujours. Repli défensif sur l'âge si ce n'était pas le cas.
+  const elongation =
+    precedent && suivant
+      ? precedent.index * 45 + 90 * ((midi - precedent.t) / (suivant.t - precedent.t))
+      : (age / SYNODIC_PERIOD) * 360
+  const croissante = elongation < 180
+  const illumination = Math.round(((1 - Math.cos(elongation * D2R)) / 2) * 100)
 
   const duJour = evts.filter((e) => e.t >= debutJour && e.t < finJour)
   if (duJour.length > 0) {
     const plusProche = duJour.reduce((a, b) => (Math.abs(a.t - midi) <= Math.abs(b.t - midi) ? a : b))
-    return { phaseIndex: plusProche.index, age, illumination }
+    return { phaseIndex: plusProche.index, age, illumination, croissante, instantEvenement: plusProche.t }
   }
-  const precedent = [...evts].reverse().find((e) => e.t <= midi)
-  return { phaseIndex: precedent ? (precedent.index + 1) % 8 : 1, age, illumination }
+  return {
+    phaseIndex: precedent ? (precedent.index + 1) % 8 : 1,
+    age,
+    illumination,
+    croissante,
+    instantEvenement: null,
+  }
 }
 
 // ── Détermination du type de jour ─────────────────────────
@@ -259,19 +354,26 @@ export function getTypeJour(age: number): TypeJour {
 }
 
 /**
- * Phase lunaire pour une date (attendue ancrée à midi local par l'appelant).
+ * Phase lunaire pour une date. Avec `fuseau` (celui du lecteur) : le jour
+ * civil de `date` dans ce fuseau, ancré à son midi. Sans : jour local du
+ * serveur, `date` attendue ancrée à midi local par l'appelant (assistant).
  * Calcul local exact — plus d'appel réseau (cf. en-tête du fichier).
  */
-export async function fetchMoonPhase(date: Date): Promise<JourLunaire> {
+export async function fetchMoonPhase(date: Date, fuseau?: string): Promise<JourLunaire> {
   // Jour local : toISOString() renverrait le jour UTC, soit la veille entre
   // minuit et 2 h en heure d'été française.
-  const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+  const dateStr = fuseau
+    ? jourDansFuseau(date, fuseau)
+    : `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+  const ancre = fuseau ? midiDansFuseau(dateStr, fuseau) : date
 
-  // Vérifier le cache
-  const cached = getCached(dateStr)
+  // Le fuseau entre dans la clé : un même jour civil ne couvre pas les mêmes
+  // instants à Paris et à Nouméa.
+  const cle = `${fuseau ?? ''}|${dateStr}`
+  const cached = getCached(cle)
   if (cached) return cached
 
-  const { phaseIndex, age, illumination } = phaseVraieDuJour(date)
+  const { phaseIndex, age, illumination, croissante, instantEvenement } = phaseVraieDuJour(ancre)
   const phaseName = PHASE_NOMS[phaseIndex] || 'Inconnue'
 
   const typeJour = getTypeJour(age)
@@ -284,7 +386,7 @@ export async function fetchMoonPhase(date: Date): Promise<JourLunaire> {
   // (conseil verger). Le conseil verger doit respecter le repos lunaire.
   const conseilVerger = typeJour === 'repos'
     ? 'Verger — jour de repos lunaire : reporter plantation, taille et greffe au prochain jour favorable.'
-    : age < SYNODIC_PERIOD / 2
+    : croissante
       ? 'Verger — lune croissante : greffes et semis favorisés. Réserver plantation et taille des arbres à la lune décroissante.'
       : 'Verger — lune décroissante : période favorable à la plantation, à la taille et au bouturage des arbres et arbustes.'
 
@@ -293,6 +395,8 @@ export async function fetchMoonPhase(date: Date): Promise<JourLunaire> {
     phase: phaseName,
     phaseIndex,
     illumination,
+    croissante,
+    instantEvenement: instantEvenement === null ? null : new Date(instantEvenement).toISOString(),
     age: Math.round(age * 10) / 10,
     emoji: PHASE_EMOJIS[phaseIndex] || '🌑',
     typeJour,
@@ -301,23 +405,23 @@ export async function fetchMoonPhase(date: Date): Promise<JourLunaire> {
     couleur: config.couleur,
   }
 
-  setCache(dateStr, jour)
+  setCache(cle, jour)
   return jour
 }
 
 /**
- * Récupère le calendrier lunaire complet pour un mois
+ * Récupère le calendrier lunaire complet pour un mois, découpé en jours du
+ * fuseau `fuseau` (celui du lecteur ; à défaut, celui du serveur).
  */
-export async function getLunarCalendar(year: number, month: number): Promise<CalendrierLunaire> {
+export async function getLunarCalendar(year: number, month: number, fuseau?: string): Promise<CalendrierLunaire> {
   const daysInMonth = new Date(year, month, 0).getDate()
   const jours: JourLunaire[] = []
 
-  // Récupérer toutes les phases du mois
-  // On fait les appels séquentiellement pour éviter le rate-limiting
-  // mais on utilise le calcul local en batch si l'API échoue
   for (let day = 1; day <= daysInMonth; day++) {
-    const date = new Date(year, month - 1, day, 12) // midi pour éviter les problèmes de timezone
-    const jour = await fetchMoonPhase(date)
+    const date = fuseau
+      ? midiDansFuseau(`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`, fuseau)
+      : new Date(year, month - 1, day, 12) // midi pour éviter les problèmes de timezone
+    const jour = await fetchMoonPhase(date, fuseau)
     jours.push(jour)
   }
 
@@ -333,8 +437,17 @@ export async function getLunarCalendar(year: number, month: number): Promise<Cal
  * jour à midi. On aligne « aujourd'hui » sur midi LOCAL : le libellé de jour
  * (dateStr, déjà local) et le calcul d'âge portent ainsi tous deux sur la
  * même journée civile, quelle que soit l'heure de consultation.
+ *
+ * Revue du 2026-10-28 : « aujourd'hui » est celui du LECTEUR. `jour` (son jour
+ * civil) fait foi, `fuseau` ancre ce jour ; sans eux, le serveur.
  */
-export async function getMoonPhaseToday(): Promise<JourLunaire> {
+export async function getMoonPhaseToday(lecteur: { jour?: string | null; fuseau?: string } = {}): Promise<JourLunaire> {
+  const { jour, fuseau } = lecteur
+  if (jour) {
+    const [a, m, j] = jour.split('-').map(Number)
+    return fetchMoonPhase(fuseau ? midiDansFuseau(jour, fuseau) : new Date(a, m - 1, j, 12, 0, 0), fuseau)
+  }
+  if (fuseau) return fetchMoonPhase(new Date(), fuseau)
   const now = new Date()
   const midiLocal = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12, 0, 0)
   return fetchMoonPhase(midiLocal)

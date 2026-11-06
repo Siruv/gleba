@@ -5,9 +5,10 @@
  */
 
 import * as React from "react"
+import Link from "next/link"
 import { format } from "date-fns"
 import { ColumnDef } from "@tanstack/react-table"
-import { Wrench, ListTodo, Check, CheckCircle, AlertTriangle } from "lucide-react"
+import { Wrench, ListTodo, Check, CheckCircle, AlertTriangle, X } from "lucide-react"
 import { checkOperationSaison } from "@/lib/tree-care-calendar"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -30,6 +31,15 @@ import { WeatherFieldset, EMPTY_WEATHER, type WeatherData } from "@/components/p
 import { MaterielFieldset } from "@/components/phyto/MaterielFieldset"
 import { libelleOperationArbre } from "@/lib/verger/operation-label"
 import { statutOperationArbre } from "@/lib/operation-arbre-statut"
+import {
+  anneeOperationArbre,
+  dateReferenceOperationArbre,
+  operationArbreDansAnnee,
+  resumeCoutOperations,
+} from "@/lib/verger/annee-operation"
+import { formatMontantDevise } from "@/lib/format-utils"
+import { updateDashboardSearchParams } from "@/lib/dashboard-navigation"
+import { lireArbreOuverture, operationsDeLArbre } from "@/lib/verger/lien-operations-arbre"
 
 const FILTER_STATES = [
   { value: "all", label: "Toutes", icon: Wrench },
@@ -114,9 +124,11 @@ function createColumns(
         // partagée. Une opération générée dont la fenêtre est ouverte n'est pas
         // en retard, et une fenêtre refermée est un rendez-vous manqué pour la
         // saison, pas un retard qui s'aggrave chaque jour.
+        // QA 2026-10-19 — même date que celle qui range l'opération dans une
+        // année (src/lib/verger/annee-operation.ts).
         const op = row.original
-        const effective = !op.fait && op.datePrevue ? op.datePrevue : op.date
-        const label = new Date(effective).toLocaleDateString("fr-FR")
+        const effective = dateReferenceOperationArbre(op)
+        const label = effective ? effective.toLocaleDateString("fr-FR") : "-"
         const statut = statutOperationArbre(op)
         return (
           <span className={!op.fait ? "text-slate-600" : ""}>
@@ -192,12 +204,22 @@ function createColumns(
   ]
 }
 
-export function OperationsTab() {
+interface OperationsTabProps {
+  /** Année du sélecteur du verger (URL `?annee=`, voir useAnneeModule). */
+  annee: number
+}
+
+export function OperationsTab({ annee }: OperationsTabProps) {
   const { toast } = useToast()
   const [data, setData] = React.useState<OperationArbre[]>([])
   const [arbres, setArbres] = React.useState<Arbre[]>([])
   const [isLoading, setIsLoading] = React.useState(true)
   const [filterFait, setFilterFait] = React.useState("all")
+  // QA cmvnorxov — arbre choisi depuis sa fiche (« Voir les opérations »),
+  // comparé par identifiant. Paramètre d'ouverture `?arbreId=` lu au montage
+  // puis retiré de l'URL, le reste de la requête gardé (motif 7) ; le filtre
+  // vit ensuite dans l'état de l'onglet et se retire par son bouton.
+  const [arbreFiltreId, setArbreFiltreId] = React.useState<number | null>(null)
   const [showDialog, setShowDialog] = React.useState(false)
   const [isSubmitting, setIsSubmitting] = React.useState(false)
   const [newOperation, setNewOperation] = React.useState({
@@ -223,8 +245,10 @@ export function OperationsTab() {
   const fetchData = React.useCallback(async () => {
     setIsLoading(true)
     try {
+      // QA 2026-10-19 — la liste et le coût suivent l'année du sélecteur du
+      // verger : la route filtre par la règle partagée (annee-operation.ts).
       const [opsRes, arbresRes] = await Promise.all([
-        fetch("/api/arbres/operations"),
+        fetch(`/api/arbres/operations?annee=${annee}`),
         fetch("/api/arbres"),
       ])
       // QA cmsnnybbg — un GET en échec laissait la table sur « Aucune
@@ -240,19 +264,43 @@ export function OperationsTab() {
     } finally {
       setIsLoading(false)
     }
-  }, [toast])
+  }, [toast, annee])
 
   React.useEffect(() => {
     fetchData()
   }, [fetchData])
 
-  const filteredData = React.useMemo(() => {
-    if (filterFait === "fait") return data.filter((op) => op.fait)
-    if (filterFait === "afaire") return data.filter((op) => !op.fait)
-    return data
-  }, [data, filterFait])
+  React.useEffect(() => {
+    const { arbreId, requete } = lireArbreOuverture(window.location.search)
+    if (requete === null) return
+    if (arbreId !== null) setArbreFiltreId(arbreId)
+    // Nettoyage par l'API History, état `null` (cf. dashboard-navigation.ts).
+    updateDashboardSearchParams(new URLSearchParams(requete), "replace")
+  }, [])
 
-  const totalCout = data.reduce((sum, o) => sum + (o.cout || 0), 0)
+  const dataArbre = React.useMemo(() => operationsDeLArbre(data, arbreFiltreId), [data, arbreFiltreId])
+
+  const filteredData = React.useMemo(() => {
+    if (filterFait === "fait") return dataArbre.filter((op) => op.fait)
+    if (filterFait === "afaire") return dataArbre.filter((op) => !op.fait)
+    return dataArbre
+  }, [dataArbre, filterFait])
+
+  // Nom affiché du filtre : la liste des arbres du compte, à défaut une
+  // opération chargée de cet arbre. Un arbre introuvable n'a pas de fiche à
+  // ouvrir : son libellé reste un texte simple.
+  const nomArbreConnu =
+    arbreFiltreId === null
+      ? null
+      : arbres.find((a) => a.id === arbreFiltreId)?.nom ??
+        data.find((op) => op.arbreId === arbreFiltreId)?.arbre.nom ??
+        null
+  const nomArbreFiltre =
+    arbreFiltreId === null
+      ? null
+      : nomArbreConnu ?? (isLoading ? "…" : `n° ${arbreFiltreId} (introuvable)`)
+
+  const coutAnnee = resumeCoutOperations(dataArbre)
 
   const handleToggleFait = React.useCallback(
     async (op: OperationArbre) => {
@@ -285,17 +333,27 @@ export function OperationsTab() {
           return
         }
         const updated = (await res.json().catch(() => null)) as OperationArbre | null
+        const suivante: OperationArbre = { ...op, ...(updated ?? {}), fait: updated?.fait ?? nextFait }
+        // QA 2026-10-19 — réalisée aujourd'hui, une opération prévue une autre
+        // année change d'exercice : elle quitte la liste, et on le dit.
+        const anneeSuivante = anneeOperationArbre(suivante)
         setData((prev) =>
-          prev.map((o) =>
-            o.id === op.id ? { ...o, ...(updated ?? {}), fait: updated?.fait ?? nextFait } : o
-          )
+          prev
+            .map((o) => (o.id === op.id ? suivante : o))
+            .filter((o) => o.id !== op.id || operationArbreDansAnnee(o, annee))
         )
-        toast({ title: nextFait ? "Fait !" : "Annulé" })
+        toast({
+          title: nextFait ? "Fait !" : "Annulé",
+          description:
+            anneeSuivante !== null && anneeSuivante !== annee
+              ? `Opération désormais rangée en ${anneeSuivante} : choisissez cette année pour la retrouver.`
+              : undefined,
+        })
       } catch {
         toast({ variant: "destructive", title: "Erreur" })
       }
     },
-    [toast]
+    [toast, annee]
   )
 
   const columns = React.useMemo(() => createColumns(handleToggleFait), [handleToggleFait])
@@ -403,9 +461,22 @@ export function OperationsTab() {
       })
 
       if (res.ok) {
+        // QA 2026-10-19 — une opération d'une autre année que celle affichée
+        // n'apparaît pas dans la liste : le dire plutôt que la laisser « disparaître ».
+        const anneeCreee = anneeOperationArbre({
+          fait: newOperation.fait,
+          date: newOperation.fait ? date || null : datePrevue || null,
+          datePrevue: datePrevue || null,
+        })
         setShowDialog(false)
         resetForm()
-        toast({ title: "Opération enregistrée" })
+        toast({
+          title: "Opération enregistrée",
+          description:
+            anneeCreee !== null && anneeCreee !== annee
+              ? `Rangée en ${anneeCreee} : choisissez cette année dans le sélecteur pour la voir.`
+              : undefined,
+        })
         fetchData()
       } else {
         const data = await res.json().catch(() => ({}))
@@ -420,13 +491,26 @@ export function OperationsTab() {
 
   return (
     <div className="space-y-4">
-      {/* Stats cout total */}
+      {/* Stats cout de l'année (QA 2026-10-19 : suit le sélecteur d'année) */}
       <Card>
         <CardContent className="pt-4 pb-3">
           <div className="flex items-center justify-between">
-            <p className="text-sm text-muted-foreground">Coût total des opérations</p>
-            <p className="text-xl font-bold">{totalCout.toFixed(2)} €</p>
+            <p className="text-sm text-muted-foreground">
+              Coût des opérations {annee}
+              {nomArbreFiltre !== null ? ` pour ${nomArbreFiltre}` : ""}
+            </p>
+            <p className="text-xl font-bold" data-testid="cout-operations-annee">{formatMontantDevise(coutAnnee.total)}</p>
           </div>
+          {coutAnnee.prevu > 0 && (
+            <p className="text-xs text-muted-foreground text-right">
+              dont {formatMontantDevise(coutAnnee.realise)} réalisés et {formatMontantDevise(coutAnnee.prevu)} prévus
+            </p>
+          )}
+          <p className="mt-1 text-xs text-muted-foreground">
+            Année {annee} : opérations réalisées en {annee}, et opérations à faire prévues en {annee}.
+            Une opération à faire d&apos;une autre année reste rangée sous son année ; le Calendrier
+            regroupe tout ce qui reste à faire.
+          </p>
         </CardContent>
       </Card>
 
@@ -453,6 +537,35 @@ export function OperationsTab() {
         </TabsList>
       </Tabs>
 
+      {arbreFiltreId !== null && (
+        <div
+          className="flex flex-wrap items-center gap-2 rounded-md border border-lime-200 bg-lime-50 px-3 py-2 text-sm"
+          data-testid="filtre-arbre-operations"
+        >
+          <span>
+            Opérations de l&apos;arbre{" "}
+            {nomArbreConnu !== null ? (
+              <Link href={`/verger/${arbreFiltreId}`} className="font-medium text-lime-800 underline">
+                {nomArbreConnu}
+              </Link>
+            ) : (
+              <span className="font-medium">{nomArbreFiltre}</span>
+            )}{" "}
+            en {annee}
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2"
+            onClick={() => setArbreFiltreId(null)}
+            title="Retirer le filtre sur l'arbre"
+          >
+            <X className="h-3.5 w-3.5 mr-1" />
+            Tous les arbres
+          </Button>
+        </div>
+      )}
+
       <DataTable
         columns={columns}
         data={filteredData}
@@ -477,7 +590,9 @@ export function OperationsTab() {
           }
         }}
         searchPlaceholder="Rechercher une opération..."
-        emptyMessage="Aucune opération trouvée."
+        emptyMessage={
+          arbreFiltreId !== null ? `Aucune opération de cet arbre en ${annee}.` : "Aucune opération trouvée."
+        }
         tableClassName="min-w-[820px]"
       />
 
@@ -693,8 +808,8 @@ export function OperationsTab() {
                 <p className="font-semibold text-amber-800 mb-1">⚠ Type Traitement</p>
                 <p className="text-amber-700">
                   Pour saisir un traitement phytosanitaire complet (Certiphyto, ZNT, EPI),
-                  utilisez plutôt l'onglet <strong>Santé &amp; Phyto</strong> qui ouvre le
-                  formulaire conforme à l'arrêté du 4 mai 2017 modifié.
+                  utilisez plutôt l&apos;onglet <strong>Santé &amp; Phyto</strong> qui ouvre le
+                  formulaire conforme à l&apos;arrêté du 4 mai 2017 modifié.
                 </p>
               </div>
             )}

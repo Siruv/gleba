@@ -4,6 +4,9 @@
 
 import { z } from 'zod'
 import { etapeDejaRealisable } from '@/lib/cultures/deja-fait'
+import { dateJourSeul, jourCivilStocke } from '@/lib/jour-civil'
+import { normaliserDateApi } from './date-api'
+import { erreurFinRecolte } from '@/lib/cultures/fenetre-recolte'
 
 // QA cmsbtr0e4 — un Select piloté peut émettre '' pour une référence
 // facultative ; '' inséré tel quel violait la FK (P2003 ⇒ 500). '' vaut
@@ -116,7 +119,29 @@ function refineFaitsPasses(
 export const cultureFormSchema = cultureSchema
   .superRefine(refineChronologie)
   .superRefine(refineFaitsPasses)
-export const cultureUpdateFormSchema = cultureSchema.partial().superRefine(refineChronologie)
+  .superRefine(refineFenetre)
+
+function refineFenetre(data: Pick<CultureInput, 'dateRecolte' | 'finRecolte'>, ctx: z.RefinementCtx) {
+  const erreur = erreurFinRecolte(data)
+  if (erreur) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['finRecolte'], message: erreur })
+}
+
+/** Même règle que l'API : une ancienne fenêtre ne bloque pas une simple note. */
+export function cultureUpdateFormSchemaPour(
+  avant?: Pick<CultureInput, 'dateRecolte' | 'finRecolte'> | null,
+) {
+  return cultureSchema.partial().superRefine(refineChronologie).superRefine((data, ctx) => {
+    const finale = {
+      dateRecolte: data.dateRecolte !== undefined ? data.dateRecolte : avant?.dateRecolte,
+      finRecolte: data.finRecolte !== undefined ? data.finRecolte : avant?.finRecolte,
+    }
+    if (!avant || (['dateRecolte', 'finRecolte'] as const).some(champ =>
+      jourCivilStocke(finale[champ]) !== jourCivilStocke(avant[champ]),
+    )) refineFenetre(finale, ctx)
+  })
+}
+
+export const cultureUpdateFormSchema = cultureUpdateFormSchemaPour()
 
 export type CultureInput = z.infer<typeof cultureSchema>
 export type CreateCultureInput = z.infer<typeof createCultureSchema>
@@ -148,4 +173,65 @@ export function normalizeCultureDateFields(
     data[field] = parsed
   }
   return null
+}
+
+/**
+ * Création d'une culture : chaque date (semis, plantation, récolte, fin de
+ * récolte) est un JOUR, écrit à minuit UTC comme une saisie « AAAA-MM-JJ ».
+ *
+ * Ticket QA cmvnulry1 (2026-10-25) : un client qui envoie un instant (assistant
+ * « Semer », `toISOString()` d'un minuit local : « 2027-04-11T22:00:00.000Z »
+ * pour le 12 avril à Paris) faisait stocker la veille au soir, que tout lecteur
+ * du jour UTC (Registre de culture) affichait au 11. Un instant reçu est
+ * ramené à son jour civil par la règle de lecture (`dateJourSeul` : minuit
+ * UTC pile = ce jour, sinon jour local du serveur, Europe/Paris), un
+ * « AAAA-MM-JJ » est contrôlé strictement (`normaliserDateApi` : pas de
+ * 31 février, année sur quatre chiffres).
+ *
+ * Création seulement : en modification, une date non touchée garde son
+ * instant stocké (`retenirDatesCulture`).
+ *
+ * Normalise en place ; rend le nom du premier champ illisible, sinon null.
+ */
+export function normaliserDatesCreationCulture(
+  data: Partial<
+    Record<'dateSemis' | 'datePlantation' | 'dateRecolte' | 'finRecolte', string | Date | null>
+  >,
+): string | null {
+  for (const field of ['dateSemis', 'datePlantation', 'dateRecolte', 'finRecolte'] as const) {
+    const value = data[field]
+    if (value === undefined || value === null) continue
+    const lue = value instanceof Date
+      ? (Number.isNaN(value.getTime()) ? { ok: false as const } : { ok: true as const, value })
+      : normaliserDateApi(value.trim())
+    if (!lue.ok) return field
+    data[field] = lue.value ? dateJourSeul(lue.value) : null
+  }
+  return null
+}
+
+/**
+ * Modification d'une culture (PUT) : règle par JOUR, celle de
+ * `dateSoinRetenue` en élevage. À appeler après `normalizeCultureDateFields`,
+ * avec la ligne stockée ; modifie en place.
+ *  - Même jour civil que la date stockée : l'instant stocké est gardé. Le
+ *    formulaire d'édition renvoie une date non touchée telle quelle (instant
+ *    horodaté d'une étape faite, ou minuit Paris d'une culture ancienne) ou
+ *    en « AAAA-MM-JJ » : ni réécrite, ni prise pour une nouvelle date de plan.
+ *  - Jour différent : minuit UTC du jour soumis (`dateJourSeul`). Un ITP
+ *    resynchronisé à l'écran renvoie « 2027-04-11T22:00:00.000Z » (minuit
+ *    local) : stocké au 12 avril, minuit UTC (ticket cmvnulry1, 2026-10-25).
+ */
+export function retenirDatesCulture(
+  data: Partial<
+    Record<'dateSemis' | 'datePlantation' | 'dateRecolte' | 'finRecolte', string | Date | null>
+  >,
+  stockee: Partial<Record<'dateSemis' | 'datePlantation' | 'dateRecolte' | 'finRecolte', Date | null>>,
+): void {
+  for (const field of ['dateSemis', 'datePlantation', 'dateRecolte', 'finRecolte'] as const) {
+    const soumise = data[field]
+    if (!(soumise instanceof Date)) continue
+    const avant = stockee[field] ?? null
+    data[field] = avant && jourCivilStocke(avant) === jourCivilStocke(soumise) ? avant : dateJourSeul(soumise)
+  }
 }

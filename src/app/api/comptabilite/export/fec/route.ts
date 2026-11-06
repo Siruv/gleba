@@ -13,10 +13,27 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { montantVenteFruit, periodeVenteVerger } from '@/lib/verger/montant-vente'
+import { TAUX_TVA_BOIS_PAR_DEFAUT } from '@/lib/verger/tva-bois'
 import { genererFec, serialiserFec, validerEquilibre, type FecInputVente, type FecInputDepense } from '@/lib/comptabilite/fec'
 import { getTerritoire, collecteTvaFrancaise } from '@/lib/territoires'
+import { chargerSuiviDesSources, cleSource } from '@/lib/comptabilite/suivi-ecriture'
+import { formatMontantFec } from '@/lib/comptabilite/fec-affichage'
+import { chargerSoldesReglements } from '@/lib/comptabilite/reglements'
+import { cleMiroirReglement, cleSourceReglement } from '@/lib/comptabilite/cle-reglement'
+import { chargerFecReglements, verifierDeviseFec } from '@/lib/comptabilite/banque/fec-reglements'
+import { deviseFactureReglement } from '@/lib/comptabilite/devise-reglement'
+import { deviseDuTerritoire } from '@/lib/territoires'
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
 
 export async function GET(request: NextRequest) {
+  try { return await exporterFec(request) }
+  catch (e) {
+    if (e instanceof ErreurReglement) return NextResponse.json({ error: e.message }, { status: e.status })
+    throw e
+  }
+}
+async function exporterFec(request: NextRequest) {
   const { session, error } = await requireAuthApi()
   if (error) return error
 
@@ -59,7 +76,7 @@ export async function GET(request: NextRequest) {
   }
 
   const start = new Date(exercice, 0, 1)
-  const end = new Date(exercice, 11, 31, 23, 59, 59)
+  const end = new Date(exercice, 11, 31, 23, 59, 59, 999)
   const userId = session!.user.id
 
   const [
@@ -105,7 +122,7 @@ export async function GET(request: NextRequest) {
     prisma.productionBois.findMany({
       where: {
         userId,
-        date: { gte: start, lte: end },
+        ...periodeVenteVerger(start, end),
         statut: 'vendu',
         prixVente: { not: null },
         factureId: null,
@@ -117,9 +134,8 @@ export async function GET(request: NextRequest) {
     prisma.recolteArbre.findMany({
       where: {
         userId,
-        date: { gte: start, lte: end },
+        ...periodeVenteVerger(start, end),
         statut: 'vendu',
-        prixTotal: { not: null },
         factureId: null,
       },
       include: { arbre: { select: { espece: true, nom: true } } },
@@ -139,7 +155,7 @@ export async function GET(request: NextRequest) {
         userId,
         statut: 'vendu',
         dateVente: { gte: start, lte: end },
-        prixTotal: { not: null },
+        OR: [{ prixTotal: { not: null } }, { prixKg: { not: null } }],
         factureId: null,
       },
       include: { espece: { select: { id: true } } },
@@ -159,6 +175,52 @@ export async function GET(request: NextRequest) {
     }),
   ])
 
+  // Ticket cmvgdzsf7 (revue du 2026-10-20) — le suivi d'une vente générée
+  // (pièce, mode de règlement) vit sur son miroir `VenteManuelle`, que le FEC
+  // n'exporte pas : il réinjecte la source brute ci-dessous. Sans relecture du
+  // miroir, la pièce saisie dans Transactions n'atteignait jamais le FEC
+  // (`ELEV-167` au lieu de `CHQ-0042`). Même helper que la liste Transactions.
+  const suiviSources = await chargerSuiviDesSources(userId, {
+    sources: [
+      ...ventesBois.map((b) => ({ sourceType: 'production_bois', sourceId: b.id })),
+      ...ventesFruits.map((r) => ({ sourceType: 'recolte_arbre', sourceId: r.id })),
+      ...ventesElevage.map((v) => ({ sourceType: 'vente_produit', sourceId: v.id })),
+      ...ventesPotager.map((r) => ({ sourceType: 'recolte', sourceId: r.id })),
+      ...abattagesVendus.map((a) => ({ sourceType: 'abattage', sourceId: a.id })),
+    ],
+  })
+  /**
+   * Pièce et règlement d'une source réinjectée : ceux de son miroir quand ils
+   * sont saisis, sinon la référence technique (`ELEV-<id>`…) et aucun mode.
+   * La référence de la source reste lisible dans le libellé.
+   */
+  const deviseComptable = exploitation?.devise || deviseDuTerritoire(exploitation?.territoire)
+  for (const f of factures) verifierDeviseFec(deviseFactureReglement(f.emetteurSnapshot, deviseComptable), deviseComptable)
+  const [soldesDetail, journalReglements] = await Promise.all([
+    chargerSoldesReglements(userId, [
+      ...ventes.map((v) => cleMiroirReglement('vente', v)),
+      ...depenses.map((d) => cleMiroirReglement('depense', d)),
+      ...ventesBois.map((v) => cleSourceReglement('vente', 'production_bois', v.id)),
+      ...ventesFruits.map((v) => cleSourceReglement('vente', 'recolte_arbre', v.id)),
+      ...ventesElevage.map((v) => cleSourceReglement('vente', 'vente_produit', v.id)),
+      ...ventesPotager.map((v) => cleSourceReglement('vente', 'recolte', v.id)),
+      ...abattagesVendus.map((v) => cleSourceReglement('vente', 'abattage', v.id)),
+    ]),
+    chargerFecReglements(userId, start, end),
+  ])
+  function suiviDeLaSource(sourceType: string, sourceId: number, refSource: string, description: string) {
+    const ecriture = suiviSources.parSource.get(cleSource(sourceType, sourceId))
+    const suivi = ecriture?.suivi
+    const piece = suivi?.numeroPiece?.trim()
+    return {
+      paye: ecriture?.paye ?? true,
+      reglementDetaille: soldesDetail.has(cleSourceReglement('vente', sourceType, sourceId)),
+      modeReglement: suivi?.modeReglement ?? null,
+      numeroPiece: piece || refSource,
+      description: piece ? `${description} (${refSource})` : description,
+    }
+  }
+
   const ventesIn: FecInputVente[] = ventes.map((v) => ({
     id: v.id,
     date: v.date,
@@ -172,12 +234,13 @@ export async function GET(request: NextRequest) {
     montantTVA: v.montantTVA,
     clientNom: v.clientNom,
     paye: v.paye,
+    reglementDetaille: soldesDetail.has(cleMiroirReglement('vente', v)),
   }))
 
   // DEV3 #5 - Injection des ventes ProductionBois (sans facture) au FEC.
-  // Catégorie 'bois' → compte 701820. TVA 20% par défaut (bois énergie : 10%
-  // si applicable mais conservons 20% en standard, l'opérateur peut éditer).
-  // Numéro pièce = "BOIS-{id}" pour éviter collision avec les ventes manuelles.
+  // Catégorie 'bois' → compte 701820 ; même taux par défaut que la vente native.
+  // Numéro pièce = celle saisie sur le miroir, sinon "BOIS-{id}" pour éviter
+  // la collision avec les ventes manuelles.
   function categorieBois(qualite: string | null): string {
     if (!qualite) return 'bois'
     if (qualite === "Bois d'œuvre") return 'bois_oeuvre'
@@ -189,28 +252,26 @@ export async function GET(request: NextRequest) {
     const ttc = b.prixVente as number
     // Audit compta 2026-06 : 10 % — aligné sur l'écriture auto et la facture
     // bois (auto-compta.ts, arbres/bois/[id]) ; le FEC sortait 20 %.
-    const tauxTVA = 10
+    const tauxTVA = TAUX_TVA_BOIS_PAR_DEFAUT
     const ht = Math.round((ttc / (1 + tauxTVA / 100)) * 100) / 100
     const tva = Math.round((ttc - ht) * 100) / 100
     const desc = `Vente bois — ${b.arbre?.espece || b.arbre?.nom || b.qualiteBois || 'lot'} (${b.numLot ?? `#${b.id}`})`
     ventesIn.push({
       id: 1_000_000 + b.id,           // décalage pour éviter collision id
       date: b.dateVente ?? b.date,
-      description: desc,
       categorie: categorieBois(b.qualiteBois),
-      modeReglement: null,
-      numeroPiece: `BOIS-${b.id}`,
+      ...suiviDeLaSource('production_bois', b.id, `BOIS-${b.id}`, desc),
       tauxTVA,
       montant: ttc,
       montantHT: ht,
       montantTVA: tva,
       clientNom: b.clientNom,
-      paye: true,
     })
   }
   // DEV3 #5 - Injection ventes RecolteArbre directes (sans facture)
   for (const r of ventesFruits) {
-    const ttc = r.prixTotal as number
+    const ttc = montantVenteFruit(r)
+    if (ttc <= 0) continue
     const tauxTVA = 5.5  // Fruits frais : 5.5% TVA réduite
     const ht = Math.round((ttc / (1 + tauxTVA / 100)) * 100) / 100
     const tva = Math.round((ttc - ht) * 100) / 100
@@ -218,16 +279,13 @@ export async function GET(request: NextRequest) {
     ventesIn.push({
       id: 2_000_000 + r.id,
       date: r.dateVente ?? r.date,
-      description: desc,
       categorie: 'fruits',
-      modeReglement: null,
-      numeroPiece: `FRUIT-${r.id}`,
+      ...suiviDeLaSource('recolte_arbre', r.id, `FRUIT-${r.id}`, desc),
       tauxTVA,
       montant: ttc,
       montantHT: ht,
       montantTVA: tva,
       clientNom: r.clientNom,
-      paye: true,
     })
   }
 
@@ -263,10 +321,8 @@ export async function GET(request: NextRequest) {
     ventesIn.push({
       id: 3_000_000 + v.id,
       date: v.date,
-      description: v.description || `Vente ${v.type} (${v.quantite} ${v.unite})`,
       categorie: categorieElevage(v.type),
-      modeReglement: null,
-      numeroPiece: `ELEV-${v.id}`,
+      ...suiviDeLaSource('vente_produit', v.id, `ELEV-${v.id}`, v.description || `Vente ${v.type} (${v.quantite} ${v.unite})`),
       tauxTVA,
       montant: ttc,
       montantHT: ht,
@@ -276,17 +332,15 @@ export async function GET(request: NextRequest) {
     })
   }
   for (const r of ventesPotager) {
-    const ttc = r.prixTotal as number
+    const ttc = r.prixTotal || r.quantite * (r.prixKg || 0)
     const tauxTVA = 5.5
     const ht = Math.round((ttc / (1 + tauxTVA / 100)) * 100) / 100
     const tva = Math.round((ttc - ht) * 100) / 100
     ventesIn.push({
       id: 4_000_000 + r.id,
       date: r.dateVente ?? r.date,
-      description: `Vente récolte — ${r.espece?.id || r.especeId || 'lot'} (#${r.id})`,
       categorie: 'legumes',
-      modeReglement: null,
-      numeroPiece: `RECOLTE-${r.id}`,
+      ...suiviDeLaSource('recolte', r.id, `RECOLTE-${r.id}`, `Vente récolte — ${r.espece?.id || r.especeId || 'lot'} (#${r.id})`),
       tauxTVA,
       montant: ttc,
       montantHT: ht,
@@ -303,16 +357,15 @@ export async function GET(request: NextRequest) {
     ventesIn.push({
       id: 5_000_000 + a.id,
       date: a.date,
-      description: `Vente viande abattage #${a.id}${a.poidsCarcasse ? ` (${a.poidsCarcasse} kg)` : ''}`,
       categorie: 'viande',
-      modeReglement: null,
-      numeroPiece: `ABATT-${a.id}`,
+      ...suiviDeLaSource('abattage', a.id, `ABATT-${a.id}`, `Vente viande abattage #${a.id}${a.poidsCarcasse ? ` (${a.poidsCarcasse} kg)` : ''}`),
       tauxTVA,
       montant: ttc,
       montantHT: ht,
       montantTVA: tva,
       clientNom: null, // Abattage n'a pas de clientNom au modèle
-      paye: true,
+      // Pointage du miroir ; sans miroir, vente présumée payée (décision du 2026-10-30).
+      paye: suiviSources.parSource.get(cleSource('abattage', a.id))?.paye ?? true,
     })
   }
 
@@ -329,6 +382,7 @@ export async function GET(request: NextRequest) {
     montantTVA: d.montantTVA,
     fournisseurNom: d.fournisseurNom,
     paye: d.paye,
+    reglementDetaille: soldesDetail.has(cleMiroirReglement('depense', d)),
   }))
 
   // POSTREVIEW — Heuristique de catégorisation des lignes de facture pour
@@ -373,7 +427,7 @@ export async function GET(request: NextRequest) {
   // de TVA au FEC (les écritures auto/manuelles ont un taux 5,5/20 par défaut
   // qui contredirait le régime déclaré — audit 2026-07 #10).
   const sansTva = !collecteTvaFrancaise(exploitation?.regimeTva)
-  const lignes = genererFec({ ventes: ventesIn, depenses: depensesIn, factures: facturesIn, sansTva })
+  const lignes = genererFec({ ventes: ventesIn, depenses: depensesIn, factures: facturesIn, sansTva, exercice, ...journalReglements })
   const validation = validerEquilibre(lignes)
 
   if (check) {
@@ -393,7 +447,7 @@ export async function GET(request: NextRequest) {
 
   if (!validation.equilibre) {
     return NextResponse.json(
-      { error: 'FEC déséquilibré', details: `Écart débit/crédit : ${validation.ecart}` },
+      { error: 'FEC déséquilibré', details: `Écart débit/crédit : ${formatMontantFec(validation.ecart)}` },
       { status: 422 }
     )
   }

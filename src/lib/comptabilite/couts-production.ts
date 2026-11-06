@@ -17,10 +17,13 @@ import { uniteQuantiteRecolte, type UniteQuantite } from '@/lib/recolte/projecti
 import {
   ajouterQuantite,
   arrondirQuantites,
+  fusionnerQuantites,
   partKg,
   type QuantiteParUnite,
 } from '@/lib/recolte/quantites'
 import { chargerSurchargesRendement, rendementEffectif } from '@/lib/recolte/rendement-effectif'
+import { surfaceCultureM2 } from '@/lib/culture-surface'
+import { chargerRevenusCultures } from './revenus-cultures'
 
 export interface CultureCost {
   cultureId: number
@@ -87,12 +90,26 @@ export interface EspeceAgg {
 
 function round2(n: number) { return Math.round(n * 100) / 100 }
 
+/**
+ * Production de la ferme ventilée par unité : celle des espèces du potager
+ * (déjà ventilée) plus la récolte du verger, en kilos. Jamais un nombre seul :
+ * des tiges ne s'additionnent pas à des kilos (QA cmvge3bqj).
+ */
+export function productionTotaleParUnite(
+  productionEspeces: QuantiteParUnite,
+  vergerKg: number,
+): QuantiteParUnite {
+  return arrondirQuantites(fusionnerQuantites(productionEspeces, { kg: vergerKg }))
+}
+
 export type CoutsProduction = Awaited<ReturnType<typeof computeCoutsProduction>>
 
 export async function computeCoutsProduction(userId: string, year: number) {
   const startOfYear = new Date(year, 0, 1)
-  const endOfYear = new Date(year, 11, 31, 23, 59, 59)
+  const endOfYear = new Date(year, 11, 31, 23, 59, 59, 999)
   const dateRange = { gte: startOfYear, lte: endOfYear }
+  const maintenant = new Date()
+  const revenusCultures = await chargerRevenusCultures(userId, startOfYear, year === maintenant.getFullYear() ? maintenant : endOfYear)
 
   // ============================================================
   // 1. POTAGER : Cultures + Récoltes + Interventions + Fertilisations
@@ -101,6 +118,7 @@ export async function computeCoutsProduction(userId: string, year: number) {
     where: {
       userId,
       OR: [
+        ...(revenusCultures.size ? [{ id: { in: [...revenusCultures.keys()] } }] : []),
         { annee: year },
         { recoltes: { some: { date: dateRange } } },
         { dateSemis: dateRange },
@@ -201,20 +219,11 @@ export async function computeCoutsProduction(userId: string, year: number) {
     const estUniteCourante = (r: { unite: string | null }) =>
       ((r.unite ?? 'kg') as UniteQuantite) === uniteCulture
     const production = culture.recoltes.filter(estUniteCourante).reduce((sum, r) => sum + r.quantite, 0)
-    // BUG-07 : on n'inclut dans le « CA moyen » que les lignes vendues qui ont
-    // effectivement un prix (sinon prixMoyenUnitaire = 0,19 €/kg sur 90 kg).
-    const recoltesVendues = culture.recoltes.filter(
-      (r) =>
-        r.statut === 'vendu' &&
-        ((r.prixKg ?? 0) > 0 || (r.prixTotal ?? 0) > 0)
-    )
-    const revenus = recoltesVendues.reduce((sum, r) => sum + (r.prixTotal || (r.quantite * (r.prixKg || 0))), 0)
-    const quantiteVendue = recoltesVendues
-      .filter(estUniteCourante)
-      .reduce((sum, r) => sum + r.quantite, 0)
+    const revenu = revenusCultures.get(culture.id)
+    const revenus = revenu?.revenus ?? 0
+    const quantiteVendue = revenu?.quantiteVendueParUnite[uniteCulture] ?? 0
 
-    const plancheSurface = culture.planche?.surface || ((culture.planche?.largeur || 0) * (culture.planche?.longueur || 0))
-    const surface = plancheSurface || 0
+    const surface = surfaceCultureM2(culture)
 
     // Coût semences : depuis variete ou part des dépenses semences
     let coutSemences = 0
@@ -223,7 +232,7 @@ export async function computeCoutsProduction(userId: string, year: number) {
     } else if (depSemencesTotal > 0 && cultures.length > 0) {
       // Distribuer les dépenses de semences proportionnellement à la surface
       const totalSurface = cultures.reduce((s, c) => {
-        const ps = c.planche?.surface || ((c.planche?.largeur || 0) * (c.planche?.longueur || 0))
+        const ps = surfaceCultureM2(c)
         return s + (ps || 1)
       }, 0)
       coutSemences = depSemencesTotal * ((surface || 1) / totalSurface)
@@ -302,17 +311,14 @@ export async function computeCoutsProduction(userId: string, year: number) {
   // ============================================================
   // 2. VERGER : Arbres + Récoltes arbres + Opérations + Bois
   // ============================================================
-  const [recoltesArbres, opsArbres, ventesArbres, depensesVerger, ventesManuellesVergerAgg] = await Promise.all([
+  const [recoltesArbres, opsArbres, depensesVerger] = await Promise.all([
     prisma.recolteArbre.findMany({
       where: { userId, date: dateRange },
       include: { arbre: { select: { nom: true, espece: true, especeId: true } } },
     }),
     prisma.operationArbre.findMany({
-      where: { userId, date: dateRange },
+      where: { userId, fait: true, date: dateRange },
       include: { arbre: { select: { nom: true, espece: true, especeId: true } } },
-    }),
-    prisma.productionBois.findMany({
-      where: { userId, date: dateRange, statut: 'vendu' },
     }),
     prisma.depenseManuelle.findMany({
       // Lot 5 : les OperationArbre ont désormais une écriture auto module
@@ -326,35 +332,13 @@ export async function computeCoutsProduction(userId: string, year: number) {
         NOT: { auto: true, sourceType: 'operation_arbre' },
       },
     }),
-    // TICKET cmsog2niy — même motif que le potager (cf. ventesPotagerAgg plus
-    // bas) : une VenteManuelle saisie à la main dans Transactions avec
-    // module='verger' (ex. vente de bois de chauffage) doit compter dans la
-    // carte atelier. On exclut les miroirs auto des sources brutes déjà
-    // sommées ci-dessous (recolte_arbre, production_bois — cf. auto-compta)
-    // pour ne pas doubler ; les ventes manuelles s'ADDITIONNENT donc aux
-    // récoltes/bois au lieu du Math.max potager (dont l'agrégat inclut les
-    // miroirs).
-    prisma.venteManuelle.aggregate({
-      where: {
-        userId,
-        module: 'verger',
-        date: dateRange,
-        NOT: { auto: true, sourceType: { in: ['recolte_arbre', 'production_bois'] } },
-      },
-      _sum: { montant: true },
-    }),
   ])
 
   // Agrégation verger par espece d'arbre
-  const vergerRevenus = recoltesArbres
-    .filter((r) => r.statut === 'vendu' && ((r.prixKg ?? 0) > 0 || (r.prixTotal ?? 0) > 0))
-    .reduce((sum, r) => sum + (r.prixTotal || (r.quantite * (r.prixKg || 0))), 0)
-    + ventesArbres.reduce((sum, v) => sum + (v.prixVente || 0), 0)
-    + (ventesManuellesVergerAgg._sum.montant ?? 0)
   const vergerProduction = recoltesArbres.reduce((sum, r) => sum + r.quantite, 0)
   const vergerCouts = opsArbres.reduce((sum, o) => sum + (o.cout || 0), 0)
     + depensesVerger.reduce((sum, d) => sum + d.montant, 0)
-  const vergerHeures = opsArbres.reduce((sum, o) => sum + ((o as any).dureeMinutes || 0), 0) / 60
+  const vergerHeures = opsArbres.reduce((sum, o) => sum + (o.dureeMinutes || 0), 0) / 60
 
   // ============================================================
   // 3. ELEVAGE : Ventes produits + Abattages + Coûts alimentation + Soins
@@ -493,30 +477,7 @@ export async function computeCoutsProduction(userId: string, year: number) {
   // TOTAUX GLOBAUX (tous modules)
   // ============================================================
 
-  // QA 2026-05-15 — Bug #4 : auparavant `potagerRevenus` = somme des
-  // recoltes vendues (avec prixKg saisi). Les ventes AMAP/marché
-  // saisies en VenteManuelle (module=potager) étaient ignorées →
-  // l'écran affichait 17,50 € alors que Transactions montrait
-  // 6 342,50 €. On agrège désormais les VenteManuelle module="potager"
-  // sur l'année comme source de vérité pour le revenu maraîchage.
-  // `parEspece` reste calculé sur les récoltes (pour la rentabilité
-  // fine par culture), mais le TOTAL module utilise la SSOT compta.
-  const ventesPotagerAgg = await prisma.venteManuelle.aggregate({
-    where: {
-      userId,
-      module: 'potager',
-      date: { gte: new Date(year, 0, 1), lt: new Date(year + 1, 0, 1) },
-    },
-    _sum: { montant: true },
-  })
-  const potagerRevenusVentes = ventesPotagerAgg._sum.montant ?? 0
   const potagerRevenusRecoltes = parEspece.reduce((s, e) => s + e.revenus, 0)
-  // Le maximum couvre les deux cas : ventes saisies au niveau Recolte
-  // (prixKg) OU au niveau VenteManuelle (AMAP/marché). Si les deux
-  // sources existent en parallèle, on évite de doubler en gardant le
-  // max — pas idéal en cas de mix mais correct pour le 90/10 des
-  // exploitations qui saisissent par un seul canal.
-  const potagerRevenus = Math.max(potagerRevenusVentes, potagerRevenusRecoltes)
   const potagerCouts = parEspece.reduce((s, e) => s + e.coutTotal, 0)
 
   // Coûts : la formule reste locale (cf. consigne PROMPT 04 — les coûts de
@@ -525,12 +486,16 @@ export async function computeCoutsProduction(userId: string, year: number) {
   const totalCouts = potagerCouts + vergerCouts + elevageCoutsTotal + coutsGeneraux
 
   // Revenus : on s'aligne sur la source unique de vérité (getKpiCompta).
-  // Le revenu par culture/espèce reste affiché à partir des récoltes vendues
-  // (utile pour la rentabilité fine), mais le TOTAL exposé en haut de la
+  // Le revenu par culture/espèce rattache les ventes directes et les factures
+  // aux lots concernés, mais le TOTAL exposé en haut de la
   // réponse est celui de la SSOT, identique sur tous les autres écrans.
   const asOf = new Date()
   const kpiCompta = await getKpiCompta(userId, year, asOf)
+  // Même ventilation que le CA : ventes natives, BL facturés et avoirs,
+  // à leur date comptable, sans compter deux fois la sortie physique.
+  const vergerRevenus = kpiCompta.revenusParModuleYtd.parModule.verger
   const totalRevenus = kpiCompta.revenusYtd
+  const revenusPotagerComptables = kpiCompta.revenusParModuleYtd.parModule.potager
 
   const totalMarge = totalRevenus - totalCouts
   const totalMargePercent = totalRevenus > 0 ? (totalMarge / totalRevenus) * 100 : 0
@@ -564,6 +529,13 @@ export async function computeCoutsProduction(userId: string, year: number) {
     nbCultures: cultureCosts.length,
   }
 
+  // QA cmvge3bqj (2026-10-20) — le total ferme additionnait les productions de
+  // toutes les espèces et du verger : 60 tiges de dahlia comptaient 60 kg
+  // (14 241,5 « kg » pour 14 181,49 kg et 60 tiges). Même ventilation que la
+  // carte Maraîchage : les masses ensemble, les autres unités à part. Le verger
+  // se pèse (`RecolteArbre.quantite` en kg).
+  const productionFermeParUnite = productionTotaleParUnite(productionEspecesParUnite, vergerProduction)
+
   return {
     parEspece,
     parCulture: cultureCosts,
@@ -571,9 +543,9 @@ export async function computeCoutsProduction(userId: string, year: number) {
     // Résumé par module
     parModule: {
       potager: {
-        revenus: round2(potagerRevenus),
+        revenus: round2(revenusPotagerComptables),
         couts: round2(potagerCouts),
-        marge: round2(potagerRevenus - potagerCouts),
+        marge: round2(revenusPotagerComptables - potagerCouts),
         production: partKg(productionEspecesParUnite),
         productionParUnite: productionEspecesParUnite,
         heures: Math.round(parEspece.reduce((s, e) => s + e.minutesTravaillees, 0) / 60 * 10) / 10,
@@ -617,7 +589,11 @@ export async function computeCoutsProduction(userId: string, year: number) {
       coutsGeneraux: round2(coutsGeneraux),
       margeBrute: round2(totalMarge),
       margePercent: Math.round(totalMargePercent * 10) / 10,
-      production: round2(parEspece.reduce((s, e) => s + e.production, 0) + vergerProduction),
+      // Part en kilos seulement ; la ventilation complète est à côté.
+      production: partKg(productionFermeParUnite),
+      productionParUnite: productionFermeParUnite,
+      // Ligne « Non affecté aux espèces » du tableau : la récolte du verger.
+      productionHorsEspecesParUnite: productionTotaleParUnite({}, vergerProduction),
       surface: round2(parEspece.reduce((s, e) => s + e.surface, 0)),
       heuresTravaillees: Math.round((parEspece.reduce((s, e) => s + e.minutesTravaillees, 0) / 60 + vergerHeures) * 10) / 10,
       nbEspeces: parEspece.length,

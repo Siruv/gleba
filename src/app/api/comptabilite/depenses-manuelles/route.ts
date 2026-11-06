@@ -1,3 +1,5 @@
+import { versCentimes } from '@/lib/comptabilite/fec'
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
 /**
  * API Dépenses Manuelles
  * GET/POST/PATCH/DELETE /api/comptabilite/depenses-manuelles
@@ -6,6 +8,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { enrichirMiroirsReglements } from '@/lib/comptabilite/projection-reglements'
+import { cleMiroirReglement } from '@/lib/comptabilite/cle-reglement'
+import { verifierPointageDetaille, suiviReglementActif } from '@/lib/comptabilite/suivi-reglement-source'
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
+import { Prisma } from '@prisma/client'
 import { createDepenseManuelleSchema, updateDepenseManuelleSchema } from '@/lib/validations/depense-manuelle'
 import { invalidateKpi } from '@/lib/kpi'
 import { champsEnvoyes, refusModificationDerivee } from '@/lib/comptabilite/ecriture-derivee'
@@ -25,7 +32,7 @@ export async function GET(request: NextRequest) {
 
     const userId = session.user.id
 
-    const where: any = { userId }
+    const where: Prisma.DepenseManuelleWhereInput = { userId }
 
     if (categorie) where.categorie = categorie
     if (paye !== null && paye !== '') where.paye = paye === 'true'
@@ -49,13 +56,14 @@ export async function GET(request: NextRequest) {
     ])
 
     return NextResponse.json({
-      data: depenses,
+      data: await enrichirMiroirsReglements(userId, 'depense', depenses),
       stats: {
         total: stats._sum.montant || 0,
         count: stats._count,
       },
     })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('GET /api/comptabilite/depenses-manuelles error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la récupération', details: "Erreur interne du serveur" },
@@ -88,6 +96,7 @@ export async function POST(request: NextRequest) {
     // un `fournisseurNom` est fourni (saisie rapide). Le find-or-create
     // est idempotent, donc pas de doublon si le fournisseur existait.
     const depense = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session.user.id)
       let resolvedFournisseurId: string | null = rest.fournisseurId ?? null
       if (!resolvedFournisseurId && rest.fournisseurNom) {
         resolvedFournisseurId = await ensureFournisseurForUser(
@@ -125,6 +134,7 @@ export async function POST(request: NextRequest) {
     invalidateKpi(userId)
     return NextResponse.json(depense, { status: 201 })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('POST /api/comptabilite/depenses-manuelles error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la création', details: "Erreur interne du serveur" },
@@ -164,12 +174,17 @@ export async function PATCH(request: NextRequest) {
     // Une dépense dérivée appartient à sa source : son montant, sa date et son
     // périmètre ne se corrigent que là. Le suivi du règlement reste ouvert
     // (l'écran des impayés marque légitimement `paye` sur une ligne dérivée).
-    const refus = refusModificationDerivee(existing, envoyes)
+    const refus = refusModificationDerivee(existing, envoyes, 'depense')
     if (refus) {
-      return NextResponse.json({ error: refus }, { status: 400 })
+      return NextResponse.json(refus, { status: 400 })
     }
 
-    const updateData: any = {}
+    // Montant et taux sont relus pour recalculer HT/TVA : des nombres, pas des
+    // opérations Prisma (`increment`…).
+    const updateData: Prisma.DepenseManuelleUncheckedUpdateInput & {
+      montant?: number
+      tauxTVA?: number | null
+    } = {}
     if (envoyes.has('paye') && updates.paye !== undefined) updateData.paye = updates.paye
     if (updates.date !== undefined) updateData.date = updates.date
     if (updates.categorie !== undefined) updateData.categorie = updates.categorie
@@ -194,9 +209,11 @@ export async function PATCH(request: NextRequest) {
     ) {
       const montant = updateData.montant ?? existing.montant
       const taux = updateData.tauxTVA ?? existing.tauxTVA ?? 20
-      const ht = montant / (1 + taux / 100)
-      updateData.montantHT = Math.round(ht * 100) / 100
-      updateData.montantTVA = Math.round((montant - ht) * 100) / 100
+      // Revue du 2026-11-01 — TVA = TTC − HT arrondi : arrondis séparément,
+      // 24,99 € à 20 % donnaient 20,82 + 4,16 = 24,98 € (FEC déséquilibré).
+      const ht = versCentimes(montant / (1 + taux / 100))
+      updateData.montantHT = ht / 100
+      updateData.montantTVA = (versCentimes(montant) - ht) / 100
     }
     if (updates.fournisseurNom !== undefined) updateData.fournisseurNom = updates.fournisseurNom
     if (updates.fournisseurId !== undefined) updateData.fournisseurId = updates.fournisseurId
@@ -208,14 +225,22 @@ export async function PATCH(request: NextRequest) {
     if (updates.numeroPiece !== undefined) updateData.numeroPiece = updates.numeroPiece
     if (updates.pjUrl !== undefined) updateData.pjUrl = updates.pjUrl || null
 
-    const depense = await prisma.depenseManuelle.update({
-      where: { id },
-      data: updateData,
+    const depense = await prisma.$transaction(async (db) => {
+      await verrouillerReglements(db, session.user.id)
+      await db.$queryRaw`SELECT id FROM depenses_manuelles WHERE id = ${id} AND user_id = ${session.user.id} FOR UPDATE`
+      const courante = await db.depenseManuelle.findFirst({ where: { id, userId: session.user.id } })
+      if (!courante) throw new ErreurReglement('Écriture introuvable. Actualisez les transactions.', 404)
+      const projection = await verifierPointageDetaille(db, session.user.id, cleMiroirReglement('depense', courante), updateData.montant ?? courante.montant, typeof updateData.paye === 'boolean' ? updateData.paye : undefined)
+      return db.depenseManuelle.update({ where: { id, userId: session.user.id }, data: { ...updateData, ...projection } })
     })
 
     invalidateKpi(session.user.id)
     return NextResponse.json(depense)
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
+      return NextResponse.json({ error: 'Cette écriture a été régénérée ou supprimée. Rechargez les transactions avant de la corriger.' }, { status: 409 })
+    }
     console.error('PATCH /api/comptabilite/depenses-manuelles error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la mise à jour', details: "Erreur interne du serveur" },
@@ -251,13 +276,19 @@ export async function DELETE(request: NextRequest) {
       )
     }
 
-    await prisma.depenseManuelle.delete({
-      where: { id: parseInt(id), userId: session.user.id },
+    await prisma.$transaction(async (db) => {
+      await verrouillerReglements(db, session.user.id)
+      await db.$queryRaw`SELECT id FROM depenses_manuelles WHERE id = ${existing.id} AND user_id = ${session.user.id} FOR UPDATE`
+      // Un dossier dont tous les versements sont annulés ne bloque plus la suppression.
+      const suivi = await suiviReglementActif(db, session.user.id, cleMiroirReglement('depense', existing))
+      if (suivi) throw new ErreurReglement('Régularisez les règlements avant de supprimer cette pièce.')
+      await db.depenseManuelle.delete({ where: { id: existing.id, userId: session.user.id } })
     })
 
     invalidateKpi(session.user.id)
     return NextResponse.json({ success: true })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('DELETE /api/comptabilite/depenses-manuelles error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la suppression', details: "Erreur interne du serveur" },

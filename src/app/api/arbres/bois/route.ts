@@ -6,15 +6,18 @@
 
 import { NextRequest, NextResponse } from "next/server"
 import prisma from "@/lib/prisma"
+import { chargerSuiviDesLignes } from "@/lib/comptabilite/suivi-ecriture"
+import { chargerSuiviCommercialVerger } from "@/lib/verger/suivi-commercial"
+import { lotVergerFige } from "@/lib/verger/sortie-stock"
+import { quantiteBois } from "@/lib/commercial/stock-types"
 import { requireAuthApi } from "@/lib/auth-utils"
-import { genererNumeroLot, m3PleinToStere, stereToM3Plein } from "@/lib/recolte/lot"
-
-// Types de production bois
-export const TYPES_PRODUCTION_BOIS = [
-  { value: "elagage", label: "Élagage" },
-  { value: "abattage", label: "Abattage" },
-  { value: "branchage", label: "Branchage" },
-]
+import { m3PleinToStere, stereToM3Plein } from "@/lib/recolte/lot"
+// Types de production bois : liste unique partagée avec l'écran (QA cmvnp0dm9).
+import { refusTypeProductionBois } from "@/lib/verger/production-bois"
+import { prixFruitApi, dateRecolteApi } from '@/lib/verger/creation-recolte'
+import { ErreurVerger } from '@/lib/verger/erreur'
+import { prochainNumeroLotVerger } from '@/lib/verger/numero-lot'
+import { verrouillerStockCommercial } from '@/lib/stocks/verrou-commercial'
 
 // DEV3 #4 — Destinations canoniques (audit Marc 2026-05-14)
 export const DESTINATIONS_BOIS = [
@@ -74,6 +77,9 @@ export async function GET(request: NextRequest) {
     const productions = await prisma.productionBois.findMany({
       where,
       include: {
+        mouvementsCommerciaux: { where: { userId, nature: { not: 'livraison' } },
+          select: { id: true, nature: true, quantite: true, unite: true, date: true, notes: true }, orderBy: { date: 'desc' } },
+        _count: { select: { mouvementsCommerciaux: { where: { userId, nature: 'livraison' } } } },
         arbre: {
           select: {
             id: true,
@@ -86,7 +92,12 @@ export async function GET(request: NextRequest) {
       orderBy: { date: "desc" },
     })
 
-    return NextResponse.json(productions)
+    const suivi = await chargerSuiviDesLignes(userId, productions.filter(p => p.statut === 'vendu').map(p => ({ id: String(p.id), source: 'ProductionBois', sourceId: p.id, factureId: p.factureId })))
+    const commercial = await chargerSuiviCommercialVerger(userId, 'bois', productions.filter(p => p.stockDisponibleCommercial != null).map(p => p.id))
+    // `figeCommercial` : seul un BL ou une facture interdit de corriger ou de
+    // supprimer le lot ; ses usages internes s'annulent un à un.
+    return NextResponse.json(productions.map(p => ({ ...p, ecriture: suivi.get(String(p.id))?.ecriture, ventesCommerciales: commercial.get(p.id) ?? [],
+      figeCommercial: lotVergerFige(quantiteBois(p), p.stockDisponibleCommercial, p.mouvementsCommerciaux, p._count.mouvementsCommerciaux) })))
   } catch (err) {
     console.error("GET /api/arbres/bois error:", err)
     return NextResponse.json(
@@ -104,115 +115,101 @@ export async function POST(request: NextRequest) {
   try {
     const userId = session!.user.id
     const body = await request.json()
+    const prixVente = prixFruitApi(body.prixVente, 'prixVente')
 
-    // Validation
-    if (!body.type) {
-      return NextResponse.json(
-        { error: "Le type de production est requis" },
-        { status: 400 }
-      )
+    // Validation. Un type hors liste n'aurait aucun libellé à afficher sur la
+    // vente ni sur la facture (QA cmvnp0dm9).
+    const refusType = refusTypeProductionBois(body.type)
+    if (refusType) {
+      return NextResponse.json({ error: refusType, champ: "type" }, { status: 400 })
     }
 
-    // Vérifier que l'arbre appartient à l'utilisateur (si spécifié)
-    let arbre: { id: number; espece: string | null; parcelleGeoId: string | null } | null = null
-    if (body.arbreId) {
-      arbre = await prisma.arbre.findFirst({
-        where: { id: body.arbreId, userId },
-        select: { id: true, espece: true, parcelleGeoId: true },
-      })
+    return await prisma.$transaction(async tx => {
+      await verrouillerStockCommercial(tx, userId)
+      // Vérifier que l'arbre appartient à l'utilisateur (si spécifié)
+      let arbre: { id: number; espece: string | null; parcelleGeoId: string | null } | null = null
+      if (body.arbreId) {
+        arbre = await tx.arbre.findFirst({
+          where: { id: body.arbreId, userId },
+          select: { id: true, espece: true, parcelleGeoId: true },
+        })
 
-      if (!arbre) {
+        if (!arbre) {
+          return NextResponse.json(
+            { error: "Arbre non trouvé" },
+            { status: 404 }
+          )
+        }
+      }
+
+      // QA 2026-07-30 — Une production d'élagage ou d'abattage était acceptée sans
+      // arbre : la ligne partait orpheline, avec un numéro de lot dégradé et une
+      // colonne « Arbre » vide, sans rien signaler à l'opérateur. L'arbre est la
+      // clé de traçabilité de ces deux opérations.
+      if (!arbre && (body.type === "elagage" || body.type === "abattage")) {
         return NextResponse.json(
-          { error: "Arbre non trouvé" },
-          { status: 404 }
+          {
+            error: "Sélectionnez l'arbre concerné : une production d'élagage ou d'abattage doit rester tracée jusqu'à l'arbre.",
+            code: "ARBRE_REQUIS",
+          },
+          { status: 422 }
         )
       }
-    }
 
-    // QA 2026-07-30 — Une production d'élagage ou d'abattage était acceptée sans
-    // arbre : la ligne partait orpheline, avec un numéro de lot dégradé et une
-    // colonne « Arbre » vide, sans rien signaler à l'opérateur. L'arbre est la
-    // clé de traçabilité de ces deux opérations.
-    if (!arbre && (body.type === "elagage" || body.type === "abattage")) {
-      return NextResponse.json(
-        {
-          error: "Sélectionnez l'arbre concerné : une production d'élagage ou d'abattage doit rester tracée jusqu'à l'arbre.",
-          code: "ARBRE_REQUIS",
-        },
-        { status: 422 }
-      )
-    }
+      const dateProd = dateRecolteApi(body.date, 'date', new Date())!
 
-    const dateProd = body.date ? new Date(body.date) : new Date()
+      // DEV3 #4 — Conversion automatique stère ↔ m³ plein
+      // Si l'utilisateur saisit l'un, on calcule l'autre.
+      let volumeM3 = body.volumeM3 != null && body.volumeM3 !== "" ? parseFloat(body.volumeM3) : null
+      let volumeStere = body.volumeStere != null && body.volumeStere !== "" ? parseFloat(body.volumeStere) : null
+      if (volumeM3 != null && volumeStere == null) volumeStere = m3PleinToStere(volumeM3)
+      if (volumeStere != null && volumeM3 == null) volumeM3 = stereToM3Plein(volumeStere)
 
-    // DEV3 #4 — Conversion automatique stère ↔ m³ plein
-    // Si l'utilisateur saisit l'un, on calcule l'autre.
-    let volumeM3 = body.volumeM3 != null && body.volumeM3 !== "" ? parseFloat(body.volumeM3) : null
-    let volumeStere = body.volumeStere != null && body.volumeStere !== "" ? parseFloat(body.volumeStere) : null
-    if (volumeM3 != null && volumeStere == null) volumeStere = m3PleinToStere(volumeM3)
-    if (volumeStere != null && volumeM3 == null) volumeM3 = stereToM3Plein(volumeStere)
+      // DEV3 #4 — Parcelle d'origine : par défaut celle de l'arbre, surchargeable
+      const parcelleId =
+        body.parcelleId !== undefined ? body.parcelleId : arbre?.parcelleGeoId ?? null
+      if (parcelleId != null && typeof parcelleId !== 'string') throw new ErreurVerger('Parcelle invalide.', 400, 'parcelleId')
+      const parcelle = parcelleId ? await tx.parcelleGeo.findFirst({ where: { id: parcelleId, userId }, select: { nom: true } }) : null
+      if (parcelleId && !parcelle) throw new ErreurVerger('Parcelle non trouvée.', 400, 'parcelleId')
 
-    // DEV3 #4 — Parcelle d'origine : par défaut celle de l'arbre, surchargeable
-    const parcelleId =
-      body.parcelleId !== undefined ? body.parcelleId : arbre?.parcelleGeoId ?? null
+      const numLot = typeof body.numLot === 'string' && body.numLot.trim()
+        ? body.numLot.trim()
+        : await prochainNumeroLotVerger(tx, userId, { date: dateProd, parcelleNom: parcelle?.nom, espece: arbre?.espece ?? body.type })
 
-    // DEV3 #4 — N° de lot auto YYYYMMDD-PARCELLE-ESPECE-NN si non fourni
-    let numLot = body.numLot || null
-    if (!numLot) {
-      const parcelleNom = parcelleId
-        ? (await prisma.parcelleGeo.findUnique({ where: { id: parcelleId }, select: { nom: true } }))?.nom
-        : null
-      const dayStart = new Date(dateProd)
-      dayStart.setHours(0, 0, 0, 0)
-      const dayEnd = new Date(dateProd)
-      dayEnd.setHours(23, 59, 59, 999)
-      const sameDayCount = await prisma.productionBois.count({
-        where: {
+      const production = await tx.productionBois.create({
+        data: {
           userId,
-          date: { gte: dayStart, lte: dayEnd },
-          ...(parcelleId ? { parcelleId } : {}),
+          arbreId: body.arbreId || null,
+          date: dateProd,
+          type: body.type,
+          volumeM3,
+          volumeStere,
+          poidsKg: body.poidsKg ? parseFloat(body.poidsKg) : null,
+          statut: "en_stock",
+          destination: body.destination || null,
+          prixVente: prixVente ?? null,
+          notes: body.notes || null,
+          // DEV3 #4
+          parcelleId,
+          numLot,
+          qualiteBois: body.qualiteBois || null,
         },
-      })
-      numLot = genererNumeroLot({
-        date: dateProd,
-        parcelleNom: parcelleNom ?? null,
-        espece: arbre?.espece ?? body.type,
-        numeroSequence: sameDayCount + 1,
-      })
-    }
-
-    const production = await prisma.productionBois.create({
-      data: {
-        userId,
-        arbreId: body.arbreId || null,
-        date: dateProd,
-        type: body.type,
-        volumeM3,
-        volumeStere,
-        poidsKg: body.poidsKg ? parseFloat(body.poidsKg) : null,
-        statut: "en_stock",
-        destination: body.destination || null,
-        prixVente: body.prixVente ? parseFloat(body.prixVente) : null,
-        notes: body.notes || null,
-        // DEV3 #4
-        parcelleId,
-        numLot,
-        qualiteBois: body.qualiteBois || null,
-      },
-      include: {
-        arbre: {
-          select: {
-            id: true,
-            nom: true,
-            type: true,
+        include: {
+          arbre: {
+            select: {
+              id: true,
+              nom: true,
+              type: true,
+            },
           },
+          parcelle: { select: { id: true, nom: true } },
         },
-        parcelle: { select: { id: true, nom: true } },
-      },
-    })
+      })
 
-    return NextResponse.json(production, { status: 201 })
+      return NextResponse.json(production, { status: 201 })
+    })
   } catch (err) {
+    if (err instanceof ErreurVerger) return NextResponse.json({ error: err.message, champ: err.champ }, { status: err.status })
     console.error("POST /api/arbres/bois error:", err)
     return NextResponse.json(
       { error: "Erreur lors de la création de la production de bois" },

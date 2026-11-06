@@ -8,10 +8,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import { ESPECE_TYPES_VERGER } from '@/lib/validations/espece'
 import prisma from '@/lib/prisma'
 import { createEspeceSchema } from '@/lib/validations'
-import { visibiliteReferentiel, attributionCreation } from '@/lib/referentiel-communaute'
+import { visibiliteReferentiel, attributionCreation, masquerEntree } from '@/lib/referentiel-communaute'
 import { Prisma } from '@prisma/client'
-import { requireAuthApi, requireAdminApi } from '@/lib/auth-utils'
+import { requireAuthApi } from '@/lib/auth-utils'
 import { displayReferentielName, normalizeReferentielKey } from '@/lib/normalize'
+import { sansChamps } from '@/lib/sans-champs'
 import { statsAvisPourRefs } from '@/lib/avis/stats-liste'
 import { appliquerSurcharges, chargerSurchargesRendement } from '@/lib/recolte/rendement-effectif'
 import { isAvisFiltre, retenuParAvis, whereZoneCultivable } from '@/lib/especes/filtres'
@@ -168,7 +169,9 @@ export async function GET(request: NextRequest) {
           famille: true,
           _count: {
             select: {
-              varietes: true,
+              // Variétés que le compte voit : le total brut comptait aussi les
+              // variétés privées des autres comptes.
+              varietes: { where: visibiliteReferentiel(me) },
               cultures: { where: cultureCountWhere },
             },
           },
@@ -197,7 +200,7 @@ export async function GET(request: NextRequest) {
     const data = appliquerSurcharges(
       avecAvis,
       await chargerSurchargesRendement(me, avecAvis.map((e) => e.id)),
-    )
+    ).map((e) => masquerEntree(e, me))
 
     return NextResponse.json({
       data,
@@ -291,7 +294,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Création : officiel → id = nom lisible ; perso → id omis → cuid (@default).
-    const { id: _nomBrut, ...rest } = data
+    const rest = sansChamps(data, 'id')
     const espece = await prisma.espece.create({
       data: {
         ...rest,
@@ -309,7 +312,7 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     console.error('POST /api/especes error:', error)
     return NextResponse.json(
-      { error: 'Erreur lors de la création de l\'espece' },
+      { error: 'Erreur lors de la création de l\'espèce' },
       { status: 500 }
     )
   }

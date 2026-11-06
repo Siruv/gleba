@@ -1,3 +1,5 @@
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
 /**
  * API Abattages
  * GET /api/elevage/abattages - Liste des abattages
@@ -14,6 +16,81 @@ import { createVenteFromAbattage, deleteAutoEntry } from '@/lib/auto-compta'
 import { invalidateKpi } from '@/lib/kpi'
 import { creerFacture, annulerFactureLiee } from '@/lib/facture-utils'
 import { abattageSchema } from '@/lib/validations/elevage-abattage'
+import { reconstituerEffectifsLots } from '@/lib/elevage/effectif'
+import { Prisma } from '@prisma/client'
+import { ErreurElevage } from '@/lib/elevage/erreurs'
+import { verifierAttenteViande } from '@/lib/elevage/attente-viande'
+import { JOUR_SEUL } from '@/lib/elevage/date-soin'
+import { jourCivilStocke } from '@/lib/jour-civil'
+import { modePaiementDepuisReglement } from '@/lib/validations/reglement'
+
+const LOT_ABATTAGE_SELECT = {
+  id: true,
+  quantiteActuelle: true,
+  quantiteInitiale: true,
+  statut: true,
+  nom: true,
+} satisfies Prisma.LotAnimauxSelect
+type LotAbattage = Prisma.LotAnimauxGetPayload<{ select: typeof LOT_ABATTAGE_SELECT }>
+
+/** Champs scalaires d'un abattage modifiables par le PATCH. */
+type AbattageModif = {
+  date?: Date
+  quantite?: number
+  poidsVif?: number | null
+  poidsCarcasse?: number | null
+  destination?: string
+  prixVente?: number | null
+  lieu?: string | null
+  nEtablissementDestination?: string | null
+  notes?: string | null
+  factureId?: number | null
+}
+
+/**
+ * Part collective reconstituée d'un lot (`effectifCollectif` : effectif de
+ * l'écran Lots moins les fiches actives rattachées) et nombre de ces fiches.
+ * Revue 2026-10-20 — c'est elle qu'un abattage de lot entame, et non le
+ * compteur stocké `quantiteActuelle`, qui dérive (la mort d'une fiche rattachée
+ * ne le décrémente pas : lot démo 71, 5 contre 4). Une fiche s'abat par son
+ * propre parcours (`animalId`), que les appelants ne plafonnent pas.
+ */
+async function partCollectiveLot(
+  userId: string,
+  lot: LotAbattage,
+  db: Prisma.TransactionClient = prisma,
+): Promise<{ collectif: number; fiches: number }> {
+  const effectif = (await reconstituerEffectifsLots(userId, [lot], db)).get(lot.id)
+  return {
+    collectif: effectif?.effectifCollectif ?? lot.quantiteActuelle,
+    fiches: effectif?.nominatifsActifs ?? 0,
+  }
+}
+
+/**
+ * Refus 422 `ABATTAGE_OVER_EFFECTIF` : `quantite` dépasse les `collectif` têtes
+ * disponibles pour cet abattage. Corps unique du POST et du PATCH (feedback
+ * Marc 2026-05-16, V3 Bug 6 : 500 poules abattues sur un lot de 30).
+ */
+function refusAbattageHorsEffectif(
+  lot: LotAbattage,
+  quantite: number,
+  collectif: number,
+  fiches: number,
+): ErreurElevage {
+  const tetes = `${collectif} tête${collectif > 1 ? 's' : ''} collective${collectif > 1 ? 's' : ''} présente${collectif > 1 ? 's' : ''} dans le lot`
+  const nomLot = lot.nom || `Lot #${lot.id}`
+  return new ErreurElevage('Abattage incohérent', 422, 'ABATTAGE_OVER_EFFECTIF', {
+    quantite,
+    effectifActuel: collectif,
+    effectifCollectif: collectif,
+    nominatifsActifs: fiches,
+    effectifInitial: lot.quantiteInitiale,
+    lotNom: lot.nom,
+    statut: lot.statut,
+    message: `${tetes} « ${nomLot} »${lot.statut === 'termine' ? ' (statut terminé)' : ''} : impossible d'en abattre ${quantite}.${fiches > 1 ? ` Les ${fiches} fiches nominatives rattachées au lot s'abattent depuis leur fiche.` : fiches === 1 ? " La fiche nominative rattachée au lot s'abat depuis sa fiche." : ''}`,
+  })
+}
 
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
@@ -28,14 +105,14 @@ export async function GET(request: NextRequest) {
     // Revue 2026-09-28 : `annee=all` pour la liste de gestion d'un historique.
     const { annee, bornes } = lireAnnee(searchParams)
 
-    const where: any = { userId: session.user.id, annule: { not: true } }
-    if (bornes) where.date = { ...bornes }
-    if (destination) where.destination = destination
-    if (dateDebut || dateFin) {
-      where.date = where.date ?? {}
-      if (dateDebut) where.date.gte = new Date(dateDebut)
-      if (dateFin) where.date.lte = new Date(dateFin)
+    const where: Prisma.AbattageWhereInput = { userId: session.user.id, annule: { not: true } }
+    if (bornes || dateDebut || dateFin) {
+      const date: Prisma.DateTimeFilter = bornes ? { ...bornes } : {}
+      if (dateDebut) date.gte = new Date(dateDebut)
+      if (dateFin) date.lte = new Date(dateFin)
+      where.date = date
     }
+    if (destination) where.destination = destination
 
     const abattages = await prisma.abattage.findMany({
       where,
@@ -70,6 +147,7 @@ export async function GET(request: NextRequest) {
       meta: { year: annee, total: abattages.length },
     })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('GET /api/elevage/abattages error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la récupération', details: "Erreur interne du serveur" },
@@ -96,81 +174,29 @@ export async function POST(request: NextRequest) {
     const dateAbattage = date || new Date()
     const overrideCoherence = (body as { overrideCoherence?: boolean })?.overrideCoherence === true
 
-    // Feedback Marc 2026-05-16 — V3 Bug 6 : on autorisait l'abattage
-    // de 500 poules sur un lot qui en comptait 30. On bloque désormais
-    // toute saisie dépassant l'effectif actuel (avec override possible).
-    if (lotId && quantite) {
-      const lot = await prisma.lotAnimaux.findFirst({
-        where: { id: lotId, userId: session.user.id },
-        select: { quantiteActuelle: true, quantiteInitiale: true, statut: true, nom: true },
-      })
-      if (!lot) {
-        return NextResponse.json({ error: 'Lot introuvable' }, { status: 404 })
-      }
-      if (!overrideCoherence && quantite > lot.quantiteActuelle) {
-        return NextResponse.json(
-          {
-            error: 'Abattage incohérent',
-            code: 'ABATTAGE_OVER_EFFECTIF',
-            details: {
-              quantite,
-              effectifActuel: lot.quantiteActuelle,
-              effectifInitial: lot.quantiteInitiale,
-              lotNom: lot.nom,
-              statut: lot.statut,
-              message: `Le lot « ${lot.nom} » compte ${lot.quantiteActuelle} animaux ${lot.statut === 'termine' ? '(statut terminé)' : ''} — impossible d'abattre ${quantite}. Cochez « forcer » pour corriger l'historique.`,
-            },
-          },
-          { status: 422 }
-        )
-      }
-    }
-
-    // Revue élevage 2026-07-21 — validation tenant de `animalId` (seul `lotId`
-    // l'était). Sans ce contrôle, un `animalId` d'un autre compte créait un
-    // abattage cross-tenant et la réponse (include: animal) fuitait sa fiche.
-    if (animalId) {
-      const animal = await prisma.animal.findFirst({
-        where: { id: animalId, userId: session.user.id },
-        select: { id: true },
-      })
-      if (!animal) {
-        return NextResponse.json({ error: 'Animal introuvable' }, { status: 404 })
-      }
-    }
-
-    // PROMPT 19B §8 — Blocage si soin en temps d'attente viande actif
-    // POSTREVIEW Sprint 5 — Filtre `fait: true` ajouté : un soin prévu mais
-    // non administré ne devrait pas bloquer ; le calcul `finAttenteViande`
-    // n'est valide que pour les soins effectivement réalisés.
-    const cibleFilters: any[] = []
-    if (animalId) cibleFilters.push({ animalId })
-    if (lotId) cibleFilters.push({ lotId })
-    const soinsAttenteViande = cibleFilters.length === 0 ? [] : await prisma.soinAnimal.findMany({
-      where: {
-        userId: session.user.id,
-        fait: true,
-        OR: cibleFilters,
-        finAttenteViande: { gte: dateAbattage },
-        date: { lte: dateAbattage },
-      },
-      include: { produitVeterinaire: { select: { nom: true } } },
-    })
-    if (soinsAttenteViande.length > 0) {
-      const details = soinsAttenteViande
-        .map((s) => `${s.produit || s.produitVeterinaire?.nom || s.type} (lève le ${s.finAttenteViande?.toLocaleDateString('fr-FR')})`)
-        .join(', ')
-      return NextResponse.json(
-        {
-          error: 'Abattage interdit : animal en temps d\'attente vétérinaire',
-          details: `Traitement(s) en cours : ${details}. Reportez l'abattage après la fin du temps d'attente viande.`,
-        },
-        { status: 409 }
-      )
-    }
-
     // Transaction pour mettre à jour l'animal/lot
     const abattage = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
+      // Toutes les gardes autoritatives précèdent les écritures, sous le même
+      // mutex que les ventes et les autres modifications du cheptel.
+      if (animalId) {
+        if (quantite !== 1) throw new ErreurElevage('Un abattage individuel porte sur un seul animal.', 400)
+        await tx.$queryRaw`SELECT id FROM animaux WHERE id = ${animalId} AND user_id = ${session.user.id} FOR UPDATE`
+        const animal = await tx.animal.findFirst({ where: { id: animalId, userId: session.user.id } })
+        if (!animal) throw new ErreurElevage('Animal introuvable', 404)
+        if (animal.statut !== 'actif') throw new ErreurElevage("Cet animal n'est plus actif. Rechargez le cheptel.")
+        if (lotId && animal.lotId !== lotId) throw new ErreurElevage("Cet animal n'appartient pas au lot indiqué.", 400)
+      }
+      if (lotId) {
+        await tx.$queryRaw`SELECT id FROM lots_animaux WHERE id = ${lotId} AND user_id = ${session.user.id} FOR UPDATE`
+        const lot = await tx.lotAnimaux.findFirst({ where: { id: lotId, userId: session.user.id }, select: LOT_ABATTAGE_SELECT })
+        if (!lot) throw new ErreurElevage('Lot introuvable', 404)
+        if (!overrideCoherence && !animalId) {
+          const { collectif, fiches } = await partCollectiveLot(session.user.id, lot, tx)
+          if (quantite > collectif) throw refusAbattageHorsEffectif(lot, quantite, collectif, fiches)
+        }
+      }
+      await verifierAttenteViande(tx, session.user.id, { animalId: animalId ?? null, lotId: lotId ?? null, date: dateAbattage })
       // Créer l'abattage
       const newAbattage = await tx.abattage.create({
         data: {
@@ -245,6 +271,8 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ data: abattage }, { status: 201 })
   } catch (error) {
+    if (error instanceof ErreurElevage) return NextResponse.json({ error: error.message, code: error.code, details: error.details }, { status: error.status })
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('POST /api/elevage/abattages error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la création', details: "Erreur interne du serveur" },
@@ -260,6 +288,7 @@ export async function PATCH(request: NextRequest) {
   try {
     const body = await request.json()
     const { id, date, quantite, poidsVif, poidsCarcasse, destination, prixVente, lieu, nEtablissementDestination, notes } = body
+    const overrideCoherence = (body as { overrideCoherence?: boolean })?.overrideCoherence === true
     const userId = session.user.id
 
     if (!id) {
@@ -288,11 +317,14 @@ export async function PATCH(request: NextRequest) {
     }
 
     // Audit #94 : gardes NaN / date invalide (le PATCH n'était pas validé).
-    const updateData: any = {}
+    const updateData: AbattageModif = {}
     if (date !== undefined) {
       const d = new Date(date)
       if (Number.isNaN(d.getTime())) return NextResponse.json({ error: 'Date invalide' }, { status: 400 })
-      updateData.date = d
+      // Le formulaire renvoie le jour seul affiché : le jour civil de l'abattage
+      // n'est pas une nouvelle date (heure d'un abattage horodaté conservée).
+      const memeJour = typeof date === 'string' && JOUR_SEUL.test(date.trim()) && date.trim() === jourCivilStocke(existing.date)
+      if (!memeJour) updateData.date = d
     }
     if (quantite !== undefined) {
       const q = parseInt(quantite)
@@ -311,12 +343,6 @@ export async function PATCH(request: NextRequest) {
     }
     if (notes !== undefined) updateData.notes = notes
 
-    const doitAnnulerFacture =
-      existing.factureId &&
-      destination !== undefined &&
-      destination !== 'vente' &&
-      existing.destination === 'vente'
-
     // Anti-double-facture : un abattage déjà facturé ne peut pas générer
     // une seconde facture (l'ancienne resterait comptée dans KPI/TVA/FEC).
     if (body.creerFacture && existing.factureId) {
@@ -327,22 +353,47 @@ export async function PATCH(request: NextRequest) {
     }
 
     // Transaction atomique : facture + update abattage + ajustement lot
-    const mutation = await prisma.$transaction(async (tx) => {
-      // Dé-vente d'un abattage facturé : facture, source et miroir doivent
-      // basculer ensemble. Une panne ne peut plus laisser une facture annulée
-      // alors que l'abattage reste encore compté comme vente.
-      if (doitAnnulerFacture && existing.factureId) {
-        const liee = await annulerFactureLiee(tx, userId, existing.factureId)
-        if (!liee.ok) return { ok: false as const, raison: liee.raison }
-        updateData.factureId = null
+    const abattage = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
+      await tx.$queryRaw`SELECT id FROM abattages WHERE id = ${existing.id} AND user_id = ${userId} FOR UPDATE`
+      const courante = await tx.abattage.findFirst({ where: { id: existing.id, userId } })
+      if (!courante || Object.entries(courante).some(([champ, valeur]) => {
+        const avant = existing[champ as keyof typeof existing]
+        return valeur instanceof Date && avant instanceof Date ? valeur.getTime() !== avant.getTime() : valeur !== avant
+      })) throw new ErreurElevage('Cet abattage a changé. Rechargez la liste avant de le modifier.')
+      if (courante.annule) throw new ErreurElevage('Abattage annulé : modification impossible.')
+      if (courante.factureId && ['date', 'quantite', 'prixVente', 'destination'].some((champ) => {
+        const valeur = updateData[champ as keyof AbattageModif]
+        const avant = courante[champ as keyof typeof courante]
+        return valeur !== undefined && (valeur instanceof Date && avant instanceof Date ? valeur.getTime() !== avant.getTime() : valeur !== avant)
+      })) throw new ErreurElevage('Cet abattage est facturé. Annulez la vente avec sa facture ou établissez un avoir pour le corriger.')
+      if (courante.animalId && updateData.quantite !== undefined && updateData.quantite !== 1) {
+        throw new ErreurElevage('Un abattage individuel porte sur un seul animal.', 400)
       }
-
+      if (!overrideCoherence && !courante.animalId && courante.lotId && updateData.quantite !== undefined && updateData.quantite > courante.quantite) {
+        const lot = await tx.lotAnimaux.findFirst({ where: { id: courante.lotId, userId }, select: LOT_ABATTAGE_SELECT })
+        if (!lot) throw new ErreurElevage('Lot introuvable', 404)
+        const { collectif, fiches } = await partCollectiveLot(userId, lot, tx)
+        if (updateData.quantite > collectif + courante.quantite) throw refusAbattageHorsEffectif(lot, updateData.quantite, collectif + courante.quantite, fiches)
+      }
+      // Attente viande rejouée seulement si la date change (l'animal et le lot
+      // ne se modifient pas ici) : un soin saisi après coup ne bloque pas la
+      // correction d'un poids, d'un prix ou d'une note.
+      if (updateData.date && updateData.date.getTime() !== courante.date.getTime()) {
+        await verifierAttenteViande(tx, userId, { animalId: courante.animalId, lotId: courante.lotId, date: updateData.date })
+      }
       // Créer une facture si demandé et si prixVente existe
-      if (body.creerFacture && (updateData.prixVente || existing.prixVente)) {
-        const prixTotalTTC = updateData.prixVente || existing.prixVente
-        const tva = body.tauxTVA ? parseFloat(body.tauxTVA) : 5.5
+      const prixTotalTTC = updateData.prixVente !== undefined ? updateData.prixVente : existing.prixVente
+      if (body.creerFacture && prixTotalTTC) {
+        const tva = body.tauxTVA !== undefined ? Number(body.tauxTVA) : 5.5
+        if (!Number.isFinite(tva) || tva < 0 || tva > 100) throw new ErreurElevage('TVA invalide', 400)
         const totalHT = prixTotalTTC / (1 + tva / 100)
         const totalTVA = prixTotalTTC - totalHT
+        // La facture suit le pointage du miroir. Sans pointage contraire, la
+        // vente d'abattage est présumée réglée, comme avant le 2026-10-28
+        // (décision du 2026-10-30) ; aucun mode n'est inventé.
+        const suivi = await tx.venteManuelle.findFirst({ where: { userId, auto: true, sourceType: 'abattage', sourceId: existing.id }, select: { paye: true, modeReglement: true } })
+        const reglee = suivi?.paye !== false
 
         const animalInfo = existing.animal?.nom || existing.lot?.nom || 'Abattage'
         const quantiteAbattue = updateData.quantite !== undefined ? updateData.quantite : existing.quantite
@@ -352,14 +403,14 @@ export async function PATCH(request: NextRequest) {
           // POSTREVIEW — 'abattage' cassait PDF + FEC ; mettre 'facture'
           type: 'facture',
           clientNom: 'Client vente abattage',
-          date: existing.date,
+          date: updateData.date ?? existing.date,
           objet: `Vente abattage - ${animalInfo}`,
           totalHT,
           totalTVA,
           totalTTC: prixTotalTTC,
-          statut: 'payee',
-          datePaiement: new Date(),
-          modePaiement: body.modePaiement || 'especes',
+          statut: reglee ? 'payee' : 'emise',
+          datePaiement: reglee ? new Date() : null,
+          modePaiement: modePaiementDepuisReglement(suivi?.modeReglement),
           lignes: [{
             description: animalInfo,
             quantite: quantiteAbattue,
@@ -419,16 +470,14 @@ export async function PATCH(request: NextRequest) {
         lot: updated.lot ? { nom: updated.lot.nom } : null,
         factureId: updated.factureId,
       }, tx)
-      return { ok: true as const, data: updated }
+      return updated
     })
-    if (!mutation.ok) {
-      return NextResponse.json({ error: mutation.raison }, { status: 409 })
-    }
-    const abattage = mutation.data
     invalidateKpi(userId)
 
     return NextResponse.json({ data: abattage })
   } catch (error) {
+    if (error instanceof ErreurElevage) return NextResponse.json({ error: error.message, code: error.code, details: error.details }, { status: error.status })
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('PATCH /api/elevage/abattages error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la mise à jour', details: "Erreur interne du serveur" },
@@ -465,36 +514,40 @@ export async function DELETE(request: NextRequest) {
     // du POST (symétrie déjà appliquée au stock aliment) : avant, annuler un
     // abattage laissait l'animal en statut 'abattu' et le lot décrémenté.
     const annulation = await prisma.$transaction(async (tx) => {
-      if (existing.factureId) {
-        const liee = await annulerFactureLiee(tx, session.user.id, existing.factureId)
+      await verrouillerReglements(tx, session!.user.id)
+      await tx.$queryRaw`SELECT id FROM abattages WHERE id = ${existing.id} AND user_id = ${session.user.id} FOR UPDATE`
+      const courante = await tx.abattage.findFirst({ where: { id: existing.id, userId: session.user.id } })
+      if (!courante || courante.annule) throw new ErreurElevage('Abattage déjà annulé ou introuvable. Rechargez la liste.')
+      if (courante.factureId) {
+        const liee = await annulerFactureLiee(tx, session.user.id, courante.factureId)
         if (!liee.ok) return liee
       }
-      await deleteAutoEntry('abattage', existing.id, 'vente', session.user.id, tx)
+      await deleteAutoEntry('abattage', courante.id, 'vente', session.user.id, tx)
 
       // Soft-delete : marquer comme annule
       await tx.abattage.update({
-        where: { id: existing.id },
+        where: { id: courante.id },
         data: { annule: true, dateAnnulation: new Date() },
       })
 
       // Restaurer l'animal individuel (uniquement si c'est bien cet abattage
       // qui l'avait sorti — on ne touche pas à un animal mort/vendu depuis).
-      if (existing.animalId) {
+      if (courante.animalId) {
         await tx.animal.updateMany({
-          where: { id: existing.animalId, userId: session.user.id, statut: 'abattu' },
+          where: { id: courante.animalId, userId: session.user.id, statut: 'abattu' },
           data: { statut: 'actif', dateSortie: null, causeSortie: null },
         })
       }
 
       // Ré-incrémenter l'effectif du lot et le réactiver s'il avait été
       // clôturé par cet abattage.
-      if (existing.lotId && existing.quantite) {
+      if (courante.lotId && courante.quantite) {
         const lot = await tx.lotAnimaux.findFirst({
-          where: { id: existing.lotId, userId: session.user.id },
+          where: { id: courante.lotId, userId: session.user.id },
           select: { id: true, quantiteActuelle: true, statut: true },
         })
         if (lot) {
-          const nouvelleQuantite = lot.quantiteActuelle + existing.quantite
+          const nouvelleQuantite = lot.quantiteActuelle + courante.quantite
           await tx.lotAnimaux.update({
             where: { id: lot.id },
             data: {
@@ -513,6 +566,8 @@ export async function DELETE(request: NextRequest) {
 
     return NextResponse.json({ success: true })
   } catch (error) {
+    if (error instanceof ErreurElevage) return NextResponse.json({ error: error.message, code: error.code, details: error.details }, { status: error.status })
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('DELETE /api/elevage/abattages error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la suppression', details: "Erreur interne du serveur" },

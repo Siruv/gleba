@@ -1,3 +1,5 @@
+import { verrouillerReglements } from '@/lib/comptabilite/verrou-reglements'
+import { ErreurReglement } from '@/lib/comptabilite/monnaie'
 /**
  * API Lots d'animaux
  * GET /api/elevage/lots - Liste des lots
@@ -9,13 +11,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
+import { Prisma } from '@prisma/client'
 import { lotSchema } from '@/lib/validations/elevage-lot'
 import { deleteAutoEntry, createDepenseFromLotAnimaux } from '@/lib/auto-compta'
 import { isPlausibleAnimalDate } from '@/lib/validations/elevage-animal'
 import { enregistrerChangementLot, isOwnedParcelle } from '@/lib/elevage/animal-lot'
 import { reconstituerEffectifsLots } from '@/lib/elevage/effectif'
+import { calculerTetesNonPondeuses, effectifPondeuses, estEspecePondeuse } from '@/lib/elevage/pondeuses'
 import { createDepenseFromAchatAnimal } from '@/lib/auto-compta'
 import { invalidateKpi } from '@/lib/kpi'
+import { especeAnimaleAccessible } from '@/lib/elevage/espece-accessible'
+import { MOTIF_MISE_EN_PLACE_LOT, MOTIF_MODIFICATION_FICHE_LOT, MOTIFS_MOUVEMENTS_AUTOMATIQUES_LOT, messageRefusSuppressionLot } from '@/lib/elevage/traces-lot'
 
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
@@ -26,7 +32,7 @@ export async function GET(request: NextRequest) {
     const especeAnimaleId = searchParams.get('especeAnimaleId')
     const statut = searchParams.get('statut')
 
-    const where: any = { userId: session.user.id }
+    const where: Prisma.LotAnimauxWhereInput = { userId: session.user.id }
     if (especeAnimaleId) where.especeAnimaleId = especeAnimaleId
     if (statut) where.statut = statut
 
@@ -43,6 +49,7 @@ export async function GET(request: NextRequest) {
             production: true,
             productions: true,
             couleur: true,
+            dureeElevage: true,
           },
         },
         parcelleGeo: {
@@ -64,20 +71,34 @@ export async function GET(request: NextRequest) {
     // abattages, plafonné par le compteur stocké) via le helper partagé avec
     // GET /stats, pour que les deux surfaces ne divergent plus.
     const effectifs = await reconstituerEffectifsLots(session.user.id, lots)
+    // QA cmv5jfsol — effectif pondeur (sans les jeunes nés dans le lot ni les
+    // fiches mâles) pour la saisie de ponte ; null hors espèces pondeuses.
+    const lotsPondeurs = lots.filter((l) => estEspecePondeuse(l.especeAnimale.production))
+    const tetesNonPondeuses = await calculerTetesNonPondeuses(session.user.id, lotsPondeurs)
+    const idsPondeurs = new Set(lotsPondeurs.map((l) => l.id))
 
     const enriched = lots.map(l => {
       const e = effectifs.get(l.id)
       return {
         ...l,
+        effectifPondeuses: idsPondeurs.has(l.id)
+          ? effectifPondeuses(e?.effectifCalcule ?? l.quantiteActuelle, tetesNonPondeuses.get(l.id))
+          : null,
         naissancesVivantes: e?.naissancesVivantes ?? 0,
         abattagesTotal: e?.abattagesTotal ?? 0,
         // Effectif reconstitué pour corriger les compteurs historiques dérivés.
         effectifCalcule: e?.effectifCalcule ?? l.quantiteActuelle,
+        // Revue 2026-10-20 — fiches actives rattachées et part collective
+        // (têtes anonymes, plafond d'un abattage de lot) : l'écran les lit ici
+        // au lieu de recalculer.
+        nominatifsActifs: e?.nominatifsActifs ?? 0,
+        effectifCollectif: e?.effectifCollectif ?? l.quantiteActuelle,
       }
     })
 
     return NextResponse.json({ data: enriched })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('GET /api/elevage/lots error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la récupération des lots', details: "Erreur interne du serveur" },
@@ -102,18 +123,21 @@ export async function POST(request: NextRequest) {
 
     const { especeAnimaleId, nom, dateArrivee, quantiteInitiale, provenance, prixAchatTotal, notes, parcelleGeoId } = parsed.data
 
-    // Vérifier que l'espece animale existe
-    const espece = await prisma.especeAnimale.findUnique({
-      where: { id: especeAnimaleId },
-    })
-    if (!espece) {
+    // L'espèce doit exister ET être visible du compte (catalogue, communauté
+    // ou fiche perso) : même règle que les animaux.
+    if (!await especeAnimaleAccessible(session.user.id, especeAnimaleId)) {
       return NextResponse.json(
-        { error: `Espèce animale "${especeAnimaleId}" introuvable` },
+        { error: `Espèce animale "${especeAnimaleId}" introuvable`, champ: 'especeAnimaleId' },
         { status: 400 }
       )
     }
+    // La parcelle aussi, comme au PATCH : le POST l'écrivait sans contrôle.
+    if (parcelleGeoId && !await isOwnedParcelle(session.user.id, parcelleGeoId)) {
+      return NextResponse.json({ error: 'Parcelle invalide', champ: 'parcelleGeoId' }, { status: 400 })
+    }
 
     const lot = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
       const created = await tx.lotAnimaux.create({
         data: {
           userId: session.user.id,
@@ -143,7 +167,7 @@ export async function POST(request: NextRequest) {
             parcelleAvantId: null,
             parcelleApresId: created.parcelleGeoId,
             date: created.dateArrivee ?? new Date(),
-            motif: 'Mise en place du lot',
+            motif: MOTIF_MISE_EN_PLACE_LOT,
           },
         })
       }
@@ -154,6 +178,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ data: lot }, { status: 201 })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('POST /api/elevage/lots error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la création', details: "Erreur interne du serveur" },
@@ -182,15 +207,27 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json({ error: 'Lot non trouvé' }, { status: 404 })
     }
 
-    const updateData: any = {}
+    // Les quantités sont relues pour la garde de clôture : des nombres, pas des
+    // opérations Prisma (`increment`…).
+    const updateData: Prisma.LotAnimauxUncheckedUpdateInput & {
+      quantiteInitiale?: number
+      quantiteActuelle?: number
+    } = {}
     // Revue élevage 2026-07-21 — le PATCH n'appliquait qu'un sous-ensemble de
     // champs : nom / espèce / dateArrivée / quantité initiale / provenance /
     // prixAchatTotal étaient ignorés en silence (200 trompeur), et la dépense
     // d'achat auto n'était jamais resynchronisée. On applique tout + resync.
     if (nom !== undefined) updateData.nom = nom || null
     if (especeAnimaleId !== undefined && especeAnimaleId) {
-      const espece = await prisma.especeAnimale.findUnique({ where: { id: especeAnimaleId } })
-      if (!espece) return NextResponse.json({ error: `Espèce animale "${especeAnimaleId}" introuvable` }, { status: 400 })
+      if (
+        especeAnimaleId !== existing.especeAnimaleId &&
+        (typeof especeAnimaleId !== 'string' || !await especeAnimaleAccessible(session.user.id, especeAnimaleId))
+      ) {
+        return NextResponse.json(
+          { error: `Espèce animale "${especeAnimaleId}" introuvable`, champ: 'especeAnimaleId' },
+          { status: 400 }
+        )
+      }
       updateData.especeAnimaleId = especeAnimaleId
     }
     if (dateArrivee !== undefined) {
@@ -274,6 +311,7 @@ export async function PATCH(request: NextRequest) {
     if (parcelleGeoId !== undefined) updateData.parcelleGeoId = parcelleGeoId || null
 
     const lot = await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
       const updated = await tx.lotAnimaux.update({
         where: { id: parseInt(id) },
         data: updateData,
@@ -284,7 +322,7 @@ export async function PATCH(request: NextRequest) {
           data: {
             userId: session.user.id, lotId: existing.id,
             parcelleAvantId: existing.parcelleGeoId, parcelleApresId: updated.parcelleGeoId,
-            date: new Date(), motif: 'Modification de la fiche lot',
+            date: new Date(), motif: MOTIF_MODIFICATION_FICHE_LOT,
           },
         })
       }
@@ -321,6 +359,7 @@ export async function PATCH(request: NextRequest) {
 
     return NextResponse.json({ data: lot })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('PATCH /api/elevage/lots error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la mise à jour', details: "Erreur interne du serveur" },
@@ -349,9 +388,12 @@ export async function DELETE(request: NextRequest) {
             animaux: true,
             abattages: true,
             productionsOeufs: true,
+            productionsRuche: true,
+            collectesLait: true,
             soins: true,
             consommations: true,
             naissances: true,
+            statutsSanitairesStructures: true,
           },
         },
       },
@@ -367,14 +409,32 @@ export async function DELETE(request: NextRequest) {
     // vendus ou abattus restait insupprimable (« lié à 12 animaux »), sans
     // piste pour s'en sortir. Les animaux SORTIS ne bloquent plus : ils gardent
     // leur fiche et leur historique, seul le rattachement au lot disparaît.
-    // Les animaux présents, eux, se retirent d'abord du lot ; et un lot qui
-    // porte des soins, naissances ou consommations reste au registre.
+    // Les animaux présents, eux, se retirent d'abord du lot.
+    //
+    // 2026-10-23 (motif « suppressions », ouvert depuis le 2026-10-08) : la
+    // garde des soins, naissances et consommations ne valait que pour un lot
+    // qui avait eu des fiches nominatives. Un lot collectif (volailles, cas
+    // courant) se supprimait en EFFAÇANT ses soins et consommations, en
+    // détruisant en cascade ses mouvements de pâturage et statuts sanitaires,
+    // et en détachant ses collectes de lait et productions de ruche : le
+    // registre d'élevage perdait l'historique. Même règle que l'animal
+    // (`compterTracesAnimal`) : un lot se supprime seulement s'il ne porte
+    // AUCUNE saisie ; un lot réel qui s'arrête se clôture. Ne comptent pas les
+    // mouvements que la fiche du lot écrit d'elle-même (création, correction
+    // de parcelle : `MOTIFS_MOUVEMENTS_AUTOMATIQUES_LOT`).
     const deps = existing._count
     const lotIdNum = parseInt(id)
-    const animauxPresents = deps.animaux > 0
-      ? await prisma.animal.count({ where: { userId: session.user.id, lotId: lotIdNum, statut: 'actif' } })
-      : 0
+    const [animauxPresents, mouvementsTous, mouvementsAuto] = await Promise.all([
+      deps.animaux > 0
+        ? prisma.animal.count({ where: { userId: session.user.id, lotId: lotIdNum, statut: 'actif' } })
+        : Promise.resolve(0),
+      prisma.mouvementCheptel.count({ where: { userId: session.user.id, lotId: lotIdNum } }),
+      prisma.mouvementCheptel.count({
+        where: { userId: session.user.id, lotId: lotIdNum, motif: { in: MOTIFS_MOUVEMENTS_AUTOMATIQUES_LOT } },
+      }),
+    ])
     const animauxSortis = deps.animaux - animauxPresents
+    const mouvements = Math.max(0, mouvementsTous - mouvementsAuto)
     if (animauxPresents > 0) {
       return NextResponse.json(
         {
@@ -384,14 +444,19 @@ export async function DELETE(request: NextRequest) {
         { status: 409 }
       )
     }
-    if (deps.abattages > 0 || deps.productionsOeufs > 0) {
+    const productions = deps.productionsOeufs + deps.productionsRuche + deps.collectesLait
+    if (deps.abattages > 0 || productions > 0) {
       return NextResponse.json(
         {
-          error: `Ce lot porte ${deps.abattages} abattage(s) et ${deps.productionsOeufs} production(s) : il reste au registre. Clôturez-le plutôt que de le supprimer.`,
+          error: `Ce lot porte ${deps.abattages} abattage(s) et ${productions} production(s) : il reste au registre. Clôturez-le plutôt que de le supprimer.`,
           details: deps,
         },
         { status: 409 }
       )
+    }
+    const refusRegistre = messageRefusSuppressionLot({ ...deps, mouvements })
+    if (refusRegistre) {
+      return NextResponse.json({ error: refusRegistre, details: { ...deps, mouvements } }, { status: 409 })
     }
     if (animauxSortis > 0 && Number(existing.prixAchatTotal || 0) > 0) {
       return NextResponse.json(
@@ -402,17 +467,9 @@ export async function DELETE(request: NextRequest) {
         { status: 409 }
       )
     }
-    if (animauxSortis > 0 && (deps.soins > 0 || deps.consommations > 0 || deps.naissances > 0)) {
-      return NextResponse.json(
-        {
-          error: `Ce lot porte ${deps.soins} soin(s), ${deps.naissances} naissance(s) et ${deps.consommations} consommation(s) d'aliment : ils restent au registre et en comptabilité. Clôturez le lot plutôt que de le supprimer.`,
-          details: deps,
-        },
-        { status: 409 }
-      )
-    }
 
     await prisma.$transaction(async (tx) => {
+      await verrouillerReglements(tx, session!.user.id)
       if (animauxSortis > 0) {
         const dateEffet = new Date()
         const sortis = await tx.animal.findMany({
@@ -427,36 +484,10 @@ export async function DELETE(request: NextRequest) {
           await enregistrerChangementLot(tx, session.user.id, animal.id, lotIdNum, null, dateEffet, 'Suppression du lot')
         }
       }
-      // Auto-compta : purger les écritures auto des consommations et soins du
-      // lot AVANT leur suppression en masse (sinon les DepenseManuelle auto
-      // resteraient orphelines).
-      const [consosLot, soinsLot] = await Promise.all([
-        tx.consommationAliment.findMany({
-          where: { lotId: parseInt(id), userId: session.user.id },
-          select: { id: true },
-        }),
-        tx.soinAnimal.findMany({
-          where: { lotId: parseInt(id), userId: session.user.id },
-          select: { id: true },
-        }),
-      ])
-      if (consosLot.length > 0) {
-        await tx.depenseManuelle.deleteMany({
-          where: { userId: session.user.id, sourceType: 'consommation_aliment', sourceId: { in: consosLot.map((c) => c.id) }, auto: true },
-        })
-      }
-      if (soinsLot.length > 0) {
-        await tx.depenseManuelle.deleteMany({
-          where: { userId: session.user.id, sourceType: 'soin_animal', sourceId: { in: soinsLot.map((s) => s.id) }, auto: true },
-        })
-      }
-
-      await tx.consommationAliment.deleteMany({
-        where: { lotId: parseInt(id), userId: session.user.id },
-      })
-      await tx.soinAnimal.deleteMany({
-        where: { lotId: parseInt(id), userId: session.user.id },
-      })
+      // Soins et consommations : la garde ci-dessus refuse tout lot qui en
+      // porte. Plus de suppression en masse ici (2026-10-23) : une saisie
+      // arrivée entre la garde et la transaction se détache (`SetNull`) au
+      // lieu d'être effacée.
       // Bug R28 : supprimer l'écriture comptable auto de l'achat du lot.
       await deleteAutoEntry('achat_animal', existing.id, 'depense', session.user.id, tx)
       await tx.lotAnimaux.delete({ where: { id: existing.id } })
@@ -465,6 +496,7 @@ export async function DELETE(request: NextRequest) {
 
     return NextResponse.json({ success: true, deleted: parseInt(id) })
   } catch (error) {
+    if (error instanceof ErreurReglement) return NextResponse.json({ error: error.message }, { status: error.status })
     console.error('DELETE /api/elevage/lots error:', error)
     return NextResponse.json(
       { error: 'Erreur lors de la suppression', details: "Erreur interne du serveur" },

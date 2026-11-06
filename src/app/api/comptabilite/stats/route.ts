@@ -9,7 +9,9 @@ import { requireAuthApi } from '@/lib/auth-utils'
 import prisma from '@/lib/prisma'
 import { ventilerParModule } from '@/lib/comptabilite/modules'
 import { getKpiCompta } from '@/lib/kpi'
-import { construireImpayees } from '@/lib/comptabilite/impayees'
+import { bornesExerciceKpi, chargerMensuelCompta, whereDepensesComptables } from '@/lib/kpi/compta'
+import { chargerEncoursCompta } from '@/lib/comptabilite/encours'
+import { STATUTS_COMMANDES_EN_ATTENTE } from '@/lib/comptabilite/alertes'
 
 const MOIS_LABELS = ['Jan', 'Fév', 'Mar', 'Avr', 'Mai', 'Jun', 'Jul', 'Aoû', 'Sep', 'Oct', 'Nov', 'Déc']
 
@@ -38,6 +40,28 @@ const COLORS = {
   main_oeuvre: '#ec4899',
 }
 
+/** Libellés des catégories de dépenses (saisies et miroirs automatiques). */
+const LABELS_CATEGORIE_DEPENSE: Record<string, string> = {
+  semences: 'Semences et plants',
+  plants: 'Plants',
+  engrais: 'Engrais et amendements',
+  intrants: 'Intrants',
+  phyto: 'Produits phytosanitaires',
+  carburant: 'Carburant',
+  energie: 'Énergie',
+  materiel: 'Matériel',
+  petit_outillage: 'Petit outillage',
+  prestation: 'Prestations',
+  veterinaire: 'Vétérinaire',
+  alimentation: 'Alimentation animale',
+  achats: 'Achats d’animaux',
+  animal_vivant: 'Achats d’animaux',
+  msa: 'Cotisations MSA',
+  main_oeuvre: 'Main d’œuvre',
+  abonnement: 'Abonnements',
+  autre: 'Autre',
+}
+
 export async function GET(request: NextRequest) {
   const { session, error } = await requireAuthApi()
   if (error) return error
@@ -48,9 +72,8 @@ export async function GET(request: NextRequest) {
 
     const userId = session.user.id
     const startOfYear = new Date(year, 0, 1)
-    const endOfYear = new Date(year, 11, 31, 23, 59, 59)
-    const startOfPrevYear = new Date(year - 1, 0, 1)
-    const endOfPrevYear = new Date(year - 1, 11, 31, 23, 59, 59)
+    const endOfYear = new Date(year, 11, 31, 23, 59, 59, 999)
+
     const asOf = new Date()
 
     // Source unique de vérité : revenus, dépenses, bénéfice, N-1 YTD.
@@ -59,15 +82,19 @@ export async function GET(request: NextRequest) {
     // proviennent désormais de `getKpiCompta`, alignant la page d'accueil
     // Compta, le module Rapports et le module Coûts de production.
     const kpiCompta = await getKpiCompta(userId, year, asOf)
+    const bornesComptables = bornesExerciceKpi(year, asOf)
 
     // ========================================
     // REVENUS
     // ========================================
+    // Ticket cmvflua2x (2026-10-19) — les revenus PAR MODULE ne se recalculent
+    // plus ici sur les tables brutes : ils viennent de la SSOT
+    // (`kpiCompta.revenusParModuleYtd`), sur les mêmes écritures que le total.
+    // Les lectures brutes ci-dessous ne servent plus qu'aux graphiques par
+    // catégorie et à la comparaison N-1.
     const [
       // Ventes elevage (VenteProduit)
-      ventesElevage,
       ventesElevageParType,
-      ventesElevagePrevYear,
 
       // Fruits vendus (RecolteArbre avec prixKg)
       recoltesArbresPrix,
@@ -75,16 +102,10 @@ export async function GET(request: NextRequest) {
       // Bois vendu (ProductionBois avec destination=vente)
       venteBois,
 
-      // Viande vendue (Abattage avec destination=vente)
-      venteAbattage,
-      // Revenus élevage sans source brute réinjectée (paie lait, réservations)
-      ventesElevageAutoSpeciales,
-
       // Récoltes potager vendues
       recoltesPotagerVendues,
 
       // Ventes manuelles
-      ventesManuelles,
       ventesManuellesParCategorie,
 
       // ========================================
@@ -112,6 +133,9 @@ export async function GET(request: NextRequest) {
       // Achats arbres
       achatsArbres,
 
+      // Coûts réels des campagnes de plantation
+      campagnesPlantation,
+
       // Dépenses manuelles
       depensesManuellesParCategorie,
       depensesManuellesParModule,
@@ -120,12 +144,6 @@ export async function GET(request: NextRequest) {
       // ========================================
       // ALERTES
       // ========================================
-
-      // Factures impayées (VenteProduit)
-      facturesImpayeesElevage,
-
-      // Factures impayées (saisies manuelles et sources sans vue brute)
-      facturesImpayeesManuelles,
 
       // Stocks bas (Aliment)
       stocksBasAliments,
@@ -139,25 +157,13 @@ export async function GET(request: NextRequest) {
     ] = await Promise.all([
       // === REVENUS ===
 
-      // Ventes elevage (audit compta 2026-06 : exclure les annulées)
-      prisma.venteProduit.aggregate({
-        where: { userId, date: { gte: startOfYear, lte: endOfYear }, annule: false },
-        _sum: { prixTotal: true },
-        _count: true,
-      }),
-
-      // Ventes elevage par type
+      // Ventes elevage par type (audit compta 2026-06 : exclure les annulées)
       prisma.venteProduit.groupBy({
         by: ['type'],
         where: { userId, date: { gte: startOfYear, lte: endOfYear }, annule: false },
         _sum: { prixTotal: true },
       }),
 
-      // Ventes elevage annee précédente
-      prisma.venteProduit.aggregate({
-        where: { userId, date: { gte: startOfPrevYear, lte: endOfPrevYear }, annule: false },
-        _sum: { prixTotal: true },
-      }),
 
       // Récoltes arbres avec prix (vendues uniquement)
       prisma.recolteArbre.findMany({
@@ -188,28 +194,6 @@ export async function GET(request: NextRequest) {
         _sum: { prixVente: true },
       }),
 
-      // Vente abattage
-      prisma.abattage.aggregate({
-        where: {
-          userId,
-          date: { gte: startOfYear, lte: endOfYear },
-          destination: 'vente',
-          prixVente: { not: null },
-          annule: false,
-        },
-        _sum: { prixVente: true },
-      }),
-
-      prisma.venteManuelle.aggregate({
-        where: {
-          userId,
-          date: { gte: startOfYear, lte: endOfYear },
-          auto: true,
-          sourceType: { in: ['paie_lait', 'reservation_elevage'] },
-        },
-        _sum: { montant: true },
-      }),
-
       // Récoltes potager vendues
       prisma.recolte.findMany({
         where: {
@@ -221,25 +205,9 @@ export async function GET(request: NextRequest) {
         select: { quantite: true, prixKg: true, prixTotal: true, dateVente: true },
       }),
 
-      // Ventes manuelles (exclure auto=true pour eviter double comptage).
-      // QA cmswtznh2 — exception : les ventes boutique (sourceType
-      // commande_boutique) n'ont AUCUNE table métier brute reprise ailleurs
-      // dans la ventilation ; les exclure creusait un écart SSOT/modules qui
-      // faisait crier « Incohérence détectée » au bandeau des Rapports.
-      prisma.venteManuelle.aggregate({
-        where: {
-          userId,
-          date: { gte: startOfYear, lte: endOfYear },
-          OR: [
-            { auto: { not: true } },
-            { auto: true, sourceType: 'commande_boutique' },
-          ],
-        },
-        _sum: { montant: true },
-        _count: true,
-      }),
-
-      // Ventes manuelles par categorie (même périmètre que l'agrégat ci-dessus)
+      // Ventes manuelles par categorie (graphique par catégorie). Miroirs auto
+      // exclus (leur source brute est lue plus haut), sauf les ventes boutique
+      // (QA cmswtznh2 : aucune table brute ne les reprend).
       prisma.venteManuelle.groupBy({
         by: ['categorie'],
         where: {
@@ -266,12 +234,14 @@ export async function GET(request: NextRequest) {
         _sum: { cout: true },
       }),
 
-      // Opérations arbres
+      // Opérations arbres réalisées : une opération planifiée n'est pas une
+      // dépense (même règle que son miroir et que Transactions).
       prisma.operationArbre.aggregate({
         where: {
           userId,
           date: { gte: startOfYear, lte: endOfYear },
           cout: { not: null },
+          NOT: { fait: false },
         },
         _sum: { cout: true },
       }),
@@ -320,7 +290,8 @@ export async function GET(request: NextRequest) {
         _sum: { prixAchat: true },
       }),
 
-      // Achats arbres (verger)
+      // Achats arbres (verger), datés comme leur miroir : achat, sinon
+      // plantation, sinon création.
       prisma.arbre.aggregate({
         where: {
           userId,
@@ -328,15 +299,30 @@ export async function GET(request: NextRequest) {
           OR: [
             { dateAchat: { gte: startOfYear, lte: endOfYear } },
             { datePlantation: { gte: startOfYear, lte: endOfYear }, dateAchat: null },
+            { dateAchat: null, datePlantation: null, createdAt: { gte: startOfYear, lte: endOfYear } },
           ],
         },
         _sum: { prixAchat: true },
       }),
 
-      // Dépenses manuelles par categorie (exclure auto=true)
+      // Coûts réels des campagnes de plantation (revue du 2026-10-29) : comptés
+      // par le KPI et Transactions, ils manquaient au verger des Rapports. Même
+      // date que la liste et le miroir ; le miroir auto est exclu plus bas.
+      prisma.campagnePlantation.aggregate({
+        where: { userId, coutReel: { gt: 0 }, OR: [
+          { datePlantationReelle: { gte: startOfYear, lte: endOfYear } },
+          { datePlantationReelle: null, datePlantationPrevue: { gte: startOfYear, lte: endOfYear } },
+          { datePlantationReelle: null, datePlantationPrevue: null, createdAt: { gte: startOfYear, lte: endOfYear } },
+        ] },
+        _sum: { coutReel: true },
+      }),
+
+      // Dépenses comptables par catégorie. Revue du 2026-11-01 — le camembert
+      // suit le total comptable : miroirs d'achats compris, coûts analytiques
+      // (`comptable: false`) exclus.
       prisma.depenseManuelle.groupBy({
         by: ['categorie'],
-        where: { userId, date: { gte: startOfYear, lte: endOfYear }, auto: { not: true } },
+        where: whereDepensesComptables(userId, bornesComptables.debut, bornesComptables.fin),
         _sum: { montant: true },
       }),
 
@@ -367,42 +353,6 @@ export async function GET(request: NextRequest) {
 
       // === ALERTES ===
 
-      // QA cmswunx5s / cmswuotxj — la carte des impayés agrégait les tables
-      // sources brutes (avoir jamais déduit, facture manuelle invisible) et
-      // ignorait l'exercice sélectionné. On charge désormais les sources
-      // BORNÉES à l'exercice et on délègue au même helper que l'écran
-      // Factures (construireImpayees : avoirs imputés, dédoublonnage
-      // facture↔vente).
-      prisma.venteProduit.findMany({
-        where: { userId, paye: false, annule: false, date: { gte: startOfYear, lte: endOfYear } },
-        orderBy: { date: 'asc' },
-        select: { id: true, date: true, type: true, prixTotal: true, client: true, factureId: true },
-      }),
-
-      // Saisies manuelles et sources auto sans vue brute d'impayé (solde de
-      // réservation, commande boutique).
-      prisma.venteManuelle.findMany({
-        where: {
-          userId,
-          paye: false,
-          date: { gte: startOfYear, lte: endOfYear },
-          OR: [
-            { auto: { not: true } },
-            { auto: true, sourceType: { in: ['reservation_elevage', 'commande_boutique'] } },
-          ],
-        },
-        orderBy: { date: 'asc' },
-        select: {
-          id: true,
-          date: true,
-          categorie: true,
-          description: true,
-          montant: true,
-          clientNom: true,
-          sourceType: true,
-        },
-      }),
-
       // Stocks bas aliments (per-user)
       prisma.$queryRaw`
         SELECT COUNT(*) as count
@@ -429,7 +379,7 @@ export async function GET(request: NextRequest) {
         where: {
           userId,
           createdAt: { gte: startOfYear, lte: endOfYear },
-          statut: { in: ['nouveau', 'confirmee', 'prete'] },
+          statut: { in: [...STATUTS_COMMANDES_EN_ATTENTE] },
         },
         _sum: { total: true },
         _count: true,
@@ -439,25 +389,7 @@ export async function GET(request: NextRequest) {
     // Impayés de l'exercice : mêmes règles que l'écran Factures. La table
     // Facture porte les avoirs et les factures manuelles sans source métier ;
     // le helper impute les avoirs et dédoublonne facture↔vente.
-    const facturesExercice = await prisma.facture.findMany({
-      where: { userId, date: { gte: startOfYear, lte: endOfYear } },
-      select: {
-        id: true, type: true, statut: true, date: true, numero: true,
-        objet: true, clientNom: true, totalTTC: true, factureOrigineId: true,
-      },
-    })
-    const impayeesExercice = construireImpayees({
-      factures: facturesExercice.map(f => ({ ...f, date: f.date.toISOString() })),
-      ventes: facturesImpayeesElevage.map(v => ({ ...v, date: v.date.toISOString() })),
-      ventesManuelles: facturesImpayeesManuelles.map(m => ({
-        id: m.id,
-        date: m.date.toISOString(),
-        categorie: m.categorie,
-        description: m.description,
-        montant: m.montant,
-        client: m.clientNom,
-      })),
-    })
+    const impayeesExercice = (await chargerEncoursCompta(userId, startOfYear, endOfYear)).creances
 
     // ========================================
     // CALCULS AGRÉGÉS
@@ -493,20 +425,14 @@ export async function GET(request: NextRequest) {
       0
     )
 
-    // Ventes manuelles attribuées au potager (categorie legumes OU module potager)
-    const ventesManuellesPotager = ventesManuellesParCategorie
-      .filter(v => v.categorie === 'legumes')
-      .reduce((sum, v) => sum + (v._sum.montant || 0), 0)
-
-    // Totaux
-    const revenus = {
-      elevage: (ventesElevage._sum.prixTotal || 0)
-        + (venteAbattage._sum.prixVente || 0)
-        + (ventesElevageAutoSpeciales._sum.montant || 0),
-      verger: revenusFruits + (venteBois._sum.prixVente || 0),
-      potager: revenusPotager + ventesManuellesPotager,
-      autre: (ventesManuelles._sum.montant || 0) - ventesManuellesPotager,
-    }
+    // Ticket cmvflua2x — revenus par module = ventilation de la SSOT, sur les
+    // mêmes ventes et factures que la carte Revenus (src/lib/kpi/compta.ts).
+    // Avant, ils relisaient les tables brutes : une facture saisie sans vente
+    // métier, un avoir ou une vente datée après le jour faisaient diverger la
+    // somme des modules du total, sans que le bandeau puisse dire d'où venait
+    // l'écart.
+    const ventilationRevenus = kpiCompta.revenusParModuleYtd
+    const revenus = ventilationRevenus.parModule
     const totalRevenus = revenus.elevage + revenus.verger + revenus.potager + revenus.autre
 
     // Ticket cmsx69cuc — les charges manuelles sont ventilées sur LEUR module
@@ -528,6 +454,7 @@ export async function GET(request: NextRequest) {
                (achatsLots._sum.prixAchatTotal || 0) + (achatsAnimaux._sum.prixAchat || 0)
                + depensesManuellesVentilees.elevage + interventionsVentilees.elevage,
       verger: (depensesOperations._sum.cout || 0) + (achatsArbres._sum.prixAchat || 0)
+               + (campagnesPlantation._sum.coutReel || 0)
                + depensesManuellesVentilees.verger + interventionsVentilees.verger,
       potager: depensesFertilisation
                + depensesManuellesVentilees.potager + interventionsVentilees.potager,
@@ -535,210 +462,22 @@ export async function GET(request: NextRequest) {
     }
     const totalDepenses = depenses.elevage + depenses.verger + depenses.potager + depenses.autre
 
-    const benefice = totalRevenus - totalDepenses
-    const margePercent = totalRevenus > 0 ? (benefice / totalRevenus) * 100 : 0
-
-    // Année précédente pour comparaison
-    const revenusPrevYear = ventesElevagePrevYear._sum.prixTotal || 0
-
     // ========================================
     // GRAPHIQUES
     // ========================================
 
-    // Données mensuelles (requêtes raw pour revenus et dépenses par mois).
-    // PERF 2026-08-11 — ces 12 agrégats étaient exécutés en séquence (awaits
-    // successifs) ; ils sont indépendants, donc regroupés dans un Promise.all
-    // (requêtes strictement inchangées).
-    const [
-      revenusParMois,
-      ventesManuParMois,
-      revenusElevageSpeciauxParMois,
-      depensesManuParMois,
-      recoltesPotagerParMois,
-      soinsParMois,
-      // Récoltes arbres vendues par mois (fruits)
-      recoltesArbresParMois,
-      // Production bois vendu par mois
-      venteBoisParMois,
-      // Abattages vendus par mois
-      abattageParMois,
-      // Consommation aliments par mois (coût = quantité × prix aliment)
-      consommationAlimentsParMois,
-      // Fertilisation par mois (coût = quantité × prix fertilisant)
-      fertilisationParMois,
-      // Opérations arbres par mois (coût direct)
-      operationsArbresParMois,
-    ] = (await Promise.all([
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM date) as mois,
-          SUM(prix_total) as total
-        FROM ventes_produits
-        WHERE user_id = ${userId}
-          AND date >= ${startOfYear}
-          AND date <= ${endOfYear}
-          AND annule = false
-        GROUP BY EXTRACT(MONTH FROM date)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM date) as mois,
-          SUM(montant) as total
-        FROM ventes_manuelles
-        WHERE user_id = ${userId}
-          AND date >= ${startOfYear}
-          AND date <= ${endOfYear}
-          -- QA cmswtznh2 : les ventes boutique auto n'ont pas de table brute,
-          -- même périmètre que la ventilation annuelle.
-          AND ((auto IS NULL OR auto = false)
-            OR (auto = true AND source_type = 'commande_boutique'))
-        GROUP BY EXTRACT(MONTH FROM date)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM date) as mois,
-          SUM(montant) as total
-        FROM ventes_manuelles
-        WHERE user_id = ${userId}
-          AND date >= ${startOfYear}
-          AND date <= ${endOfYear}
-          AND auto = true
-          AND source_type IN ('paie_lait', 'reservation_elevage')
-        GROUP BY EXTRACT(MONTH FROM date)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM date) as mois,
-          SUM(montant) as total
-        FROM depenses_manuelles
-        WHERE user_id = ${userId}
-          AND date >= ${startOfYear}
-          AND date <= ${endOfYear}
-          AND (auto IS NULL OR auto = false)
-        GROUP BY EXTRACT(MONTH FROM date)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM date_vente) as mois,
-          SUM(prix_total) as total
-        FROM recoltes
-        WHERE user_id = ${userId}
-          AND statut = 'vendu'
-          AND date_vente >= ${startOfYear}
-          AND date_vente <= ${endOfYear}
-          AND prix_total IS NOT NULL
-        GROUP BY EXTRACT(MONTH FROM date_vente)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM date) as mois,
-          SUM(cout) as total
-        FROM soins_animaux
-        WHERE user_id = ${userId}
-          AND date >= ${startOfYear}
-          AND date <= ${endOfYear}
-          AND cout IS NOT NULL
-          AND fait = true
-        GROUP BY EXTRACT(MONTH FROM date)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM date) as mois,
-          SUM(COALESCE(prix_total, quantite * COALESCE(prix_kg, 0))) as total
-        FROM recoltes_arbres
-        WHERE user_id = ${userId}
-          AND date >= ${startOfYear}
-          AND date <= ${endOfYear}
-          AND statut = 'vendu'
-          AND (prix_total IS NOT NULL OR prix_kg IS NOT NULL)
-        GROUP BY EXTRACT(MONTH FROM date)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM date) as mois,
-          SUM(prix_vente) as total
-        FROM production_bois
-        WHERE user_id = ${userId}
-          AND date >= ${startOfYear}
-          AND date <= ${endOfYear}
-          AND destination = 'vente'
-          AND prix_vente IS NOT NULL
-        GROUP BY EXTRACT(MONTH FROM date)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM date) as mois,
-          SUM(prix_vente) as total
-        FROM abattages
-        WHERE user_id = ${userId}
-          AND date >= ${startOfYear}
-          AND date <= ${endOfYear}
-          AND destination = 'vente'
-          AND prix_vente IS NOT NULL
-          AND annule = false
-        GROUP BY EXTRACT(MONTH FROM date)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM ca.date) as mois,
-          SUM(ca.quantite * COALESCE(usa.cout_unitaire, usa.prix, a.prix, 0)) as total
-        FROM consommations_aliments ca
-        JOIN aliments a ON ca.aliment_id = a.aliment
-        LEFT JOIN user_stock_aliments usa
-          ON usa.user_id = ca.user_id AND usa.aliment_id = ca.aliment_id
-        WHERE ca.user_id = ${userId}
-          AND ca.date >= ${startOfYear}
-          AND ca.date <= ${endOfYear}
-        GROUP BY EXTRACT(MONTH FROM ca.date)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM f.date) as mois,
-          SUM(f.quantite * COALESCE(fe.prix, 0)) as total
-        FROM fertilisations f
-        JOIN fertilisants fe ON f.fertilisant = fe.fertilisant
-        WHERE f.user_id = ${userId}
-          AND f.date >= ${startOfYear}
-          AND f.date <= ${endOfYear}
-        GROUP BY EXTRACT(MONTH FROM f.date)
-      `,
-      prisma.$queryRaw`
-        SELECT
-          EXTRACT(MONTH FROM date) as mois,
-          SUM(cout) as total
-        FROM operations_arbres
-        WHERE user_id = ${userId}
-          AND date >= ${startOfYear}
-          AND date <= ${endOfYear}
-          AND cout IS NOT NULL
-        GROUP BY EXTRACT(MONTH FROM date)
-      `,
-    ])) as { mois: number; total: number }[][]
-
-    // Construire données mensuelles
+    // Données mensuelles — revue du 2026-11-01 : mêmes écritures et mêmes
+    // bornes que les totaux (`getKpiCompta`), la somme des mois redonne donc
+    // le total comptable. Les tables brutes (consommations, fertilisations,
+    // soins) restent des coûts analytiques, exposés à part.
+    const mensuelComptable = await chargerMensuelCompta(userId, year, asOf)
     const mensuel = MOIS_LABELS.map((label, i) => {
-      const mois = i + 1
-      const rev1 = revenusParMois.find(r => Number(r.mois) === mois)?.total || 0
-      const rev2 = ventesManuParMois.find(r => Number(r.mois) === mois)?.total || 0
-      const rev3 = recoltesPotagerParMois.find(r => Number(r.mois) === mois)?.total || 0
-      const rev4 = recoltesArbresParMois.find(r => Number(r.mois) === mois)?.total || 0
-      const rev5 = venteBoisParMois.find(r => Number(r.mois) === mois)?.total || 0
-      const rev6 = abattageParMois.find(r => Number(r.mois) === mois)?.total || 0
-      const rev7 = revenusElevageSpeciauxParMois.find(r => Number(r.mois) === mois)?.total || 0
-      const dep1 = depensesManuParMois.find(d => Number(d.mois) === mois)?.total || 0
-      const dep2 = soinsParMois.find(d => Number(d.mois) === mois)?.total || 0
-      const dep3 = consommationAlimentsParMois.find(d => Number(d.mois) === mois)?.total || 0
-      const dep4 = fertilisationParMois.find(d => Number(d.mois) === mois)?.total || 0
-      const dep5 = operationsArbresParMois.find(d => Number(d.mois) === mois)?.total || 0
-
-      const revenus = Number(rev1) + Number(rev2) + Number(rev3) + Number(rev4) + Number(rev5) + Number(rev6) + Number(rev7)
-      const depenses = Number(dep1) + Number(dep2) + Number(dep3) + Number(dep4) + Number(dep5)
-
+      const { revenus, depenses } = mensuelComptable[i]
       return {
         mois: label,
         revenus,
         depenses,
-        benefice: revenus - depenses,
+        benefice: Math.round((revenus - depenses) * 100) / 100,
       }
     })
 
@@ -770,23 +509,16 @@ export async function GET(request: NextRequest) {
       })),
     ].filter(r => r.montant > 0)
 
-    // Dépenses par categorie
-    const depensesParCategorie = [
-      { categorie: 'Soins animaux', montant: depensesSoins._sum.cout || 0, couleur: COLORS.soins },
-      { categorie: 'Aliments', montant: depensesAliments, couleur: COLORS.aliments },
-      { categorie: 'Opérations arbres', montant: depensesOperations._sum.cout || 0, couleur: COLORS.operations },
-      { categorie: 'Fertilisation', montant: depensesFertilisation, couleur: COLORS.fertilisation },
-      { categorie: 'Achats animaux', montant: (achatsLots._sum.prixAchatTotal || 0) + (achatsAnimaux._sum.prixAchat || 0), couleur: COLORS.achats },
-      { categorie: 'Achats arbres', montant: achatsArbres._sum.prixAchat || 0, couleur: '#15803d' },
-      ...depensesManuellesParCategorie.map(d => ({
-        categorie: d.categorie === 'materiel' ? 'Matériel' :
-                   d.categorie === 'carburant' ? 'Carburant' :
-                   d.categorie === 'main_oeuvre' ? 'Main d\'oeuvre' :
-                   d.categorie.charAt(0).toUpperCase() + d.categorie.slice(1),
-        montant: d._sum.montant || 0,
+    // Dépenses par categorie — mêmes charges que le total comptable.
+    const depensesParCategorie = depensesManuellesParCategorie
+      .map(d => ({
+        categorie: LABELS_CATEGORIE_DEPENSE[d.categorie] ||
+                   d.categorie.charAt(0).toUpperCase() + d.categorie.slice(1).replace(/_/g, ' '),
+        montant: Math.round((d._sum.montant || 0) * 100) / 100,
         couleur: COLORS[d.categorie as keyof typeof COLORS] || COLORS.autre,
-      })),
-    ].filter(d => d.montant > 0)
+      }))
+      .filter(d => d.montant > 0)
+      .sort((a, b) => b.montant - a.montant)
 
     // Par module
     const parModule = [
@@ -897,20 +629,11 @@ export async function GET(request: NextRequest) {
     // bandeau d'alerte. Pas de masquage silencieux.
     const sumRevenusModules = totalRevenus
     const sumDepensesModules = totalDepenses
-    // QA cmsw9dcrd (2026-08-16) — l'écart structurel connu entre SSOT (nette
-    // d'avoirs) et ventilation par module (factures brutes) est exposé pour
-    // que le bandeau d'alerte puisse le nommer au lieu de le laisser passer
-    // pour une anomalie (convention déjà tranchée EVOLUTION_PRODUIT le
-    // 2026-08-10 : « avoir non affiché en liste »).
-    const avoirsAgg = await prisma.facture.aggregate({
-      where: {
-        userId,
-        type: 'avoir',
-        date: { gte: startOfYear, lte: endOfYear },
-        statut: { notIn: ['annulee', 'brouillon'] },
-      },
-      _sum: { totalTTC: true },
-    })
+    // QA cmsw9dcrd (2026-08-16) puis ticket cmvflua2x (2026-10-19) — les
+    // avoirs ne creusent plus d'écart : ils sont déduits du module de leur
+    // facture d'origine. La composition du total (ventes, factures rattachées,
+    // factures sans vente, avoirs) est exposée pour que le bandeau nomme les
+    // sources si un écart réapparaissait.
     // Ticket cmsx69cuc — l'écart résiduel entre le total comptable et la
     // ventilation par module est, par construction, la VALORISATION INTERNE :
     // soins, consommations d'aliments et fertilisations sont des coûts
@@ -926,7 +649,8 @@ export async function GET(request: NextRequest) {
       depensesSsot: kpiCompta.depensesYtd,
       depensesSommeModules: Math.round(sumDepensesModules * 100) / 100,
       depensesEcart: Math.round((kpiCompta.depensesYtd - sumDepensesModules) * 100) / 100,
-      avoirsExercice: Math.round((avoirsAgg._sum.totalTTC ?? 0) * 100) / 100,
+      avoirsExercice: Math.abs(ventilationRevenus.composition.avoirs),
+      revenusComposition: ventilationRevenus.composition,
       depensesAnalytiques,
     }
 
@@ -947,10 +671,10 @@ export async function GET(request: NextRequest) {
         nbRevenusNonPayes: kpiCompta.nbRevenusNonPayes,
         // BUG #2 — diagnostic de cohérence pour bannière UI éventuelle.
         coherenceCheck,
-        // Ventilations par module : conservées pour les graphiques. Leur somme
-        // peut, transitoirement, ne pas correspondre exactement au total
-        // ci-dessus si une vente est saisie hors VenteManuelle/Facture — c'est
-        // la SSOT (revenus, depenses) qui fait foi.
+        // Ventilations par module. Revenus : ventilation de la SSOT, leur
+        // somme est `revenus` au centime (ticket cmvflua2x). Dépenses :
+        // ventilation analytique, l'écart au total comptable est nommé par
+        // `coherenceCheck.depensesAnalytiques`.
         revenusParModule: revenus,
         depensesParModule: depenses,
         // YTD vs YTD année dernière (et non plus année N-1 complète qui

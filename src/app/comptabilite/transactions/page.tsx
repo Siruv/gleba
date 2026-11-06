@@ -1,5 +1,8 @@
 "use client"
 
+import { cibleReglementLigne } from "@/lib/comptabilite/cle-reglement"
+import { ReglementsDialog } from "@/components/comptabilite/ReglementsDialog"
+
 /**
  * Page Transactions unifiée
  * Onglets: Revenus, Dépenses, Saisie
@@ -8,7 +11,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
-import { ArrowLeft, Receipt, RefreshCw, Filter, Plus, Sprout, TreeDeciduous, Bird, TrendingUp, TrendingDown, Store, Info, ChevronDown, ChevronUp, Pencil, Trash2, Loader2 } from "lucide-react"
+import { ArrowLeft, Receipt, RefreshCw, Filter, Plus, Sprout, TreeDeciduous, Bird, TrendingUp, TrendingDown, Store, Info, ChevronDown, ChevronUp, Pencil, Trash2, Loader2, FileText } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -22,8 +25,10 @@ import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { DeleteConfirmDialog } from "@/components/ui/delete-confirm-dialog"
+import { SelectNatif } from "@/components/ui/select-natif"
 import { useToast } from "@/hooks/use-toast"
 import { MODULE_COMPTA_LABELS } from "@/lib/comptabilite/modules"
+import { CHAMPS_DE_SUIVI_SAISIS_VENTE, type ChampSuiviSaisiVente } from "@/lib/comptabilite/ecriture-derivee"
 import {
   compteVente,
   compteAchat,
@@ -53,7 +58,20 @@ interface SourceBreakdown {
   montant: number
 }
 
+/** Agrégats renvoyés par GET /api/comptabilite/revenus et /depenses. */
+interface StatsTransactions {
+  total: number
+  count: number
+  totalComptable?: number
+  totalAnalytique?: number
+  parModule: Record<string, number>
+  parCategorie: { categorie: string; montant: number }[]
+}
+
 interface Transaction {
+  reglementsDisponibles?: boolean
+  montantRegle?: number | null
+  resteAPayer?: number | null
   id: string
   source: string
   sourceId: number
@@ -67,6 +85,9 @@ interface Transaction {
   client?: string | null
   fournisseur?: string | null
   paye: boolean | null
+  modeReglement?: string | null
+  numeroPiece?: string | null
+  tauxTVA?: number | null
   categorie: string
   // false = coût interne de production : visible ici mais non ajouté au FEC,
   // à la TVA déductible ni au total comptable.
@@ -77,6 +98,23 @@ interface Transaction {
    * réservation) et porter malgré tout le nom de source `VenteManuelle`.
    */
   corrigeable?: boolean
+  /**
+   * Écriture comptable d'une ligne dérivée (ticket cmvgdzsf7, 2026-10-20) :
+   * son suivi (règlement, pièce, notes) se modifie ici, montant et date non.
+   * Calculé par l'API (`chargerSuiviDesLignes`).
+   */
+  ecriture?: { id: number; suivi: Record<ChampSuiviVente, string | null> } | null
+  /** Facture qui porte une vente dérivée facturée : le règlement s'y suit. */
+  facture?: { id: number; numero: string } | null
+}
+
+/** Champs du formulaire « Règlement et pièce » : la liste blanche du serveur, pas une copie. */
+type ChampSuiviVente = ChampSuiviSaisiVente
+
+const LIBELLE_CHAMP_SUIVI: Record<ChampSuiviVente, string> = {
+  modeReglement: "Mode de règlement",
+  numeroPiece: "N° de pièce",
+  notes: "Notes",
 }
 
 /**
@@ -99,6 +137,8 @@ const ECRAN_SOURCE: Record<string, string> = {
   Abattage: "l'abattage, dans Élevage",
   ProductionBois: "la production, dans Verger > Bois",
   VenteManuelle: "sa source (commande boutique ou réservation)",
+  CommandeBoutique: "la commande, dans Boutique",
+  PaieLait: "la paie, dans Élevage > Production",
   SoinAnimal: "le soin, dans Élevage > Alimentation & Soins",
   ConsommationAliment: "la consommation, dans Élevage > Alimentation & Soins",
   Fertilisation: "l'intervention, dans Interventions",
@@ -107,6 +147,18 @@ const ECRAN_SOURCE: Record<string, string> = {
   LotAnimaux: "le prix d'achat du lot, dans Élevage > Animaux & Lots",
   Animal: "le prix d'achat de l'animal, sur sa fiche",
   Arbre: "l'arbre, sur sa fiche",
+  CampagnePlantation: "la campagne, dans Verger > Plantations",
+}
+
+/** Écran de la source d'une ligne dérivée, quand il a une adresse fixe. */
+const LIEN_SOURCE: Record<string, string> = {
+  CampagnePlantation: "/verger?tab=plantations",
+  Recolte: "/maraichage/recoltes",
+  RecolteArbre: "/verger?tab=productions",
+  ProductionBois: "/verger?tab=productions",
+  VenteProduit: "/elevage?tab=production",
+  PaieLait: "/elevage?tab=production",
+  Abattage: "/elevage?tab=animaux",
 }
 
 const CATEGORIES_VENTE = [
@@ -188,8 +240,8 @@ function TransactionsPageInner() {
   const [isLoading, setIsLoading] = React.useState(true)
   const [revenus, setRevenus] = React.useState<Transaction[]>([])
   const [depenses, setDepenses] = React.useState<Transaction[]>([])
-  const [statsRevenus, setStatsRevenus] = React.useState<any>(null)
-  const [statsDepenses, setStatsDepenses] = React.useState<any>(null)
+  const [statsRevenus, setStatsRevenus] = React.useState<StatsTransactions | null>(null)
+  const [statsDepenses, setStatsDepenses] = React.useState<StatsTransactions | null>(null)
   const [sourcesBreakdown, setSourcesBreakdown] = React.useState<SourceBreakdown[]>([])
   const [sourcesOpen, setSourcesOpen] = React.useState(false)
   // Bug R2 : l'année choisie sur le dashboard Compta se propage aux sous-pages
@@ -274,6 +326,20 @@ function TransactionsPageInner() {
   const [isSavingEdit, setIsSavingEdit] = React.useState(false)
   const [deleting, setDeleting] = React.useState<Transaction | null>(null)
 
+  // Ticket cmvgdzsf7 (2026-10-20) — une ligne dérivée n'offrait rien : ni
+  // bouton ni formulaire, alors que le serveur accepte son suivi (règlement,
+  // pièce, notes). Le formulaire ne porte que les champs de la liste blanche
+  // (`CHAMPS_DE_SUIVI_SAISIS_VENTE`) ; montant, date et client restent à la source.
+  const suiviVide = Object.fromEntries(CHAMPS_DE_SUIVI_SAISIS_VENTE.map((c) => [c, ""])) as Record<ChampSuiviVente, string>
+  const [suivant, setSuivant] = React.useState<Transaction | null>(null)
+  const [suiviForm, setSuiviForm] = React.useState<Record<ChampSuiviVente, string>>(suiviVide)
+  const [erreurSuivi, setErreurSuivi] = React.useState<string | null>(null)
+  const [isSavingSuivi, setIsSavingSuivi] = React.useState(false)
+  const [suiviPaye, setSuiviPaye] = React.useState(false)
+  // Un abattage n'a pas de pointage à la source : son miroir le porte et le
+  // conserve. Le décocher ici en fait une vente à crédit (décision du 2026-10-30).
+  const peutPointer = (t: Transaction) => t.source === 'VenteProduit' || t.source === 'Abattage' || (t.source !== 'VenteManuelle' && t.comptable === true)
+
   const endpointFor = (t: Transaction) =>
     t.source === "VenteManuelle"
       ? "/api/comptabilite/ventes-manuelles"
@@ -294,6 +360,9 @@ function TransactionsPageInner() {
       module: (MODULES_SAISIE as readonly string[]).includes(t.module) ? t.module : "",
       tiers: (t.source === "VenteManuelle" ? t.client : t.fournisseur) ?? "",
       paye: t.paye === false ? "false" : "true",
+      modeReglement: t.modeReglement ?? "",
+      numeroPiece: t.numeroPiece ?? "",
+      tauxTVA: t.tauxTVA == null ? "" : String(t.tauxTVA),
     })
     setEditing(t)
   }
@@ -316,8 +385,8 @@ function TransactionsPageInner() {
       }
       if (editForm.categorie) body.categorie = editForm.categorie
       if (editForm.module) body.module = editForm.module
-      if (editForm.modeReglement) body.modeReglement = editForm.modeReglement
-      if (editForm.numeroPiece.trim()) body.numeroPiece = editForm.numeroPiece.trim()
+      if (editForm.modeReglement !== (editing.modeReglement ?? "")) body.modeReglement = editForm.modeReglement || null
+      if (editForm.numeroPiece.trim() !== (editing.numeroPiece ?? "")) body.numeroPiece = editForm.numeroPiece.trim() || null
       if (editForm.tauxTVA) {
         const taux = parseFloat(editForm.tauxTVA.replace(",", "."))
         if (!Number.isFinite(taux) || taux < 0 || taux > 100) {
@@ -364,8 +433,68 @@ function TransactionsPageInner() {
     fetchData()
   }
 
-  /** Cellule d'actions : corriger/supprimer, ou dire où corriger. */
-  const cellulActions = (t: Transaction) =>
+  const openSuivi = (t: Transaction) => {
+    if (!t.ecriture) return
+    setSuiviPaye(t.paye === true)
+    const valeurs = t.ecriture.suivi
+    setSuiviForm(
+      Object.fromEntries(CHAMPS_DE_SUIVI_SAISIS_VENTE.map((c) => [c, valeurs[c] ?? ""])) as Record<ChampSuiviVente, string>,
+    )
+    setErreurSuivi(null)
+    setSuivant(t)
+  }
+
+  const changerSuivi = (champ: ChampSuiviVente, valeur: string) => {
+    // Un message d'erreur appartient à un essai : il s'efface à la modification.
+    setErreurSuivi(null)
+    setSuiviForm((prev) => ({ ...prev, [champ]: valeur }))
+  }
+
+  const saveSuivi = async () => {
+    if (!suivant?.ecriture || isSavingSuivi) return
+    // Seuls les champs modifiés partent : une valeur stockée hors de la liste
+    // des modes (ancienne saisie) n'est pas renvoyée telle qu'affichée.
+    const body: Record<string, unknown> = { id: suivant.ecriture.id }
+    for (const champ of CHAMPS_DE_SUIVI_SAISIS_VENTE) {
+      const saisi = suiviForm[champ].trim()
+      if (saisi !== (suivant.ecriture.suivi[champ] ?? "")) body[champ] = saisi || null
+    }
+    if (peutPointer(suivant) && suiviPaye !== suivant.paye) body.paye = suiviPaye
+    if (Object.keys(body).length === 1) {
+      setSuivant(null)
+      return
+    }
+    setIsSavingSuivi(true)
+    setErreurSuivi(null)
+    try {
+      const res = await fetch(suivant.comptable === true ? "/api/comptabilite/depenses-manuelles" : "/api/comptabilite/ventes-manuelles", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        const champsInvalides = data?.details?.fieldErrors as Record<string, string[]> | undefined
+        const premier = champsInvalides ? Object.keys(champsInvalides)[0] : undefined
+        setErreurSuivi(
+          premier
+            ? `Données invalides — ${LIBELLE_CHAMP_SUIVI[premier as ChampSuiviVente] ?? premier} : ${champsInvalides?.[premier]?.[0] ?? "valeur refusée"}`
+            : data.error || "Enregistrement refusé",
+        )
+        return
+      }
+      toast({ title: "Règlement et pièce enregistrés", description: suivant.description })
+      setSuivant(null)
+      fetchData()
+    } catch (err) {
+      setErreurSuivi(err instanceof Error ? err.message : "Enregistrement impossible")
+    } finally {
+      setIsSavingSuivi(false)
+    }
+  }
+
+  /** Cellule d'actions : corriger/supprimer, suivi d'une ligne dérivée, ou dire où corriger. */
+  const anciennesActions = (t: Transaction) =>
     t.corrigeable ? (
       <div className="flex justify-end gap-1">
         <Button variant="ghost" size="sm" className="h-8 w-8 p-0" title="Corriger cette écriture" onClick={() => openEdit(t)}>
@@ -375,6 +504,36 @@ function TransactionsPageInner() {
           <Trash2 className="h-4 w-4" />
         </Button>
       </div>
+    ) : t.ecriture ? (
+      <div className="flex flex-col items-end gap-0.5">
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8"
+          title="Suivre le règlement, le numéro de pièce et les notes"
+          onClick={() => openSuivi(t)}
+        >
+          <FileText className="h-4 w-4 mr-1" />
+          Règlement et pièce
+        </Button>
+        <span className="text-[11px] text-muted-foreground text-right">
+          Générée · montant et date : {ECRAN_SOURCE[t.source] ?? "sa source"}
+        </span>
+      </div>
+    ) : t.facture ? (
+      <span className="text-xs text-muted-foreground" title="Une vente facturée se règle sur sa facture.">
+        Facturée ·{" "}
+        <a
+          href={`/api/comptabilite/factures/${t.facture.id}/pdf`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline"
+          title={`Ouvrir la facture ${t.facture.numero}`}
+        >
+          {t.facture.numero}
+        </a>
+        {" "}: règlement dans <Link href="/comptabilite/factures" className="underline">Factures</Link>
+      </span>
     ) : (
       <span className="text-xs text-muted-foreground" title={`Écriture générée par Gleba : corrigez ${ECRAN_SOURCE[t.source] ?? "sa source"}.`}>
         Générée · corriger {ECRAN_SOURCE[t.source] ?? "sa source"}
@@ -389,6 +548,15 @@ function TransactionsPageInner() {
     if (isManualTransactionType(requestedType)) setFormType(requestedType)
     setSelectedModule(isTransactionModule(requestedModule) ? requestedModule : "all")
   }, [requestedTab, requestedType, requestedModule])
+
+  const cellulActions = (t: Transaction, nature: 'vente' | 'depense') => {
+    const cible = cibleReglementLigne(t, nature)
+    return <div className="flex flex-wrap items-center justify-end gap-2">
+      {cible && t.montant > 0 && <ReglementsDialog type={cible.type} id={cible.id} onChange={fetchData} />}
+      {anciennesActions(t)}
+    </div>
+  }
+
 
   const handleTabChange = React.useCallback((value: string) => {
     if (!isTransactionTab(value)) return
@@ -462,7 +630,7 @@ function TransactionsPageInner() {
         const result = await srcRes.json()
         setSourcesBreakdown(result.sources || [])
       }
-    } catch (error) {
+    } catch {
       toast({ variant: "destructive", title: "Erreur", description: "Impossible de charger les données" })
     } finally {
       setIsLoading(false)
@@ -678,7 +846,7 @@ function TransactionsPageInner() {
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
                     <Info className="h-5 w-5 text-blue-600" />
-                    <CardTitle className="text-base">D'où viennent ces chiffres ?</CardTitle>
+                    <CardTitle className="text-base">D&apos;où viennent ces chiffres ?</CardTitle>
                   </div>
                   {sourcesOpen ? (
                     <ChevronUp className="h-4 w-4 text-muted-foreground" />
@@ -690,8 +858,8 @@ function TransactionsPageInner() {
               {sourcesOpen && (
                 <CardContent className="space-y-4 text-sm">
                   <p className="text-muted-foreground">
-                    Ce total agrège toutes vos ventes, qu'elles proviennent du potager,
-                    du verger, de l'elevage, de la boutique en ligne ou de saisies manuelles.
+                    Ce total agrège toutes vos ventes, qu&apos;elles proviennent du potager,
+                    du verger, de l&apos;elevage, de la boutique en ligne ou de saisies manuelles.
                   </p>
 
                   <div className="grid gap-2 md:grid-cols-2">
@@ -701,7 +869,7 @@ function TransactionsPageInner() {
                     </div>
                     <div className="flex items-start gap-2">
                       <TreeDeciduous className="h-4 w-4 text-lime-600 mt-0.5 flex-shrink-0" />
-                      <span><strong>Verger (fruits)</strong> — récoltes d'arbres au statut « vendu ».</span>
+                      <span><strong>Verger (fruits)</strong> — récoltes d&apos;arbres au statut « vendu ».</span>
                     </div>
                     <div className="flex items-start gap-2">
                       <TreeDeciduous className="h-4 w-4 text-amber-800 mt-0.5 flex-shrink-0" />
@@ -721,7 +889,7 @@ function TransactionsPageInner() {
                     </div>
                     <div className="flex items-start gap-2 md:col-span-2">
                       <Receipt className="h-4 w-4 text-blue-600 mt-0.5 flex-shrink-0" />
-                      <span><strong>Saisies manuelles</strong> — ventes ajoutées via l'onglet Saisie (hors automatiques).</span>
+                      <span><strong>Saisies manuelles</strong> — ventes ajoutées via l&apos;onglet Saisie (hors automatiques).</span>
                     </div>
                   </div>
 
@@ -766,7 +934,7 @@ function TransactionsPageInner() {
                           {sourcesBreakdown.length === 0 && (
                             <TableRow>
                               <TableCell colSpan={4} className="text-center py-4 text-muted-foreground text-xs">
-                                Aucune donnée pour cette annee
+                                Aucune donnée pour cette année
                               </TableCell>
                             </TableRow>
                           )}
@@ -831,6 +999,7 @@ function TransactionsPageInner() {
                           <TableHead>Description</TableHead>
                           <TableHead className="text-right">Montant</TableHead>
                           <TableHead>Client</TableHead>
+                          <TableHead>Mode de règlement</TableHead>
                           <TableHead>Statut</TableHead>
                           <TableHead className="text-right">Actions</TableHead>
                         </TableRow>
@@ -861,20 +1030,21 @@ function TransactionsPageInner() {
                               )}
                             </TableCell>
                             <TableCell>{r.client || '-'}</TableCell>
+                            <TableCell className="whitespace-nowrap">{r.modeReglement || r.ecriture?.suivi.modeReglement || 'Non renseigné'}</TableCell>
                             <TableCell>
-                              {r.paye === null ? (
-                                <Badge variant="outline">N/A</Badge>
+                              {r.facture ? <Badge variant="outline">Facturée</Badge> : r.montantRegle != null && r.montantRegle > 0 && (r.resteAPayer ?? 0) > 0 ? <Badge className="bg-amber-100 text-amber-800">Partiel · reste {formatEuro(r.resteAPayer!)}</Badge> : r.paye === null ? (
+                                <Badge variant="outline">Non suivi</Badge>
                               ) : r.paye ? (
-                                <Badge className="bg-green-100 text-green-800">Payé</Badge>
+                                <><Badge className="bg-green-100 text-green-800">{r.montantRegle == null ? 'Déclaré encaissé' : 'Encaissé'}</Badge>{r.montantRegle == null && <p className="mt-1 text-xs text-muted-foreground">Pointage sans détail. À vérifier dans Règlements.</p>}</>
                               ) : (
-                                <Badge className="bg-orange-100 text-orange-800">À payer</Badge>
+                                <Badge className="bg-orange-100 text-orange-800">À encaisser</Badge>
                               )}
                             </TableCell>
-                            <TableCell className="text-right">{cellulActions(r)}</TableCell>
+                            <TableCell className="text-right">{cellulActions(r, 'vente')}</TableCell>
                           </TableRow>
                         ))}
                         {revenus.length === 0 && (
-                          <TableRow><TableCell colSpan={7} className="text-center py-8 text-muted-foreground">Aucun revenu</TableCell></TableRow>
+                          <TableRow><TableCell colSpan={8} className="text-center py-8 text-muted-foreground">Aucun revenu</TableCell></TableRow>
                         )}
                       </TableBody>
                     </Table>
@@ -928,6 +1098,7 @@ function TransactionsPageInner() {
                           <TableHead>Description</TableHead>
                           <TableHead className="text-right">Montant</TableHead>
                           <TableHead>Fournisseur</TableHead>
+                          <TableHead>Mode de règlement</TableHead>
                           <TableHead>Statut</TableHead>
                           <TableHead className="text-right">Actions</TableHead>
                         </TableRow>
@@ -945,9 +1116,12 @@ function TransactionsPageInner() {
                             <TableCell className="max-w-[250px] truncate">{d.description}</TableCell>
                             <TableCell className="text-right font-bold text-red-600">{formatEuro(d.montant)}</TableCell>
                             <TableCell>{d.fournisseur || '-'}</TableCell>
+                            <TableCell className="whitespace-nowrap">{d.comptable === false ? 'Coût interne' : d.modeReglement || d.ecriture?.suivi.modeReglement || 'Non renseigné'}</TableCell>
                             <TableCell>
                               {d.comptable === false ? (
                                 <Badge className="bg-amber-100 text-amber-800">Analytique</Badge>
+                              ) : d.montantRegle != null && d.montantRegle > 0 && (d.resteAPayer ?? 0) > 0 ? (
+                                <Badge className="bg-amber-100 text-amber-800">Partiel · reste {formatEuro(d.resteAPayer!)}</Badge>
                               ) : d.paye === null ? (
                                 <Badge variant="outline">N/A</Badge>
                               ) : d.paye ? (
@@ -956,11 +1130,11 @@ function TransactionsPageInner() {
                                 <Badge className="bg-orange-100 text-orange-800">À payer</Badge>
                               )}
                             </TableCell>
-                            <TableCell className="text-right">{cellulActions(d)}</TableCell>
+                            <TableCell className="text-right">{cellulActions(d, 'depense')}</TableCell>
                           </TableRow>
                         ))}
                         {depenses.length === 0 && (
-                          <TableRow><TableCell colSpan={7} className="text-center py-8 text-muted-foreground">Aucune dépense</TableCell></TableRow>
+                          <TableRow><TableCell colSpan={8} className="text-center py-8 text-muted-foreground">Aucune dépense</TableCell></TableRow>
                         )}
                       </TableBody>
                     </Table>
@@ -1339,24 +1513,20 @@ function TransactionsPageInner() {
             </div>
             <div>
               <Label htmlFor="edit-mode">Mode de règlement</Label>
-              <Select value={editForm.modeReglement} onValueChange={(v) => setEditForm({ ...editForm, modeReglement: v })}>
-                <SelectTrigger id="edit-mode" name="modeReglement">
-                  <SelectValue placeholder="Inchangé" />
-                </SelectTrigger>
-                <SelectContent>
+              <SelectNatif id="edit-mode" name="modeReglement" value={editForm.modeReglement} onChange={(e) => setEditForm({ ...editForm, modeReglement: e.target.value })}>
+                  <option value="">Non renseigné</option>
                   {MODES_REGLEMENT.map((m) => (
-                    <SelectItem key={m.value} value={m.value}>{m.label}</SelectItem>
+                    <option key={m.value} value={m.value}>{m.label}</option>
                   ))}
-                </SelectContent>
-              </Select>
+              </SelectNatif>
             </div>
             <div>
               <Label htmlFor="edit-paye">Règlement</Label>
               <Select value={editForm.paye} onValueChange={(v) => setEditForm({ ...editForm, paye: v })}>
                 <SelectTrigger id="edit-paye" name="paye"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="true">Payé</SelectItem>
-                  <SelectItem value="false">À payer</SelectItem>
+                  <SelectItem value="true">{editing?.source === 'VenteManuelle' ? 'Encaissé' : 'Payé'}</SelectItem>
+                  <SelectItem value="false">{editing?.source === 'VenteManuelle' ? 'À encaisser' : 'À payer'}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -1366,6 +1536,97 @@ function TransactionsPageInner() {
             <Button onClick={saveEdit} disabled={isSavingEdit}>
               {isSavingEdit && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
               {isSavingEdit ? "Enregistrement..." : "Enregistrer"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Suivi d'une écriture dérivée (ticket cmvgdzsf7) : seuls les champs que
+          le serveur accepte sur une ligne générée (CHAMPS_DE_SUIVI_SAISIS_VENTE). */}
+      <Dialog open={suivant !== null} onOpenChange={(open) => !open && setSuivant(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Règlement et pièce</DialogTitle>
+            <DialogDescription>
+              Écriture générée par Gleba. Le montant, la date et le client appartiennent à la
+              source : corrigez {suivant ? ECRAN_SOURCE[suivant.source] ?? "sa source" : "sa source"}, l&apos;écriture suivra.
+            </DialogDescription>
+          </DialogHeader>
+          {suivant && (
+            <div className="space-y-3">
+              <dl className="grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 rounded-md border bg-slate-50 p-3 text-sm">
+                <dt className="text-muted-foreground">Date</dt>
+                <dd>{new Date(suivant.date).toLocaleDateString("fr-FR")}</dd>
+                <dt className="text-muted-foreground">Libellé</dt>
+                <dd className="break-words">{suivant.description}</dd>
+                <dt className="text-muted-foreground">Montant</dt>
+                <dd className="font-semibold">{formatEuro(suivant.montant)}</dd>
+                <dt className="text-muted-foreground">Client</dt>
+                <dd className="break-words">{suivant.client || "—"}</dd>
+              </dl>
+              {LIEN_SOURCE[suivant.source] && (
+                <Link href={LIEN_SOURCE[suivant.source]} className="inline-block text-sm text-teal-700 underline">
+                  Ouvrir la source
+                </Link>
+              )}
+              {peutPointer(suivant) && (
+                <div>
+                  <label htmlFor="suivi-paye" className="flex items-center gap-2 text-sm font-medium">
+                    <input id="suivi-paye" type="checkbox" checked={suiviPaye} onChange={(e) => setSuiviPaye(e.target.checked)} />
+                    {suivant.comptable === true ? 'Paiement confirmé' : 'Encaissement confirmé'}
+                  </label>
+                  <p className="mt-1 text-xs text-muted-foreground">Pointage manuel à vérifier sur votre compte ou en caisse.{suivant.source === 'VenteProduit' && ' Le statut sera aussi mis à jour dans l’atelier d’élevage.'}</p>
+                </div>
+              )}
+              {CHAMPS_DE_SUIVI_SAISIS_VENTE.map((champ) => (
+                <div key={champ}>
+                  <Label htmlFor={`suivi-${champ}`}>{LIBELLE_CHAMP_SUIVI[champ]}</Label>
+                  {champ === "modeReglement" ? (
+                    <SelectNatif
+                      id={`suivi-${champ}`}
+                      name={champ}
+                      value={suiviForm[champ]}
+                      onChange={(e) => changerSuivi(champ, e.target.value)}
+                    >
+                      <option value="">Non renseigné</option>
+                      {MODES_REGLEMENT.map((m) => (
+                        <option key={m.value} value={m.value}>{m.label}</option>
+                      ))}
+                      {/* Valeur ancienne hors liste : affichée telle quelle, jamais renvoyée sans changement. */}
+                      {suiviForm[champ] && !MODES_REGLEMENT.some((m) => m.value === suiviForm[champ]) && (
+                        <option value={suiviForm[champ]}>{suiviForm[champ]}</option>
+                      )}
+                    </SelectNatif>
+                  ) : champ === "notes" ? (
+                    <Textarea
+                      id={`suivi-${champ}`}
+                      name={champ}
+                      rows={3}
+                      maxLength={5000}
+                      value={suiviForm[champ]}
+                      onChange={(e) => changerSuivi(champ, e.target.value)}
+                    />
+                  ) : (
+                    <Input
+                      id={`suivi-${champ}`}
+                      name={champ}
+                      maxLength={50}
+                      value={suiviForm[champ]}
+                      onChange={(e) => changerSuivi(champ, e.target.value)}
+                    />
+                  )}
+                </div>
+              ))}
+              {erreurSuivi && (
+                <p role="alert" className="text-sm text-red-600">{erreurSuivi}</p>
+              )}
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSuivant(null)} disabled={isSavingSuivi}>Annuler</Button>
+            <Button onClick={saveSuivi} disabled={isSavingSuivi}>
+              {isSavingSuivi && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              {isSavingSuivi ? "Enregistrement..." : "Enregistrer"}
             </Button>
           </DialogFooter>
         </DialogContent>

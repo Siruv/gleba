@@ -7,9 +7,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { requireAuthApi } from '@/lib/auth-utils'
-import { visibiliteReferentiel } from '@/lib/referentiel-communaute'
+import { masquerEntree, visibiliteReferentiel } from '@/lib/referentiel-communaute'
 import { refusSiPasProprietaire } from '@/lib/exploitation/garde-session'
 import { exporterDonneesTabulaires } from '@/lib/export-tabulaire'
+import { sansChamps } from '@/lib/sans-champs'
 
 export async function GET(request: NextRequest) {
   const { error, session } = await requireAuthApi()
@@ -91,13 +92,13 @@ export async function GET(request: NextRequest) {
     ])
 
     // Nettoyer les données utilisateur (supprimer le champ userId pour l'export)
-    const cleanPlanches = planches.map(({ userId: _, ...rest }) => rest)
-    const cleanCultures = cultures.map(({ userId: _, createdAt: __, updatedAt: ___, ...rest }) => rest)
-    const cleanRecoltes = recoltes.map(({ userId: _, createdAt: __, ...rest }) => rest)
-    const cleanFertilisations = fertilisations.map(({ userId: _, createdAt: __, ...rest }) => rest)
-    const cleanAnalyses = analyses.map(({ userId: _, ...rest }) => rest)
-    const cleanObjetsJardin = objetsJardin.map(({ userId: _, createdAt: __, ...rest }) => rest)
-    const cleanArbres = arbres.map(({ userId: _, createdAt: __, updatedAt: ___, ...rest }) => rest)
+    const cleanPlanches = planches.map((p) => sansChamps(p, 'userId'))
+    const cleanCultures = cultures.map((c) => sansChamps(c, 'userId', 'createdAt', 'updatedAt'))
+    const cleanRecoltes = recoltes.map((r) => sansChamps(r, 'userId', 'createdAt'))
+    const cleanFertilisations = fertilisations.map((f) => sansChamps(f, 'userId', 'createdAt'))
+    const cleanAnalyses = analyses.map((a) => sansChamps(a, 'userId'))
+    const cleanObjetsJardin = objetsJardin.map((o) => sansChamps(o, 'userId', 'createdAt'))
+    const cleanArbres = arbres.map((a) => sansChamps(a, 'userId', 'createdAt', 'updatedAt'))
 
     const data = {
       exportDate: new Date().toISOString(),
@@ -105,9 +106,11 @@ export async function GET(request: NextRequest) {
       // Référentiels globaux
       familles,
       fournisseurs,
-      especes,
-      varietes,
-      itps,
+      // Revue 2026-10-20 — l'auteur d'une entrée partagée par un autre compte
+      // sort sous le marqueur « communaute », jamais son id.
+      especes: especes.map((e) => masquerEntree(e, userId)),
+      varietes: varietes.map((v) => masquerEntree(v, userId)),
+      itps: itps.map((i) => masquerEntree(i, userId)),
       rotations,
       rotationDetails,
       fertilisants,

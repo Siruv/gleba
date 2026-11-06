@@ -6,7 +6,8 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
-import { createCultureSchema, normalizeCultureDateFields, validateCultureDates } from '@/lib/validations'
+import { createCultureSchema, normaliserDatesCreationCulture, validateCultureDates } from '@/lib/validations'
+import { dateJourSeul } from '@/lib/jour-civil'
 import { Prisma } from '@prisma/client'
 import { requireAuthApi } from '@/lib/auth-utils'
 import { evaluerOccupationPlanche } from '@/lib/planche-validation'
@@ -17,15 +18,18 @@ import { checkRotationViolation } from '@/lib/rotation-check'
 import { estEtatCulture, etatCulture, whereEtatCulture } from '@/lib/cultures/etat'
 import { ecrituresPassageAFait, ETAPES, type EtatEtapes } from '@/lib/cultures/execution'
 import { chevauchePeriode, estVivaceEnPlace, finDeCycle, finRecolteDepuisItp } from '@/lib/cultures/fenetre-recolte'
+import type { AlerteSaisonCulture } from '@/lib/cultures/saison-culture'
 import { whereItpUtilisable } from '@/lib/itp-acces'
 import { avertissementItpPlanche, verdictItpPlanche } from '@/lib/cultures/itp-planche'
 import { nomAffichableItp } from '@/lib/itp-label'
 import { visibiliteReferentiel } from '@/lib/referentiel-communaute'
+import { masquerReferentielsEmbarques } from '@/lib/referentiel-embarque'
 import { appliquerDecalageItp, decalageItpPourLecteur } from '@/lib/calendrier-climat'
 import { zoneEffectiveUser } from '@/lib/terroir'
 import { type UniteQuantite } from '@/lib/recolte/projection'
 import { ajouterQuantite, arrondirQuantites, partKg, type QuantiteParUnite } from '@/lib/recolte/quantites'
 import { chargerSurchargesRendement, rendementEffectif } from '@/lib/recolte/rendement-effectif'
+import { quantiteCultureACreer } from '@/lib/cultures/quantite-plants'
 
 // GET /api/cultures
 export async function GET(request: NextRequest) {
@@ -163,8 +167,10 @@ export async function GET(request: NextRequest) {
       }
     })
 
+    // Espèce, variété et ITP embarqués : jamais l'id de l'auteur d'une entrée
+    // partagée par un autre compte (revue 2026-10-20).
     return NextResponse.json({
-      data: culturesWithComputed,
+      data: masquerReferentielsEmbarques(culturesWithComputed, session!.user.id),
       total,
       page,
       pageSize,
@@ -201,7 +207,9 @@ export async function POST(request: NextRequest) {
 
     // Parité avec le PUT (fix efa206f) : un input type=date envoie
     // « YYYY-MM-DD », Prisma exige un DateTime — normaliser avant insertion.
-    const champDateInvalide = normalizeCultureDateFields(data)
+    // Ticket QA cmvnulry1 (2026-10-25) : un instant reçu (« 2027-04-11T22:00Z »,
+    // minuit à Paris) est ramené à son jour civil, écrit à minuit UTC.
+    const champDateInvalide = normaliserDatesCreationCulture(data)
     if (champDateInvalide) {
       return NextResponse.json(
         { error: `Date invalide pour ${champDateInvalide}` },
@@ -317,6 +325,11 @@ export async function POST(request: NextRequest) {
           // par aucun chemin du maraîchage.
           semaineRecolteFin: true,
           dureeRecolte: true,
+          // Fenêtre d'implantation et opération (2026-10-25) : l'alerte de
+          // saison compare la date d'implantation saisie à cette fenêtre.
+          semaineImplantationDebut: true,
+          semaineImplantationFin: true,
+          implantation: true,
           espacementRangs: true,
           nbGrainesPlant: true,
           doseSemis: true,
@@ -327,6 +340,12 @@ export async function POST(request: NextRequest) {
           {
             error: `L'itinéraire technique « ${data.itpId} » n'est pas disponible : introuvable, privé, ou retiré du service.`,
           },
+          { status: 400 }
+        )
+      }
+      if (itp.especeId && itp.especeId !== data.especeId) {
+        return NextResponse.json(
+          { error: "Choisissez un itinéraire technique de la même espèce que la culture.", champ: 'itpId' },
           { status: 400 }
         )
       }
@@ -360,13 +379,25 @@ export async function POST(request: NextRequest) {
         (data.dateRecolte as Date | null) ?? null,
         itpCalibre ?? itp
       )
-      if (finDerivee) data.finRecolte = finDerivee
+      // Dérivée en jours locaux (`setDate`) : ramenée au jour seul, comme les
+      // dates reçues (cmvnulry1).
+      if (finDerivee) data.finRecolte = dateJourSeul(finDerivee)
     }
+
+    // Ticket QA cmvnpkkhp (2026-10-25) — l'assistant « Semer » n'envoyait pas
+    // la quantité qu'il affichait (« ~159 plants ») : la culture naissait sans
+    // nombre de plants, quand Planification > Plants le recalculait depuis les
+    // rangs, la longueur et l'espacement. La route déduit la quantité absente
+    // par la même règle que tous les écrans, quel que soit le client.
+    data.quantite = quantiteCultureACreer(data)
 
     // Audit Marc 2026-05-14 — Bug 04 : remonter les warnings dates/ITP
     // au client (non bloquant). Le client peut alors afficher un toast
     // explicite "Semis le 01/06 hors fenêtre ITP recommandée (mars–avril)".
     const dateWarnings: string[] = []
+    // Date d'implantation hors de la fenêtre de l'ITP (2026-10-25, aubergine
+    // plantée un 25 octobre) : non bloquant, renvoyé structuré pour l'écran.
+    let alerteSaison: AlerteSaisonCulture | null = null
     if (data.dateSemis || data.datePlantation || data.dateRecolte) {
       try {
         const annee = data.annee || new Date().getFullYear()
@@ -374,6 +405,7 @@ export async function POST(request: NextRequest) {
           dateSemis: data.dateSemis,
           datePlantation: data.datePlantation,
           dateRecolte: data.dateRecolte,
+          finRecolte: data.finRecolte,
           itp: itpCalibre,
           annee,
         })
@@ -391,6 +423,7 @@ export async function POST(request: NextRequest) {
           )
         }
         dateWarnings.push(...dateValidation.warnings)
+        alerteSaison = dateValidation.alerteSaison
       } catch (validationError) {
         console.error('Erreur validation dates:', validationError)
       }
@@ -589,8 +622,13 @@ export async function POST(request: NextRequest) {
     invalidateKpi(session!.user.id)
 
     // Audit Marc 2026-05-14 — Bug 04 : warnings remontés non bloquants
+    const reponse = masquerReferentielsEmbarques(culture, session!.user.id)
     return NextResponse.json(
-      dateWarnings.length > 0 ? { ...culture, warnings: dateWarnings } : culture,
+      {
+        ...reponse,
+        ...(dateWarnings.length > 0 ? { warnings: dateWarnings } : {}),
+        ...(alerteSaison ? { alerteSaison } : {}),
+      },
       { status: 201 }
     )
   } catch (error) {

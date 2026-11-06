@@ -6,6 +6,7 @@
  */
 
 import * as React from "react"
+import { useSearchParams } from "next/navigation"
 import {
   Stethoscope,
   Egg,
@@ -25,9 +26,11 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useToast } from "@/hooks/use-toast"
+import { updateDashboardSearchParams } from "@/lib/dashboard-navigation"
 import { useFiliereSelection, capacitesSelection } from "@/lib/elevage/filiere-context"
 import { formatRemisesEnVente } from "@/lib/elevage/remise-vente-label"
 import { SoinDetailDialog } from "@/components/elevage/SoinDetailDialog"
+import { libelleTypeSoin } from "@/lib/elevage/types-soin"
 import { LigneRegistre } from "@/components/accueil/LigneRegistre"
 import { PastilleEtat } from "@/components/accueil/PastilleEtat"
 import { etatEcheance } from "@/lib/accueil/elevage"
@@ -125,14 +128,6 @@ type AttenteActive = {
   oeufs?: { remiseVente: string } | null
 }
 
-const SOIN_TYPE_LABELS: Record<string, string> = {
-  vaccination: "Vaccination",
-  vermifuge: "Vermifuge",
-  traitement: "Traitement",
-  naissance_prevue: "Naissance prévue",
-  autre: "Autre",
-}
-
 const JOURS = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim']
 
 // ============================================================
@@ -147,6 +142,36 @@ function getWeekStart(offset: number): Date {
   start.setDate(now.getDate() + diff)
   start.setHours(0, 0, 0, 0)
   return start
+}
+
+// QA cmv5jwqub (2026-10-12) — la semaine consultée repartait sur la semaine
+// courante à chaque rechargement : l'offset ne vivait que dans l'état React.
+// L'URL porte désormais le lundi affiché (`?semaine=AAAA-MM-JJ`, absent pour
+// la semaine courante), comme `tab`/`sub` pour les onglets.
+const SEMAINE_PARAM = "semaine"
+
+/** Lundi 00:00 (heure locale) de la semaine contenant `date`. */
+function lundiDe(date: Date): Date {
+  const d = new Date(date)
+  const day = d.getDay()
+  d.setDate(d.getDate() + (day === 0 ? -6 : 1 - day))
+  d.setHours(0, 0, 0, 0)
+  return d
+}
+
+/** AAAA-MM-JJ en heure locale (pas d'ISO UTC : un lundi 00:00 à Paris serait un dimanche). */
+function cleJourLocal(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`
+}
+
+/** Décalage en semaines entre la semaine courante et celle du paramètre d'URL ; 0 si absent ou invalide. */
+function offsetDepuisParam(param: string | null): number {
+  if (!param || !/^\d{4}-\d{2}-\d{2}$/.test(param)) return 0
+  const [annee, mois, jour] = param.split("-").map(Number)
+  const cible = new Date(annee, mois - 1, jour)
+  // `new Date(2026, 12, 45)` ne donne pas NaN, il déborde : on exige l'aller-retour.
+  if (cible.getFullYear() !== annee || cible.getMonth() !== mois - 1 || cible.getDate() !== jour) return 0
+  return Math.round((lundiDe(cible).getTime() - lundiDe(new Date()).getTime()) / (7 * 86_400_000))
 }
 
 // QA caprin cms1vlsa9 — l'année est indispensable : en caprin on navigue en
@@ -183,10 +208,6 @@ function libelleCibleSoin(soin: Pick<SoinTask, 'animal' | 'lot'>): string {
   return a.nom || a.identifiant || '-'
 }
 
-function isSameDay(d1: Date, d2: Date): boolean {
-  return d1.getFullYear() === d2.getFullYear() && d1.getMonth() === d2.getMonth() && d1.getDate() === d2.getDate()
-}
-
 // Bug cmp8rtr5m (Marc 2026-05-16) — Off-by-one calendrier élevage.
 // `toISOString()` retourne du UTC : un dimanche local 00:00 CEST devient
 // samedi 22:00 UTC, donc split('T')[0] décale la clé d'un jour. On clé
@@ -206,7 +227,20 @@ export function CalendrierTab() {
   const { toast } = useToast()
   const filiereSel = useFiliereSelection()
   const caps = capacitesSelection(filiereSel)
-  const [weekOffset, setWeekOffset] = React.useState(0)
+  const searchParams = useSearchParams()
+  // Semaine lue dans l'URL au montage, puis resynchronisée si l'URL change
+  // (retour arrière, lien) ; voir SEMAINE_PARAM.
+  const [weekOffset, setWeekOffset] = React.useState(() => offsetDepuisParam(searchParams.get(SEMAINE_PARAM)))
+  React.useEffect(() => {
+    setWeekOffset(offsetDepuisParam(searchParams.get(SEMAINE_PARAM)))
+  }, [searchParams])
+  const allerSemaine = React.useCallback((offset: number) => {
+    setWeekOffset(offset)
+    const params = new URLSearchParams(window.location.search)
+    if (offset === 0) params.delete(SEMAINE_PARAM)
+    else params.set(SEMAINE_PARAM, cleJourLocal(getWeekStart(offset)))
+    updateDashboardSearchParams(params, "replace")
+  }, [])
   const [isLoading, setIsLoading] = React.useState(true)
   const [data, setData] = React.useState<TachesData | null>(null)
   // Bug cmp8smrwe — masquer les tâches déjà faites par défaut.
@@ -351,11 +385,11 @@ export function CalendrierTab() {
       {/* Navigation semaine */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Button variant="ghost" size="sm" onClick={() => setWeekOffset(o => o - 1)}>
+          <Button variant="ghost" size="sm" aria-label="Semaine précédente" onClick={() => allerSemaine(weekOffset - 1)}>
             <ChevronLeft className="h-4 w-4" />
           </Button>
           <button
-            onClick={() => setWeekOffset(0)}
+            onClick={() => allerSemaine(0)}
             className="text-sm font-medium hover:text-amber-600 min-w-[180px] text-center transition-colors"
           >
             {weekOffset === 0
@@ -367,7 +401,7 @@ export function CalendrierTab() {
                   : formatDateRange(weekStart, weekEnd)
             }
           </button>
-          <Button variant="ghost" size="sm" onClick={() => setWeekOffset(o => o + 1)}>
+          <Button variant="ghost" size="sm" aria-label="Semaine suivante" onClick={() => allerSemaine(weekOffset + 1)}>
             <ChevronRight className="h-4 w-4" />
           </Button>
         </div>
@@ -564,9 +598,9 @@ export function CalendrierTab() {
                         <TooltipContent side="bottom" className="max-w-xs text-left text-xs">
                           <p className="font-semibold mb-1">Saisie anormale détectée</p>
                           <p>
-                            La collecte de la semaine dépasse l'attendu théorique
+                            La collecte de la semaine dépasse l&apos;attendu théorique
                             ({Math.round(attenduSem)} œufs pour cet effectif × saison).
-                            Vérifiez les dernières saisies ou l'effectif du lot.
+                            Vérifiez les dernières saisies ou l&apos;effectif du lot.
                           </p>
                         </TooltipContent>
                       </Tooltip>
@@ -642,7 +676,7 @@ export function CalendrierTab() {
                           <span className="break-words [overflow-wrap:anywhere]">
                             {soin.numeroInjection
                               ? `Injection ${soin.numeroInjection}/${soin.nombreInjections ?? "?"}`
-                              : SOIN_TYPE_LABELS[soin.type] || soin.type}
+                              : libelleTypeSoin(soin.type)}
                             {soin.produit ? ` · ${soin.produit}` : ""}
                           </span>
                         </div>
@@ -755,7 +789,7 @@ export function CalendrierTab() {
                         etat={etat}
                         titre={libelleCibleSoin(soin)}
                         meta={[
-                          SOIN_TYPE_LABELS[soin.type] || soin.type,
+                          libelleTypeSoin(soin.type),
                           soin.produit || soin.description || "",
                           libelleDatePrevue(soin.date),
                           libelleRetard(retard),
@@ -775,7 +809,6 @@ export function CalendrierTab() {
       <SoinDetailDialog
         soin={soinDetail}
         onClose={() => setSoinDetail(null)}
-        typeLabels={SOIN_TYPE_LABELS}
         onMarquerFait={async (s) => { await toggleInjection(s as SoinTask, false); setSoinDetail(null) }}
         onRouvrir={async (s) => { await toggleInjection(s as SoinTask, true); setSoinDetail(null) }}
       />

@@ -3,12 +3,14 @@
  * DELETE /api/user/delete-data
  */
 
-import { NextRequest, NextResponse } from 'next/server'
+import { NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { requireAuthApi } from '@/lib/auth-utils'
 import { getUserId, refusSiPasProprietaire } from '@/lib/exploitation/garde-session'
+import { MESSAGES_REFUS_DEMO, refusSiCompteDemo } from '@/lib/demo-garde'
+import { supprimerMesuresBrutesDuCompte } from '@/lib/capteurs/agregats'
 
-export async function DELETE(request: NextRequest) {
+export async function DELETE() {
   const { error, session } = await requireAuthApi()
   if (error) return error
   // Vider l'exploitation n'est jamais le geste d'un compte invité.
@@ -18,9 +20,32 @@ export async function DELETE(request: NextRequest) {
   try {
     const userId = getUserId(session)
 
+    // Le compte de démonstration est partagé, identifiants publics : un
+    // visiteur pouvait vider la ferme de démonstration pour tous les suivants.
+    const refusDemo = await refusSiCompteDemo(userId, MESSAGES_REFUS_DEMO.viderDonnees)
+    if (refusDemo) return refusDemo
+
+    // Seules les livraisons (bons, factures) lient un lot à un document à
+    // conserver ; une perte ou un usage interne du verger part avec son lot.
+    if (await prisma.mouvementStockCommercial.count({ where: { userId, nature: 'livraison' } })) return NextResponse.json({ error: 'Ces lots sont liés à des bons ou factures. Ils doivent être conservés avec leurs documents commerciaux ; l’effacement partiel est impossible.' }, { status: 409 })
+
+    // Mesures brutes des capteurs d'abord, par lots validés chacun seul
+    // (revue du 2026-10-30) : 90 jours d'historique comptent des centaines de
+    // milliers de lignes, que la cascade faisait supprimer dans la transaction
+    // ci-dessous, au délai par défaut de 5 s. Les supprimer d'abord va dans le
+    // sens de la demande ; si la suite échoue, un nouvel essai la termine.
+    const mesuresCapteurs = await supprimerMesuresBrutesDuCompte(userId)
+
     // Supprimer toutes les données utilisateur
     // Ordre important pour respecter les contraintes de clés étrangères
     const results = await prisma.$transaction(async (tx) => {
+      // 0. Sorties physiques des lots du verger (pertes, usages internes,
+      // fruits transformés) : elles référencent leurs lots sans cascade (revue
+      // du 2026-10-30). Puis les produits transformés jamais livrés, issus de
+      // ces fruits.
+      await tx.mouvementStockCommercial.deleteMany({ where: { userId, nature: { not: 'livraison' } } })
+      const lotsTransformes = await tx.lotTransforme.deleteMany({ where: { userId } })
+
       // 1. Irrigations planifiées (dépendent de cultures)
       const irrigations = await tx.irrigationPlanifiee.deleteMany({
         where: { userId },
@@ -66,6 +91,14 @@ export async function DELETE(request: NextRequest) {
         where: { userId },
       })
 
+      // 10. Capteurs connectés (2026-10-23) : les connecteurs, et en cascade
+      // leurs capteurs, positions, agrégats journaliers et le brut arrivé
+      // depuis la suppression par lots. Leurs jetons cessent aussitôt de
+      // fonctionner : un webhook resté branché ne réécrit rien.
+      const connecteursCapteurs = await tx.connecteurCapteurs.deleteMany({
+        where: { userId },
+      })
+
       return {
         irrigations: irrigations.count,
         recoltes: recoltes.count,
@@ -76,15 +109,18 @@ export async function DELETE(request: NextRequest) {
         objets: objets.count,
         arbres: arbres.count,
         notes: notes.count,
+        connecteursCapteurs: connecteursCapteurs.count,
+        lotsTransformes: lotsTransformes.count,
       }
     })
 
-    const total = Object.values(results).reduce((sum, count) => sum + count, 0)
+    const details = { ...results, mesuresCapteurs }
+    const total = Object.values(details).reduce((sum, count) => sum + count, 0)
 
     return NextResponse.json({
       success: true,
       message: `${total} enregistrements supprimés`,
-      details: results,
+      details,
     })
   } catch (error) {
     console.error('DELETE /api/user/delete-data error:', error)

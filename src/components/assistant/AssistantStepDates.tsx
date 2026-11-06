@@ -31,13 +31,15 @@ import { format, getISOWeek } from "date-fns"
 import { fr } from "date-fns/locale"
 import {
   calculerDatesCulture,
-  estimerNombrePlants,
   estimerRendement,
   formatSemaine,
 } from "@/lib/assistant-helpers"
 import { evaluerOccupationPlanche, type VerdictOccupation } from "@/lib/planche-validation"
+import { nbPlantsCulture } from "@/lib/cultures/quantite-plants"
 import type { CultureData, PlancheData, EspeceData, ITPData } from "./AssistantDialog"
 import { formatQuantite } from "@/lib/recolte/quantites"
+import { jourEnvoye } from "./corps-culture-semer"
+import { alerteSaisonCulture } from "@/lib/cultures/saison-culture"
 
 type DateMode = "calculated" | "manual"
 
@@ -147,6 +149,13 @@ export function AssistantStepDates({
     })
   }, [datesCalculees, dateMode, itp]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Date d'implantation hors de la fenêtre de l'ITP (2026-10-25) : même règle
+  // que la route, dite dans un encart, sans bloquer la suite.
+  const alerteSaison = React.useMemo(
+    () => alerteSaisonCulture({ itp, dateSemis: culture.dateSemis, datePlantation: culture.datePlantation }),
+    [itp, culture.dateSemis, culture.datePlantation]
+  )
+
   // --- Date mode toggle ---
   const handleDateModeChange = (newMode: DateMode) => {
     if (newMode === dateMode) return
@@ -182,11 +191,14 @@ export function AssistantStepDates({
         setManualRecolte(value)
         break
     }
-    // QA 2026-07-30 — « T00:00:00 » est interprété en heure locale, puis
-    // sérialisé en UTC à l'envoi : une date saisie au 05/08 partait au
-    // 04/08T22:00Z en Europe/Paris, soit un jour de moins à l'affichage. On
-    // ancre donc la date à midi UTC, comme les dates calculées depuis un ITP.
-    const date = value ? new Date(`${value}T12:00:00.000Z`) : null
+    // Minuit LOCAL du jour saisi, comme les dates calculées depuis l'ITP
+    // (`semaineVersDate`). Le midi UTC du 2026-07-30 compensait un envoi par
+    // `toISOString()` (05/08 parti au 04/08T22:00Z à Paris) ; l'envoi passe
+    // désormais par le jour local (`jourEnvoye`, ticket cmvnulry1), juste dans
+    // tout fuseau pour un minuit local, alors qu'un midi UTC tombe le
+    // lendemain à UTC+12 (Wallis-et-Futuna).
+    const [annee, mois, jour] = value.split("-").map(Number)
+    const date = value ? new Date(annee, mois - 1, jour) : null
     onCultureChange({ [field]: date })
   }
 
@@ -201,14 +213,15 @@ export function AssistantStepDates({
     return 0
   }, [culture.longueur, planche.largeur, planche.surface])
 
+  // Mêmes valeurs et même règle que le récapitulatif, qui envoie ce nombre à
+  // la création (ticket cmvnpkkhp) : pas de rang ni d'espacement supposés.
   const nbPlants = React.useMemo(() => {
-    return estimerNombrePlants(
-      culture.longueur || planche.longueur || 0,
-      planche.largeur || 0,
-      culture.nbRangs || 1,
-      culture.espacement || 30
+    return nbPlantsCulture(
+      culture.longueur || planche.longueur || null,
+      culture.nbRangs || null,
+      culture.espacement || null
     )
-  }, [culture.longueur, planche.longueur, planche.largeur, culture.nbRangs, culture.espacement])
+  }, [culture.longueur, planche.longueur, culture.nbRangs, culture.espacement])
 
   // L'unité voyage avec le rendement : sans elle, un fruitier en kg/ARBRE
   // était projeté au m² (kiwi 25 → 750 kg sur 30 m²).
@@ -264,10 +277,9 @@ export function AssistantStepDates({
         // est lue par son identifiant et vérifiée par le serveur, sur les
         // cultures qui chevauchent la période ; une planche en cours de
         // création n'a encore aucune culture.
-        // Même sérialisation que l'enregistrement (AssistantStepRecap) : le
-        // verdict compare des instants, pas des jours.
-        const enIso = (d: Date | string | null | undefined) =>
-          d ? new Date(d).toISOString() : ""
+        // Même sérialisation que l'enregistrement (`corpsCultureSemer`) : le
+        // verdict porte sur les jours qui seront enregistrés (cmvnulry1).
+        const enJour = (d: Date | string | null | undefined) => jourEnvoye(d) ?? ""
         let verdict: VerdictOccupation | null = null
         if (plancheId) {
           const params = new URLSearchParams({
@@ -275,9 +287,9 @@ export function AssistantStepDates({
             itpId: itp?.id ?? "",
             nbRangs: String(culture.nbRangs),
             longueur: culture.longueur ? String(culture.longueur) : "",
-            dateSemis: enIso(culture.dateSemis),
-            datePlantation: enIso(culture.datePlantation),
-            dateRecolte: enIso(culture.dateRecolte),
+            dateSemis: enJour(culture.dateSemis),
+            datePlantation: enJour(culture.datePlantation),
+            dateRecolte: enJour(culture.dateRecolte),
           })
           const res = await fetch(`/api/cultures/occupation?${params.toString()}`)
           if (cancelled) return
@@ -459,8 +471,8 @@ export function AssistantStepDates({
                       </TooltipTrigger>
                       <TooltipContent>
                         <p className="max-w-xs text-xs">
-                          Décalez les dates de quelques semaines si necessaire
-                          (étalement des recoltes, conditions météo...)
+                          Décalez les dates de quelques semaines si nécessaire
+                          (étalement des récoltes, conditions météo...)
                         </p>
                       </TooltipContent>
                     </Tooltip>
@@ -629,6 +641,17 @@ export function AssistantStepDates({
           </>
         )}
 
+        {alerteSaison && (
+          <Alert className="border-amber-300 bg-amber-50 text-amber-900">
+            <AlertTriangle className="h-4 w-4 text-amber-600" />
+            <AlertTitle>Hors saison pour cet itinéraire</AlertTitle>
+            <AlertDescription>
+              {alerteSaison.message} Vous pouvez continuer : décalez les dates ou
+              changez d&apos;année si ce n&apos;est pas voulu.
+            </AlertDescription>
+          </Alert>
+        )}
+
         {/* ====== SECTION 2: QUANTITÉS ====== */}
         <div className="grid grid-cols-2 gap-4">
           <div className="space-y-2">
@@ -761,7 +784,7 @@ export function AssistantStepDates({
                   <Sprout className="h-3 w-3" />
                   Plants
                 </div>
-                <div className="font-medium">{nbPlants}</div>
+                <div className="font-medium">{nbPlants ?? "—"}</div>
               </div>
               <div>
                 <div className="flex items-center justify-center gap-1 text-muted-foreground text-xs mb-1">

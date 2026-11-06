@@ -6,6 +6,7 @@
  */
 
 import * as React from "react"
+import { ReglementsDialog } from "@/components/comptabilite/ReglementsDialog"
 import { ouvrirApercu } from "@/lib/apercu-document"
 import Link from "next/link"
 import { ArrowLeft, FileText, RefreshCw, Check, Plus, AlertCircle, Download, Printer, CreditCard, Eye } from "lucide-react"
@@ -21,36 +22,74 @@ import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { SelectNatif } from "@/components/ui/select-natif"
+import { CATEGORIES_OPERATION, LABELS_CATEGORIE_OPERATION } from "@/lib/facture-regles"
 import { getAvailableYears } from "@/components/year-selector"
+import { useExploitation } from '@/hooks/use-exploitation'
 import { useToast } from "@/hooks/use-toast"
 import { confirmDialog } from "@/lib/global-dialog"
-import { todayLocalISO } from '@/lib/format-utils'
+import { formatMontantDevise, todayLocalISO } from '@/lib/format-utils'
 import { factureSansTaxe } from '@/lib/territoires'
-import { construireImpayees, type Impayee } from '@/lib/comptabilite/impayees'
+import { construireImpayees, type FactureImpayee, type Impayee } from '@/lib/comptabilite/impayees'
+import { adresseDeFiche, clientDesigneParNom } from '@/lib/comptabilite/rattachement-client'
+import { formatSiren, formatSiret } from '@/lib/siret'
+import { ChoisirStock, prixHTDuStock } from '@/components/commercial/ChoisirStock'
+import type { ArticleStockCommercial } from '@/lib/commercial/stock-types'
+import { DocumentsCommerciaux } from '@/components/commercial/DocumentsCommerciaux'
+import { EnvoyerDocument } from '@/components/commercial/EnvoyerDocument'
+import { updateDashboardSearchParams } from '@/lib/dashboard-navigation'
 
 interface LigneFacture {
+  articleStockType?: string | null
+  articleStockId?: string | null
   id: string
   description: string
   quantite: number
   unite: string
   prixUnitaire: number // HT
-  tauxTVA: number      // 0 | 2.1 | 5.5 | 10 | 20
+  tauxTVA: number      // 0 | 2.1 | 5.5 | 10 | 20 (taux appliqué)
+  /**
+   * Taux choisi dans la ligne. Il est gardé à part du taux appliqué : un
+   * client exonéré ou une franchise imposent 0 %, et le taux choisi revient
+   * si la fiche est détachée.
+   */
+  tauxChoisi: number
   montantHT: number
   montantTVA: number
   montantTTC: number
 }
 
-// Taux TVA présélectionné par catégorie (PROMPT 14C §10)
-const TAUX_TVA_PAR_CATEGORIE: Record<string, number> = {
-  legumes: 5.5,
-  fruits: 5.5,
-  oeufs: 5.5,
-  produits_transformes: 5.5,
-  animaux_vivants: 10,
-  aliments_animaux: 10,
-  bois: 20,
-  service: 20,
-  main_oeuvre: 0,
+/** Fiche client proposée par le formulaire (GET /api/comptabilite/clients). */
+interface ClientFiche {
+  id: number
+  nom: string
+  type: string
+  email: string | null
+  adresse: string | null
+  codePostal: string | null
+  ville: string | null
+  siret: string | null
+  siren: string | null
+  tvaIntra: string | null
+  /** Client exonéré de TVA : creerFacture met toutes les lignes à 0 %. */
+  exonererTVA: boolean
+}
+
+const LIBELLES_TYPE_CLIENT: Record<string, string> = {
+  particulier: "Particulier",
+  professionnel: "Professionnel",
+  association: "Association",
+  amap: "AMAP",
+}
+
+/** Identité de la fiche telle qu'elle sera figée sur la facture. */
+function identiteFiche(c: ClientFiche): string {
+  return [
+    LIBELLES_TYPE_CLIENT[c.type] ?? c.type,
+    c.siret ? `SIRET ${formatSiret(c.siret)}` : c.siren ? `SIREN ${formatSiren(c.siren)}` : null,
+    c.tvaIntra ? `TVA intracommunautaire ${c.tvaIntra}` : null,
+    c.email,
+    adresseDeFiche(c) || null,
+  ].filter(Boolean).join(" · ")
 }
 
 interface FactureEmise {
@@ -64,10 +103,13 @@ interface FactureEmise {
   notes?: string | null
   totalHT: number
   totalTTC: number
+  montantRegle?: number | null
   statut: string
   factureOrigineId?: number | null
   /** Résolue côté API depuis `factureOrigineId` (cf. ticket cmsx5zhke). */
   factureOrigine?: { id: number; numero: string; clientNom: string } | null
+  mouvementsStock?: Array<{ quantite: number }>
+  documentsCommerciaux?: Array<{ id: string; numero: string; type: string }>
 }
 
 /**
@@ -86,8 +128,22 @@ function objetAffiche(f: FactureEmise): string {
 }
 
 export default function FacturesPage() {
+  const { peutEcrire } = useExploitation()
   const { toast } = useToast()
   const [activeTab, setActiveTab] = React.useState("impayees")
+  React.useEffect(() => {
+    const lire = () => {
+      const t = new URLSearchParams(window.location.search).get('tab')
+      if (t && ['impayees', 'emises', 'generer', 'avoir', 'devis', 'livraisons'].includes(t)) setActiveTab(t)
+    }
+    lire(); window.addEventListener('popstate', lire)
+    return () => window.removeEventListener('popstate', lire)
+  }, [])
+  function changerOnglet(t: string) {
+    setActiveTab(t)
+    const q = new URLSearchParams(window.location.search); q.set('tab', t); q.delete('document')
+    updateDashboardSearchParams(q, 'push')
+  }
   const [isLoading, setIsLoading] = React.useState(true)
   const [impayees, setImpayees] = React.useState<Impayee[]>([])
   const [total, setTotal] = React.useState(0)
@@ -104,15 +160,57 @@ export default function FacturesPage() {
     echeance: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
     client: "",
     adresse: "",
-    email: "",
+    // Ticket cmvfljaru (2026-10-19) — fiche client choisie (id) ; `sansFiche`
+    // quand l'utilisateur refuse le rattachement proposé pour un nom exact.
+    // Le champ « Email » a disparu : il n'était jamais envoyé, le courriel
+    // imprimé est celui de la fiche.
+    clientId: "",
+    sansFiche: false,
     objet: "",
     notes: "",
+    // Facturation électronique (lot 1) : catégorie de l'opération (BT-23) et
+    // livraison si elle diffère de la facture (BT-72, BG-15).
+    categorieOperation: "biens",
+    dateLivraison: "",
+    livraisonDifferente: false,
+    adresseLivraison: "",
+    codePostalLivraison: "",
+    villeLivraison: "",
+    paysLivraison: "France",
   })
+  const cleStockFacture = React.useRef<string | null>(null)
   const [lignes, setLignes] = React.useState<LigneFacture[]>([
-    { id: "1", description: "", quantite: 1, unite: "unité", prixUnitaire: 0, tauxTVA: 5.5, montantHT: 0, montantTVA: 0, montantTTC: 0 }
+    { id: "1", description: "", quantite: 1, unite: "unité", prixUnitaire: 0, tauxTVA: 5.5, tauxChoisi: 5.5, montantHT: 0, montantTVA: 0, montantTTC: 0 }
   ])
   const [savingFacture, setSavingFacture] = React.useState(false)
+  const [clientsFiches, setClientsFiches] = React.useState<ClientFiche[]>([])
   const [exploitationOk, setExploitationOk] = React.useState<boolean | null>(null)
+
+  // Ticket cmvfljaru — fiches clients actives, proposées par le formulaire.
+  React.useEffect(() => {
+    fetch('/api/comptabilite/clients?actif=true')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => setClientsFiches(Array.isArray(j?.data) ? j.data : []))
+      .catch(() => setClientsFiches([]))
+  }, [])
+
+  // Fiche choisie au sélecteur, sinon fiche désignée par le nom saisi
+  // (`clientDesigneParNom`, même règle que le contrôle de la route) : dans les
+  // deux cas son id est envoyé, la route ne devine plus rien.
+  const ficheChoisie = clientsFiches.find((c) => String(c.id) === factureData.clientId) ?? null
+  const ficheDuNom = !ficheChoisie && !factureData.sansFiche ? clientDesigneParNom(clientsFiches, factureData.client) : null
+  const ficheRattachee = ficheChoisie ?? ficheDuNom
+
+  const choisirFiche = (id: string) => {
+    const fiche = clientsFiches.find((c) => String(c.id) === id)
+    if (!fiche) {
+      // « Sans fiche » choisi au sélecteur : aucun rattachement, même si le
+      // nom saisi désigne une fiche (la route reçoit clientId null).
+      setFactureData({ ...factureData, clientId: "", sansFiche: true })
+      return
+    }
+    setFactureData({ ...factureData, clientId: String(fiche.id), sansFiche: false, client: fiche.nom, adresse: adresseDeFiche(fiche) || factureData.adresse })
+  }
   const [regimeTva, setRegimeTva] = React.useState<string | null>(null)
 
   React.useEffect(() => {
@@ -128,7 +226,11 @@ export default function FacturesPage() {
   // Franchise 293B / non-assujetti / TGC : pas de TVA à facturer. Le formulaire
   // forçait quand même 5,5 % à l'affichage alors que la facture émise est à 0
   // (creerFacture neutralise côté serveur) → aperçu trompeur (audit #48).
-  const sansTaxe = factureSansTaxe(regimeTva)
+  // Ticket cmvfljaru (revue 2026-10-19) — une fiche exonérée de TVA
+  // (`exonererTVA`) impose aussi 0 % : creerFacture l'applique côté serveur
+  // (le TTC saisi devenait le HT alors que l'écran affichait la TVA). L'écran
+  // suit désormais la même règle que le serveur.
+  const sansTaxe = factureSansTaxe(regimeTva) || !!ficheRattachee?.exonererTVA
 
   // DEV1 #7 — État formulaire avoir refondu : sélecteur facture origine,
   // recopie auto client + montant, persistance via /api/comptabilite/factures
@@ -158,7 +260,7 @@ export default function FacturesPage() {
         fetch(`/api/comptabilite/factures?year=all`),
       ])
 
-      let factures: any[] = []
+      let factures: FactureImpayee[] = []
       if (facturesRes.ok) {
         const facturesData = await facturesRes.json()
         factures = Array.isArray(facturesData)
@@ -174,7 +276,7 @@ export default function FacturesPage() {
       const { items, total: totalImpayees } = construireImpayees({ factures, ventes, ventesManuelles })
       setImpayees(items)
       setTotal(totalImpayees)
-    } catch (error) {
+    } catch {
       toast({ variant: "destructive", title: "Erreur", description: "Impossible de charger les données" })
     } finally {
       setIsLoading(false)
@@ -225,25 +327,27 @@ export default function FacturesPage() {
     ouvrirApercu(`/api/comptabilite/factures/${factureId}/pdf`, `Facture ${numero}`)
   }
 
-  const downloadFactureUBL = async (factureId: number, numero: string) => {
+  /** UBL 2.1 (XML) ou Factur-X (PDF/A-3 avec XML CII) : même contrôle de complétude côté serveur (422 détaillé). */
+  const telechargerExportFacture = async (factureId: number, numero: string, format: "ubl" | "facturx") => {
+    const libelle = format === "ubl" ? "UBL" : "Factur-X"
     try {
-      const res = await fetch(`/api/comptabilite/factures/${factureId}/ubl`, { credentials: "include" })
+      const res = await fetch(`/api/comptabilite/factures/${factureId}/${format}`, { credentials: "include" })
       if (!res.ok) {
         const payload = await res.json().catch(() => ({}))
         const details = Array.isArray(payload.details) ? payload.details.join(" · ") : ""
-        toast({ variant: "destructive", title: "Export UBL impossible", description: [payload.error || `Erreur ${res.status}`, details].filter(Boolean).join(" — ") })
+        toast({ variant: "destructive", title: `Export ${libelle} impossible`, description: [payload.error || `Erreur ${res.status}`, details].filter(Boolean).join(" — ") })
         return
       }
       const url = URL.createObjectURL(await res.blob())
       const link = document.createElement("a")
       link.href = url
-      link.download = `${numero}.ubl.xml`
+      link.download = format === "ubl" ? `${numero}.ubl.xml` : `${numero}-facturx.pdf`
       document.body.appendChild(link)
       link.click()
       document.body.removeChild(link)
       setTimeout(() => URL.revokeObjectURL(url), 1000)
     } catch {
-      toast({ variant: "destructive", title: "Export UBL impossible", description: "Erreur réseau" })
+      toast({ variant: "destructive", title: `Export ${libelle} impossible`, description: "Erreur réseau" })
     }
   }
 
@@ -255,35 +359,6 @@ export default function FacturesPage() {
     const date = new Date(dateStr)
     const now = new Date()
     return Math.floor((now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24))
-  }
-
-  const markAsPaid = async (item: Impayee) => {
-    try {
-      // Une facture passe par sa machine à états (emise→payee, pose la date de
-      // paiement) ; les ventes brutes/manuelles par leur flag `paye`.
-      const response = item.source === 'Facture'
-        ? await fetch('/api/comptabilite/factures', {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: item.id, statut: 'payee' }),
-          })
-        : await fetch(
-            item.source === 'VenteProduit' ? '/api/elevage/ventes' : '/api/comptabilite/ventes-manuelles',
-            {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ id: item.id, paye: true }),
-            },
-          )
-
-      if (!response.ok) throw new Error('Erreur')
-
-      toast({ title: "Marqué comme payé", description: formatEuro(item.montant) })
-      fetchImpayees()
-      fetchFacturesEmises()
-    } catch {
-      toast({ variant: "destructive", title: "Erreur", description: "Impossible de mettre à jour" })
-    }
   }
 
   // Transition de statut d'une facture émise (machine à états côté API :
@@ -315,23 +390,33 @@ export default function FacturesPage() {
   const addLigne = () => {
     setLignes([
       ...lignes,
-      { id: String(Date.now()), description: "", quantite: 1, unite: "unité", prixUnitaire: 0, tauxTVA: 5.5, montantHT: 0, montantTVA: 0, montantTTC: 0 }
+      { id: String(Date.now()), description: "", quantite: 1, unite: "unité", prixUnitaire: 0, tauxTVA: 5.5, tauxChoisi: 5.5, montantHT: 0, montantTVA: 0, montantTTC: 0 }
     ])
   }
 
-  const recalcLigne = (l: LigneFacture): LigneFacture => {
+  /** Montants d'une ligne ; en franchise ou pour un client exonéré, la TVA est nulle quelle que soit la catégorie. */
+  const calculerLigne = (l: LigneFacture, exonere: boolean): LigneFacture => {
     const ht = Math.round(l.quantite * l.prixUnitaire * 100) / 100
-    // En franchise/exonéré, la TVA est nulle quelle que soit la catégorie.
-    const tauxEffectif = sansTaxe ? 0 : l.tauxTVA
+    const tauxEffectif = exonere ? 0 : l.tauxChoisi
     const tva = Math.round(ht * (tauxEffectif / 100) * 100) / 100
     const ttc = Math.round((ht + tva) * 100) / 100
     return { ...l, tauxTVA: tauxEffectif, montantHT: ht, montantTVA: tva, montantTTC: ttc }
   }
+  const recalcLigne = (l: LigneFacture): LigneFacture => calculerLigne(l, sansTaxe)
 
-  const updateLigne = (id: string, field: keyof LigneFacture, value: any) => {
+  // Rattacher ou détacher une fiche exonérée (ou charger le régime) change le
+  // taux applicable : toutes les lignes sont recalculées.
+  React.useEffect(() => {
+    setLignes((ls) => ls.map((l) => calculerLigne(l, sansTaxe)))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sansTaxe])
+
+  const updateLigne = <K extends keyof LigneFacture>(id: string, field: K, value: LigneFacture[K]) => {
     setLignes(lignes.map(l => {
       if (l.id !== id) return l
-      const updated = { ...l, [field]: value }
+      const updated: LigneFacture = field === 'tauxTVA'
+        ? { ...l, tauxTVA: value as number, tauxChoisi: value as number }
+        : { ...l, [field]: value }
       if (field === 'quantite' || field === 'prixUnitaire' || field === 'tauxTVA') {
         return recalcLigne(updated)
       }
@@ -339,6 +424,12 @@ export default function FacturesPage() {
     }))
   }
 
+  const ajouterStockFacture = (a: ArticleStockCommercial) => {
+    const ligne = recalcLigne({ id: crypto.randomUUID(), description: a.nom, quantite: 1, unite: a.unite,
+      prixUnitaire: prixHTDuStock(a, sansTaxe) ?? 0, tauxTVA: a.tauxTVA, tauxChoisi: a.tauxTVA,
+      montantHT: 0, montantTVA: 0, montantTTC: 0, articleStockType: a.type, articleStockId: a.id })
+    setLignes((ls) => ls.length === 1 && !ls[0].description ? [ligne] : [...ls, ligne])
+  }
   const removeLigne = (id: string) => {
     if (lignes.length > 1) {
       setLignes(lignes.filter(l => l.id !== id))
@@ -373,7 +464,17 @@ export default function FacturesPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           type: 'facture',
-          clientNom: factureData.client,
+          cleCreationStock: cleStockFacture.current ||= crypto.randomUUID(),
+          // Ticket cmvfljaru — fiche choisie : son id ; refus explicite : null ;
+          // sinon absent, et la route rattache la fiche de même nom s'il y en
+          // a une seule (identité de l'acheteur figée à l'émission).
+          // Ticket cmvfljaru (revue 2026-10-19) — la fiche affichée dans
+          // l'encadré (choisie ou désignée par le nom) part par son id ;
+          // « Facturer sans la fiche » envoie null. Sans fiche connue, le
+          // champ est omis : la route refuse (409) un nom qui désigne une
+          // fiche plutôt que de deviner.
+          clientId: ficheRattachee ? ficheRattachee.id : factureData.sansFiche ? null : undefined,
+          clientNom: ficheRattachee ? ficheRattachee.nom : factureData.client,
           clientAdresse: factureData.adresse || null,
           date: factureData.date,
           dateEcheance: factureData.echeance,
@@ -383,7 +484,14 @@ export default function FacturesPage() {
           totalTTC: totalFacture,
           statut: 'emise',
           notes: factureData.notes,
+          categorieOperation: factureData.categorieOperation,
+          dateLivraison: factureData.dateLivraison || null,
+          adresseLivraison: factureData.livraisonDifferente ? factureData.adresseLivraison || null : null,
+          codePostalLivraison: factureData.livraisonDifferente ? factureData.codePostalLivraison || null : null,
+          villeLivraison: factureData.livraisonDifferente ? factureData.villeLivraison || null : null,
+          paysLivraison: factureData.livraisonDifferente ? factureData.paysLivraison || null : null,
           lignes: lignes.map(l => ({
+            articleStockType: l.articleStockType, articleStockId: l.articleStockId,
             description: l.description,
             quantite: l.quantite,
             unite: l.unite,
@@ -400,17 +508,24 @@ export default function FacturesPage() {
         toast({ variant: 'destructive', title: 'Erreur', description: json.error || 'Échec de la création' })
         return
       }
-      toast({ title: 'Facture enregistrée', description: `Numéro ${json.data.numero}` })
+      toast({
+        title: 'Facture enregistrée',
+        description: json.data.client?.nom
+          ? `Numéro ${json.data.numero}, rattachée à la fiche « ${json.data.client.nom} »`
+          : `Numéro ${json.data.numero}`,
+      })
+      cleStockFacture.current = null
       // Réinitialise le formulaire
-      setLignes([{ id: '1', description: '', quantite: 1, unite: 'unité', prixUnitaire: 0, tauxTVA: 5.5, montantHT: 0, montantTVA: 0, montantTTC: 0 }])
+      setLignes([{ id: '1', description: '', quantite: 1, unite: 'unité', prixUnitaire: 0, tauxTVA: 5.5, tauxChoisi: 5.5, montantHT: 0, montantTVA: 0, montantTTC: 0 }])
       setFactureData({
         ...factureData,
-        client: '', adresse: '', email: '', objet: '', notes: '',
+        client: '', adresse: '', clientId: '', sansFiche: false, objet: '', notes: '',
+        dateLivraison: '', livraisonDifferente: false, adresseLivraison: '', codePostalLivraison: '', villeLivraison: '', paysLivraison: 'France',
       })
       // Recharge la liste & ouvre le PDF
       fetchFacturesEmises()
       ouvrirApercu(`/api/comptabilite/factures/${json.data.id}/pdf`, `Facture ${json.data.numero ?? ''}`.trim())
-      setActiveTab('emises')
+      changerOnglet('emises')
     } catch (err) {
       toast({ variant: 'destructive', title: 'Erreur réseau', description: String(err) })
     } finally {
@@ -486,7 +601,7 @@ export default function FacturesPage() {
       const created = json.data ?? json
       toast({
         title: "Avoir créé",
-        description: `${created.numero} — ${montantTTC.toFixed(2)} €`,
+        description: `${created.numero} — ${formatMontantDevise(montantTTC)}`,
       })
       // Reset form
       setAvoirData({
@@ -519,7 +634,7 @@ export default function FacturesPage() {
             <Link href="/comptabilite"><Button variant="ghost" size="sm"><ArrowLeft className="h-4 w-4 mr-2" />Comptabilité</Button></Link>
             <div className="flex items-center gap-2">
               <FileText className="h-6 w-6 text-blue-600" />
-              <h1 className="text-xl font-bold">Factures</h1>
+              <h1 className="text-xl font-bold">Devis et facturation</h1>
             </div>
           </div>
           <Button variant="outline" size="sm" onClick={fetchImpayees}><RefreshCw className="h-4 w-4" /></Button>
@@ -527,7 +642,7 @@ export default function FacturesPage() {
       </header>
 
       <div className="container mx-auto px-4 py-6">
-        <Tabs value={activeTab} onValueChange={setActiveTab}>
+        <Tabs value={activeTab} onValueChange={changerOnglet}>
           {/* Ticket cmsx6g3gq (QA 2026-08-17, viewport 375 px) — quatre onglets
               en `inline-flex` mesuraient 618 px : c'est le DOCUMENT qui
               débordait, pas le tableau des lignes. Le tableau, lui, a bien son
@@ -535,6 +650,8 @@ export default function FacturesPage() {
               parce que la page entière était décalée. Les onglets passent donc
               à la ligne sur mobile. */}
           <TabsList className="mb-6 flex h-auto w-full flex-wrap justify-start gap-1">
+            <TabsTrigger value="devis">Devis</TabsTrigger>
+            <TabsTrigger value="livraisons">Bons de livraison</TabsTrigger>
             <TabsTrigger value="impayees" className="flex items-center gap-2">
               <AlertCircle className="h-4 w-4" />
               Impayées
@@ -558,6 +675,9 @@ export default function FacturesPage() {
               Avoir
             </TabsTrigger>
           </TabsList>
+
+          <TabsContent value="devis"><DocumentsCommerciaux type="devis" onFacture={() => { fetchFacturesEmises(); fetchImpayees(); changerOnglet('emises') }} /></TabsContent>
+          <TabsContent value="livraisons"><DocumentsCommerciaux type="livraison" onFacture={() => { fetchFacturesEmises(); fetchImpayees(); changerOnglet('emises') }} /></TabsContent>
 
           {/* Onglet Impayées */}
           <TabsContent value="impayees">
@@ -635,15 +755,7 @@ export default function FacturesPage() {
                             <TableCell>{item.client || '-'}</TableCell>
                             <TableCell className="text-right font-bold text-amber-600">{formatEuro(item.montant)}</TableCell>
                             <TableCell>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => markAsPaid(item)}
-                                className="text-green-600 hover:text-green-700 hover:bg-green-50"
-                              >
-                                <Check className="h-4 w-4 mr-1" />
-                                Payé
-                              </Button>
+                              <ReglementsDialog type={item.source} id={item.id} onChange={() => { fetchImpayees(); fetchFacturesEmises() }} />
                             </TableCell>
                           </TableRow>
                         )
@@ -658,7 +770,7 @@ export default function FacturesPage() {
           {/* Onglet Factures émises */}
           <TabsContent value="emises">
             <p className="mb-4 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900">
-              L’export UBL produit un fichier structuré contrôlé avant téléchargement. Il ne constitue pas une transmission réglementaire : l’envoi doit passer par une plateforme agréée.
+              Les exports UBL 2.1 et Factur-X produisent un fichier structuré contrôlé avant téléchargement. Ils ne constituent pas une transmission réglementaire : l’envoi doit passer par une plateforme agréée (obligatoire pour l’émission des PME et micro-entreprises à partir du 1er septembre 2027).
             </p>
             <Card>
               <CardHeader>
@@ -683,7 +795,7 @@ export default function FacturesPage() {
               <CardContent>
                 {facturesEmises.length === 0 ? (
                   <p className="text-center text-muted-foreground py-8">
-                    Aucune facture émise cette annee.
+                    Aucune facture émise cette année.
                   </p>
                 ) : (
                   <Table>
@@ -708,6 +820,7 @@ export default function FacturesPage() {
                           <TableCell className="max-w-[180px] truncate">{f.clientNom}</TableCell>
                           <TableCell className="max-w-[200px] truncate text-muted-foreground">
                             {objetAffiche(f)}
+                            {f.documentsCommerciaux?.map((d) => <a key={d.id} className="mt-1 block text-xs text-primary underline" href={`/comptabilite/factures?tab=${d.type === 'devis' ? 'devis' : 'livraisons'}&document=${d.id}`}>{d.numero}</a>)}
                           </TableCell>
                           <TableCell className="text-right font-medium">{formatEuro(f.totalTTC)}</TableCell>
                           <TableCell>
@@ -736,19 +849,23 @@ export default function FacturesPage() {
                                           ? "Brouillon"
                                           : f.statut}
                             </Badge>
+                            {f.type !== 'avoir' && f.statut === 'payee' && f.montantRegle == null && <p className="mt-1 text-xs text-muted-foreground">Paiement déclaré sans détail. À vérifier dans Règlements.</p>}
+                            {f.type !== 'avoir' && f.montantRegle != null && <p className="mt-1 text-xs text-muted-foreground">Versements : {formatEuro(f.montantRegle)}</p>}
                           </TableCell>
                           <TableCell className="text-right">
-                            <div className="flex items-center justify-end gap-1">
+                            {peutEcrire && !!f.mouvementsStock?.length && (f.mouvementsStock.filter((m) => m.quantite < 0).length === f.mouvementsStock.filter((m) => m.quantite > 0).length ? <span className="block text-xs text-muted-foreground">Stock retourné</span> : <Button size="sm" variant="outline" onClick={async () => {
+                              if (!await confirmDialog('Toutes les quantités liées à cette facture seront remises en stock. Confirmez leur retour physique. La facture reste inchangée : émettez un avoir si un remboursement est dû.', { title: 'Retour en stock de la facture ?' })) return
+                              const r = await fetch(`/api/comptabilite/factures/${f.id}/stock`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'retourner' }) })
+                              const j = await r.json()
+                              if (!r.ok) { toast({ variant: 'destructive', title: 'Retour impossible', description: j.error }); return }
+                              toast({ title: 'Quantités remises en stock' }); fetchFacturesEmises()
+                            }}>Retour en stock</Button>)}
+                            <div className="flex flex-wrap items-center justify-end gap-1">
+                              {['emise', 'payee'].includes(f.statut) && <EnvoyerDocument type="facture" id={f.id} numero={f.numero} />}
+                              {f.type !== 'avoir' && ['emise', 'payee'].includes(f.statut) && <ReglementsDialog type="Facture" id={f.id} onChange={() => { fetchImpayees(); fetchFacturesEmises() }} />}
                               {f.statut === "emise" && (
                                 <>
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    title="Marquer payée"
-                                    onClick={() => updateFactureStatut(f.id, "payee", "Facture marquée payée")}
-                                  >
-                                    <Check className="h-4 w-4 text-green-600" />
-                                  </Button>
+
                                   <Button
                                     variant="ghost"
                                     size="sm"
@@ -768,15 +885,26 @@ export default function FacturesPage() {
                                 <Eye className="h-4 w-4 mr-1" />
                                 PDF
                               </Button>
-                              {f.type !== "avoir" && (
+                              {f.statut !== "brouillon" && (
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  title="Exporter au format structuré UBL 2.1"
-                                  onClick={() => downloadFactureUBL(f.id, f.numero)}
+                                  title="Exporter au format structuré UBL 2.1 (CreditNote pour un avoir)"
+                                  onClick={() => telechargerExportFacture(f.id, f.numero, "ubl")}
                                 >
                                   <Download className="h-4 w-4 mr-1" />
                                   UBL
+                                </Button>
+                              )}
+                              {f.statut !== "brouillon" && (
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  title="Exporter en Factur-X : PDF/A-3 avec le XML CII (profil EN 16931) incorporé"
+                                  onClick={() => telechargerExportFacture(f.id, f.numero, "facturx")}
+                                >
+                                  <Download className="h-4 w-4 mr-1" />
+                                  Factur-X
                                 </Button>
                               )}
                             </div>
@@ -823,34 +951,107 @@ export default function FacturesPage() {
                   </div>
                 </div>
 
+                {/* Ticket cmvfljaru (2026-10-19) — le formulaire n'offrait qu'un
+                    nom en texte libre : aucune fiche client à choisir, et une
+                    facture tapée au nom exact d'un client professionnel partait
+                    sans son SIRET. La fiche se choisit ici (ou est proposée
+                    dès que le nom saisi la désigne) ; son identité est figée
+                    sur la facture à l'émission. */}
                 <div className="grid gap-4 md:grid-cols-3">
                   <div>
-                    <Label>Client *</Label>
+                    <Label htmlFor="facture-fiche-client">Fiche client</Label>
+                    <SelectNatif
+                      id="facture-fiche-client"
+                      value={ficheRattachee ? String(ficheRattachee.id) : ""}
+                      onChange={(e) => choisirFiche(e.target.value)}
+                    >
+                      <option value="">Sans fiche (saisie libre)</option>
+                      {clientsFiches.map((c) => (
+                        <option key={c.id} value={String(c.id)}>
+                          {c.nom}{c.siret ? ` · SIRET ${formatSiret(c.siret)}` : ""}
+                        </option>
+                      ))}
+                    </SelectNatif>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {clientsFiches.length > 0
+                        ? `${clientsFiches.length} fiche${clientsFiches.length > 1 ? "s" : ""} dans Clients.`
+                        : "Aucune fiche : créez-la dans Clients."}
+                    </p>
+                  </div>
+                  <div>
+                    <Label htmlFor="facture-client-nom">Nom du client *</Label>
                     <Input
+                      id="facture-client-nom"
+                      list="facture-clients-fiches"
                       value={factureData.client}
-                      onChange={(e) => setFactureData({ ...factureData, client: e.target.value })}
+                      onChange={(e) => setFactureData({ ...factureData, client: e.target.value, sansFiche: false })}
                       placeholder="Nom du client"
+                      readOnly={!!ficheChoisie}
                       required
                     />
+                    <datalist id="facture-clients-fiches">
+                      {clientsFiches.map((c) => (
+                        <option key={c.id} value={c.nom} />
+                      ))}
+                    </datalist>
                   </div>
                   <div>
-                    <Label>Adresse</Label>
+                    <Label htmlFor="facture-client-adresse">Adresse</Label>
                     <Input
+                      id="facture-client-adresse"
                       value={factureData.adresse}
                       onChange={(e) => setFactureData({ ...factureData, adresse: e.target.value })}
-                      placeholder="Adresse complète"
-                    />
-                  </div>
-                  <div>
-                    <Label>Email</Label>
-                    <Input
-                      type="email"
-                      value={factureData.email}
-                      onChange={(e) => setFactureData({ ...factureData, email: e.target.value })}
-                      placeholder="email@exemple.com"
+                      placeholder={ficheChoisie ? "Fiche sans adresse : saisissez-la ou complétez la fiche" : "Adresse complète"}
+                      readOnly={!!ficheChoisie && !!adresseDeFiche(ficheChoisie)}
                     />
                   </div>
                 </div>
+                {ficheRattachee ? (
+                  <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-900" data-testid="facture-fiche-rattachee">
+                    <p className="font-medium">
+                      {ficheChoisie
+                        ? `Facture rattachée à la fiche « ${ficheRattachee.nom} ».`
+                        : `Une fiche « ${ficheRattachee.nom} » porte ce nom : la facture y sera rattachée.`}
+                    </p>
+                    <p className="text-xs mt-0.5">
+                      Identité reprise de la fiche et figée à l&apos;émission : {identiteFiche(ficheRattachee)}.
+                    </p>
+                    {ficheRattachee.exonererTVA && (
+                      <p className="text-xs mt-1 font-medium" data-testid="facture-client-exonere">
+                        Client exonéré de TVA : les montants sont saisis hors taxe, toutes les lignes passent à 0 %.
+                      </p>
+                    )}
+                    {ficheRattachee.type === "professionnel" && !ficheRattachee.siret && !ficheRattachee.siren && (
+                      <p className="text-xs mt-1 text-amber-800">
+                        Fiche professionnelle sans SIRET ni SIREN : complétez-la avant l&apos;émission, sinon l&apos;export Factur-X sera refusé.
+                      </p>
+                    )}
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {!ficheChoisie && (
+                        <Button type="button" size="sm" variant="outline" onClick={() => choisirFiche(String(ficheRattachee.id))}>
+                          Utiliser cette fiche
+                        </Button>
+                      )}
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => setFactureData({ ...factureData, clientId: "", sansFiche: true })}
+                      >
+                        Facturer sans la fiche
+                      </Button>
+                      <Link href="/comptabilite/clients" className="self-center text-xs underline">
+                        Modifier la fiche dans Clients
+                      </Link>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Sans fiche, la facture porte le nom et l&apos;adresse saisis, sans SIRET, TVA intracommunautaire ni courriel du client.
+                    Pour un client professionnel, choisissez sa fiche ou{" "}
+                    <Link href="/comptabilite/clients" className="underline">créez-la dans Clients</Link>.
+                  </p>
+                )}
 
                 <div>
                   <Label>Objet</Label>
@@ -861,6 +1062,74 @@ export default function FacturesPage() {
                   />
                 </div>
 
+                {/* Mentions de la facturation électronique (décret 2022-1299) :
+                    catégorie de l'opération, date et adresse de livraison. */}
+                <div className="grid gap-4 md:grid-cols-3">
+                  <div>
+                    <Label htmlFor="categorie-operation">Catégorie de l&apos;opération</Label>
+                    <select
+                      id="categorie-operation"
+                      className="w-full h-10 rounded-md border border-slate-300 px-3 bg-white"
+                      value={factureData.categorieOperation}
+                      onChange={(e) => setFactureData({ ...factureData, categorieOperation: e.target.value })}
+                    >
+                      {CATEGORIES_OPERATION.map((c) => (
+                        <option key={c} value={c}>{LABELS_CATEGORIE_OPERATION[c]}</option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-muted-foreground mt-1">Mention obligatoire de la facture électronique.</p>
+                  </div>
+                  <div>
+                    <Label>Livraison ou fin d&apos;exécution</Label>
+                    <Input
+                      type="date"
+                      value={factureData.dateLivraison}
+                      onChange={(e) => setFactureData({ ...factureData, dateLivraison: e.target.value })}
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">Si différente de la date de facture.</p>
+                  </div>
+                  <div className="flex items-start gap-2 pt-7">
+                    <input
+                      id="livraison-differente"
+                      type="checkbox"
+                      className="mt-1 h-4 w-4"
+                      checked={factureData.livraisonDifferente}
+                      onChange={(e) => setFactureData({ ...factureData, livraisonDifferente: e.target.checked })}
+                    />
+                    <Label htmlFor="livraison-differente" className="font-normal">Adresse de livraison différente de celle du client</Label>
+                  </div>
+                </div>
+                {factureData.livraisonDifferente && (
+                  <div className="grid gap-4 md:grid-cols-4">
+                    <div className="md:col-span-2">
+                      <Label>Adresse de livraison</Label>
+                      <Input
+                        value={factureData.adresseLivraison}
+                        onChange={(e) => setFactureData({ ...factureData, adresseLivraison: e.target.value })}
+                        placeholder="Voie, lieu-dit"
+                      />
+                    </div>
+                    <div>
+                      <Label>Code postal</Label>
+                      <Input
+                        value={factureData.codePostalLivraison}
+                        onChange={(e) => setFactureData({ ...factureData, codePostalLivraison: e.target.value })}
+                        placeholder="64000"
+                      />
+                    </div>
+                    <div>
+                      <Label>Ville</Label>
+                      <Input
+                        value={factureData.villeLivraison}
+                        onChange={(e) => setFactureData({ ...factureData, villeLivraison: e.target.value })}
+                        placeholder="Pau"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <ChoisirStock dateEffet={factureData.dateLivraison || factureData.date} onChoisir={ajouterStockFacture} />
+                <p className="text-sm text-muted-foreground">Les produits liés sont déduits du stock à l’émission de cette facture directe. Pour une livraison déjà enregistrée, facturez son bon depuis l’onglet Bons de livraison.</p>
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <Label>Lignes de facturation</Label>
@@ -892,6 +1161,7 @@ export default function FacturesPage() {
                               onChange={(e) => updateLigne(ligne.id, 'description', e.target.value)}
                               placeholder="Description"
                             />
+                            {ligne.articleStockId && <div className="mt-1 text-xs text-green-800">Liée au stock <button type="button" className="underline" onClick={() => setLignes((ls) => ls.map((l) => l.id === ligne.id ? { ...l, articleStockType: null, articleStockId: null } : l))}>Détacher</button></div>}
                           </TableCell>
                           <TableCell>
                             <Input
@@ -906,8 +1176,10 @@ export default function FacturesPage() {
                             <select
                               className="h-9 rounded-md border border-slate-300 px-2 bg-white"
                               value={ligne.unite}
+                              disabled={!!ligne.articleStockId}
                               onChange={(e) => updateLigne(ligne.id, 'unite', e.target.value)}
                             >
+                              {ligne.articleStockId && <option value={ligne.unite}>{ligne.unite}</option>}
                               <option value="unité">unité</option>
                               <option value="kg">kg</option>
                               <option value="pièce">pièce</option>
@@ -971,13 +1243,18 @@ export default function FacturesPage() {
                 </div>
 
                 <div>
-                  <Label>Notes / Conditions</Label>
+                  <Label htmlFor="facture-notes">Notes / Conditions</Label>
                   <Textarea
+                    id="facture-notes"
                     value={factureData.notes}
                     onChange={(e) => setFactureData({ ...factureData, notes: e.target.value })}
                     placeholder="Conditions de paiement, mentions complémentaires..."
                     rows={3}
+                    maxLength={5000}
                   />
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Imprimées sur la facture remise au client ; elles ne se modifient plus après l&apos;émission.
+                  </p>
                 </div>
 
                 {exploitationOk === false && (
@@ -1010,7 +1287,7 @@ export default function FacturesPage() {
               <CardContent className="space-y-4">
                 {/* DEV1 #7 — Sélecteur facture d'origine + recopie client */}
                 <div>
-                  <Label>Facture d'origine *</Label>
+                  <Label>Facture d&apos;origine *</Label>
                   <Select
                     value={avoirData.factureOrigineId}
                     onValueChange={(v) => setAvoirData({ ...avoirData, factureOrigineId: v })}
@@ -1023,7 +1300,7 @@ export default function FacturesPage() {
                         .filter((f: { type?: string }) => f.type !== "avoir")
                         .map((f: { id: number; numero: string; clientNom?: string; totalTTC?: number; date?: string }) => (
                           <SelectItem key={f.id} value={String(f.id)}>
-                            {f.numero} · {f.clientNom || "—"} · {(f.totalTTC ?? 0).toFixed(2)} €
+                            {f.numero} · {f.clientNom || "—"} · {formatMontantDevise(f.totalTTC ?? 0)}
                           </SelectItem>
                         ))}
                     </SelectContent>
@@ -1036,7 +1313,7 @@ export default function FacturesPage() {
                     return (
                       <p className="text-[11px] text-muted-foreground mt-1">
                         Client recopié : <span className="font-medium">{String(origine.clientNom ?? "—")}</span> ·
-                        Montant origine TTC : <span className="font-medium">{Number(origine.totalTTC ?? 0).toFixed(2)} €</span>
+                        Montant origine TTC : <span className="font-medium">{formatMontantDevise(Number(origine.totalTTC ?? 0))}</span>
                       </p>
                     )
                   })()}
@@ -1079,7 +1356,7 @@ export default function FacturesPage() {
                 </div>
 
                 <div>
-                  <Label>Motif de l'avoir *</Label>
+                  <Label>Motif de l&apos;avoir *</Label>
                   <Textarea
                     value={avoirData.motif}
                     onChange={(e) => setAvoirData({ ...avoirData, motif: e.target.value })}
@@ -1090,7 +1367,7 @@ export default function FacturesPage() {
 
                 <p className="text-xs text-muted-foreground">
                   Le numéro AV-{new Date().getFullYear()}-XXXX est généré automatiquement par le serveur
-                  (séquence comptable continue). La facture d'origine ne pourra plus être supprimée
+                  (séquence comptable continue). La facture d&apos;origine ne pourra plus être supprimée
                   tant que cet avoir existe (Art. 289 CGI).
                 </p>
 

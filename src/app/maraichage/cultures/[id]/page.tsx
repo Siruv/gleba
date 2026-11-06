@@ -37,12 +37,15 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { useToast } from "@/hooks/use-toast"
 import { confirmDialog } from "@/lib/global-dialog"
 import { AppHeader, PageToolbar } from "@/components/shell/AppHeader"
-import { cultureUpdateFormSchema, type UpdateCultureInput } from "@/lib/validations"
+import { cultureUpdateFormSchemaPour, type UpdateCultureInput } from "@/lib/validations"
 import { estimerNombrePlantsStrict } from "@/lib/assistant-helpers"
+import { AIDE_QUANTITE_PLANTS, libelleQuantitePlants, useQuantiteManuelle } from "@/hooks/use-quantite-manuelle"
 import { nomAffichableItpAvecFenetre } from "@/lib/itp-label"
 import { AvisItpPlanche } from "@/components/cultures/AvisItpPlanche"
 import { badgeOrigine } from "@/lib/referentiel-communaute"
 import { datesDepuisItp, recolteApresDebut } from "@/lib/cultures/dates-itp"
+import { finRecolteApresModification } from "@/lib/cultures/fenetre-recolte"
+import { jourCivilStocke } from "@/lib/jour-civil"
 
 interface ITPData {
   id: string
@@ -85,11 +88,22 @@ export default function EditCulturePage() {
   const [isSubmitting, setIsSubmitting] = React.useState(false)
   // Empêcher l'auto-remplissage au chargement initial
   const initialLoadDone = React.useRef(false)
+  // Quantité saisie à la main : plus de recalcul (ticket cmvnpkkhp, revue).
+  const {
+    manuelle: quantiteManuelle,
+    estManuelle: quantiteEstManuelle,
+    saisir: saisirQuantite,
+    definir: definirQuantiteManuelle,
+  } = useQuantiteManuelle()
   const initialItpId = React.useRef<string | null>(null)
   // Dernier début de cycle appliqué (chargement, changement d'ITP ou saisie).
   // Le recalage de la récolte ne suit que les CHANGEMENTS de début : éditer la
   // seule récolte ne déclenche rien.
   const debutCycleRef = React.useRef<string | null>(null)
+  // Fenêtre de récolte telle que stockée, et fin touchée par l'utilisateur :
+  // la fiche montre la fin que l'enregistrement écrira (2026-10-25).
+  const fenetreStockeeRef = React.useRef<{ dateRecolte: Date | null; finRecolte: Date | null; itpId: string | null } | null>(null)
+  const finSaisieRef = React.useRef(false)
   // Mémoriser les valeurs de l'ITP précédent pour la logique d'écrasement intelligent
   const prevItpNbRangs = React.useRef<number | null>(null)
   const prevItpEspacement = React.useRef<number | null>(null)
@@ -97,7 +111,9 @@ export default function EditCulturePage() {
   const form = useForm<UpdateCultureInput>({
     // QA cmsfxvbab — schéma formulaire : bloque récolte < semis AVANT le PUT,
     // avec message inline sous le champ.
-    resolver: zodResolver(cultureUpdateFormSchema),
+    resolver: (values, context, options) => zodResolver(
+      cultureUpdateFormSchemaPour(fenetreStockeeRef.current),
+    )(values, context, options),
     defaultValues: {
       especeId: "",
       varieteId: null,
@@ -167,12 +183,27 @@ export default function EditCulturePage() {
 
         // Mémoriser l'ITP initial pour ne pas écraser les données existantes
         initialItpId.current = itpIncoherent ? null : cultureData.itpId || null
+        fenetreStockeeRef.current = {
+          dateRecolte: cultureData.dateRecolte ? new Date(cultureData.dateRecolte) : null,
+          finRecolte: cultureData.finRecolte ? new Date(cultureData.finRecolte) : null,
+          itpId: cultureData.itpId || null,
+        }
+        finSaisieRef.current = false
         // Début de cycle tel que chargé : baseline du recalage de la récolte.
         const debutInitial = cultureData.datePlantation || cultureData.dateSemis
         debutCycleRef.current = debutInitial ? new Date(debutInitial).toISOString() : null
         // Mémoriser les valeurs initiales de nbRangs/espacement de l'ITP
         prevItpNbRangs.current = cultureData.nbRangs || null
         prevItpEspacement.current = cultureData.espacement || null
+
+        // Une quantité stockée qui ne vaut pas le calcul a été saisie à la main :
+        // même critère que le serveur (`quantiteCultureApresModification`).
+        const quantiteCalculee = estimerNombrePlantsStrict(
+          cultureData.longueur,
+          cultureData.nbRangs,
+          cultureData.espacement
+        )
+        definirQuantiteManuelle(cultureData.quantite > 0 && cultureData.quantite !== quantiteCalculee)
 
         // Remplir le formulaire
         form.reset({
@@ -189,7 +220,11 @@ export default function EditCulturePage() {
           plantationFaite: cultureData.plantationFaite || false,
           recolteFaite: cultureData.recolteFaite || false,
           terminee: cultureData.terminee || null,
-          quantite: cultureData.quantite || null,
+          // Ticket cmvnpkkhp — une culture née sans quantité (assistant
+          // « Semer » avant le 2026-10-25) montrait un champ « auto » vide
+          // sous une formule qui disait 159 : on affiche la quantité que la
+          // route déduira à l'enregistrement, par la même règle.
+          quantite: cultureData.quantite || quantiteCalculee || null,
           nbRangs: cultureData.nbRangs || null,
           longueur: cultureData.longueur || null,
           espacement: cultureData.espacement || null,
@@ -207,7 +242,7 @@ export default function EditCulturePage() {
         })
         router.push("/maraichage/cultures")
       })
-  }, [cultureId, form, router, toast])
+  }, [cultureId, form, router, toast, definirQuantiteManuelle])
 
   // Charger les varietes et ITPs quand l'espece change
   React.useEffect(() => {
@@ -308,6 +343,29 @@ export default function EditCulturePage() {
     form.setValue("dateRecolte", nouvelleRecolte)
   }, [watchedDateSemis, watchedDatePlantation, selectedItp, itps, form])
 
+  // 2026-10-25 — la fin de récolte suit son début et l'itinéraire, par la règle
+  // du PUT (`finRecolteApresModification`) : changer d'ITP réécrivait
+  // plantation et récolte et laissait à l'écran (puis en base) la fin de
+  // l'ancien ITP, un an trop tard. Une fin saisie à la main n'est plus touchée.
+  const watchedDateRecolte = form.watch("dateRecolte")
+  React.useEffect(() => {
+    if (!initialLoadDone.current || finSaisieRef.current) return
+    const stockee = fenetreStockeeRef.current
+    if (!stockee) return
+    const itp = selectedItp ? itps.find((i) => i.id === selectedItp) : null
+    if (selectedItp && !itp) return // itinéraires pas encore chargés
+    const dateRecolte = watchedDateRecolte ? new Date(watchedDateRecolte) : null
+    if (dateRecolte && Number.isNaN(dateRecolte.getTime())) return
+    const fin = finRecolteApresModification({
+      avant: stockee,
+      dateRecolte,
+      itpChange: (selectedItp || null) !== stockee.itpId,
+      itp: itp ?? null,
+    })
+    const affichee = fin === undefined ? stockee.finRecolte : fin
+    form.setValue("finRecolte", affichee ? jourCivilStocke(affichee) : null)
+  }, [watchedDateRecolte, selectedItp, itps, form])
+
   // Mettre à jour la longueur quand la planche change.
   // Bug Ail #509 — En mode édition, on n'écrase la longueur qu'après que l'utilisateur
   // ait changé la planche (initialLoadDone). Sans guard, l'ouverture d'une culture
@@ -326,15 +384,16 @@ export default function EditCulturePage() {
   // Auto-calculer la quantité de plants (BUG-10 : null si inputs incomplets,
   // pour ne pas garder une ancienne valeur fantôme — la liste reflète alors
   // l'absence de calcul plutôt qu'une valeur stale).
+  // Une quantité saisie à la main n'est plus recalculée.
   React.useEffect(() => {
-    if (!initialLoadDone.current) return
+    if (!initialLoadDone.current || quantiteEstManuelle()) return
     const quantite = estimerNombrePlantsStrict(
       watchedLongueur ?? null,
       watchedNbRangs ?? null,
       watchedEspacement ?? null
     )
     form.setValue("quantite", quantite)
-  }, [watchedNbRangs, watchedLongueur, watchedEspacement, form])
+  }, [watchedNbRangs, watchedLongueur, watchedEspacement, form, quantiteEstManuelle])
 
   const onSubmit = async (data: UpdateCultureInput) => {
     setIsSubmitting(true)
@@ -724,9 +783,10 @@ export default function EditCulturePage() {
                           <Input
                             type="date"
                             value={field.value ? format(new Date(field.value), "yyyy-MM-dd") : ""}
-                            onChange={(e) =>
+                            onChange={(e) => {
+                              finSaisieRef.current = true
                               field.onChange(e.target.value ? e.target.value : null)
-                            }
+                            }}
                           />
                         </FormControl>
                         <FormMessage />
@@ -863,7 +923,7 @@ export default function EditCulturePage() {
                           />
                         </FormControl>
                         {nbRangsDepuisITP && (
-                          <p className="text-xs text-blue-600">depuis l'ITP</p>
+                          <p className="text-xs text-blue-600">depuis l&apos;ITP</p>
                         )}
                         <FormMessage />
                       </FormItem>
@@ -892,7 +952,7 @@ export default function EditCulturePage() {
                           />
                         </FormControl>
                         {espacementDepuisITP && (
-                          <p className="text-xs text-blue-600">depuis l'ITP</p>
+                          <p className="text-xs text-blue-600">depuis l&apos;ITP</p>
                         )}
                         <FormMessage />
                       </FormItem>
@@ -904,11 +964,8 @@ export default function EditCulturePage() {
                     name="quantite"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel
-                          title="Formule : nbRangs × ⌊longueur (cm) ÷ espacement⌋. Recalculé dès que vous modifiez longueur, nb rangs ou espacement. Vous pouvez aussi écrire la valeur manuellement."
-                          className="cursor-help"
-                        >
-                          Quantité / plants (auto) ⓘ
+                        <FormLabel title={AIDE_QUANTITE_PLANTS} className="cursor-help">
+                          {libelleQuantitePlants(quantiteManuelle)} ⓘ
                         </FormLabel>
                         <FormControl>
                           <Input
@@ -916,11 +973,11 @@ export default function EditCulturePage() {
                             step="0.1"
                             {...field}
                             value={field.value ?? ""}
-                            onChange={(e) =>
-                              field.onChange(
-                                e.target.value ? parseFloat(e.target.value) : null
-                              )
-                            }
+                            onChange={(e) => {
+                              const valeur = e.target.value ? parseFloat(e.target.value) : null
+                              saisirQuantite(valeur)
+                              field.onChange(valeur)
+                            }}
                           />
                         </FormControl>
                         {/* Bug #2 — montrer la formule active pour éviter
@@ -928,7 +985,7 @@ export default function EditCulturePage() {
                         {watchedLongueur && watchedNbRangs && watchedEspacement && watchedEspacement > 0 && (
                           <p className="text-xs text-slate-500">
                             = {watchedNbRangs} rang(s) × ⌊{watchedLongueur} m ÷ {watchedEspacement} cm⌋
-                            = {Math.floor((watchedLongueur * 100) / watchedEspacement) * watchedNbRangs}
+                            = {estimerNombrePlantsStrict(watchedLongueur, watchedNbRangs, watchedEspacement)}
                           </p>
                         )}
                         <FormMessage />

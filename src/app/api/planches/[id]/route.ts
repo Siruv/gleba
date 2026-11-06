@@ -12,7 +12,8 @@ import { updatePlancheSchema } from '@/lib/validations'
 import { requireAuthApi } from '@/lib/auth-utils'
 import { invalidateKpi } from '@/lib/kpi'
 import { resoudreIdPlanche } from '@/lib/planches/resolution'
-import { aDesTraces, compterTracesPlanches, messageSuppressionRefusee } from '@/lib/planches/traces'
+import { compterTracesPlanches, refusSuppressionPlanche } from '@/lib/planches/traces'
+import { masquerReferentielsEmbarques } from '@/lib/referentiel-embarque'
 
 type RouteParams = { params: Promise<{ id: string }> }
 
@@ -72,7 +73,9 @@ export async function GET(
       )
     }
 
-    return NextResponse.json(planche)
+    // ITP des étapes de rotation, espèce et variété des cultures : jamais l'id
+    // de l'auteur d'une entrée partagée par un autre compte (revue 2026-10-20).
+    return NextResponse.json(masquerReferentielsEmbarques(planche, session!.user.id))
   } catch (error) {
     console.error('GET /api/planches/[id] error:', error)
     return NextResponse.json(
@@ -197,15 +200,12 @@ export async function DELETE(
     // QA cmv29i9ad — cultures et interventions retiennent la planche, sinon
     // l'intervention perd son emplacement (voir traces.ts pour ce qui ne la
     // retient pas).
+    // QA cmvgdp9fn — le refus nomme les années des cultures et porte un lien
+    // vers la liste filtrée ; l'écran l'affiche tel quel.
     const traces = (await compterTracesPlanches(prisma, [planche], session!.user.id)).get(planche.id)!
-    if (aDesTraces(traces)) {
-      return NextResponse.json(
-        {
-          error: messageSuppressionRefusee(planche.nom, traces),
-          details: traces,
-        },
-        { status: 409 }
-      )
+    const refus = refusSuppressionPlanche(planche, traces)
+    if (refus) {
+      return NextResponse.json(refus, { status: 409 })
     }
 
     // Suppression

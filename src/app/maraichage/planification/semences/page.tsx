@@ -15,7 +15,6 @@
 import * as React from "react"
 import { Suspense } from "react"
 import Link from "next/link"
-import { useSearchParams } from "next/navigation"
 import { useAnneePlanification } from "@/hooks/use-annee-planification"
 import { SelecteurAnneePlanification } from "@/components/maraichage/SelecteurAnneePlanification"
 import { ColumnDef } from "@tanstack/react-table"
@@ -54,6 +53,9 @@ interface BesoinSemence {
   nbGrainesG: number | null
   nbGrainesGEstime?: boolean
   doseSemis: number | null
+  doseMoyenne?: boolean
+  /** Une partie des cultures sans dose : seules les cultures dosées sont comptées. */
+  besoinPartiel?: boolean
   uniteDose: "g_m2" | "pieces_m2" | "graines_plant" | "caieux_m2" | null
   tauxGerminationPct: number | null
   aCommander: number
@@ -90,7 +92,7 @@ interface Stats {
   derniereMajStockISO: string | null
 }
 
-function StatutBadge({ statut }: { statut: BesoinSemence["statut"] }) {
+function StatutBadge({ statut, partiel = false }: { statut: BesoinSemence["statut"]; partiel?: boolean }) {
   switch (statut) {
     case "OK":
       return <Badge className="bg-green-600 hover:bg-green-700">OK</Badge>
@@ -111,10 +113,16 @@ function StatutBadge({ statut }: { statut: BesoinSemence["statut"] }) {
     case "DONNEE_MANQUANTE":
       // QA cmswxo3ri — besoin non calculable : la ligne reste visible, avec la
       // cause. Avant, elle était filtrée avec les lignes hors plan.
+      // Revue du 2026-10-29 — besoin partiel : seules les cultures dosées
+      // sont comptées (`besoinPartiel`), les autres attendent leur dose.
       return (
-        <Badge variant="outline" className="flex items-center gap-1 border-amber-400 text-amber-700">
+        <Badge
+          variant="outline"
+          className="flex items-center gap-1 border-amber-400 text-amber-700"
+          title={partiel ? "Besoin partiel : compléter les doses manquantes au référentiel" : undefined}
+        >
           <AlertTriangle className="h-3 w-3" />
-          Dose manquante
+          {partiel ? "Besoin partiel" : "Dose manquante"}
         </Badge>
       )
     case "SURFACE_MANQUANTE":
@@ -219,7 +227,7 @@ function GrainesTooltip({ b, appliquerMarge }: { b: BesoinSemence; appliquerMarg
           <div>
             Dose × surface : <strong>{brut.toFixed(1)} g</strong>
             {b.doseSemis !== null && (
-              <span className="text-slate-300"> ({b.doseSemis} {uniteLabel(b.uniteDose)} × {b.surfaceTotale.toFixed(1)} m²)</span>
+              <span className="text-slate-300"> ({b.doseMoyenne ? 'dose moyenne : ' : ''}{b.doseSemis} {uniteLabel(b.uniteDose)} × {b.surfaceTotale.toFixed(1)} m²)</span>
             )}
           </div>
           {b.margeSecuritePct > 0 && (
@@ -278,7 +286,7 @@ function makeGrainesColumns(appliquerMarge: boolean): ColumnDef<BesoinSemence>[]
     {
       accessorKey: "statut",
       header: "Statut",
-      cell: ({ row }) => <StatutBadge statut={row.original.statut} />,
+      cell: ({ row }) => <StatutBadge statut={row.original.statut} partiel={row.original.besoinPartiel} />,
     },
   ]
 }
@@ -323,7 +331,7 @@ function makePlantsColumns(appliquerMarge: boolean): ColumnDef<BesoinSemence>[] 
     {
       accessorKey: "statut",
       header: "Statut",
-      cell: ({ row }) => <StatutBadge statut={row.original.statut} />,
+      cell: ({ row }) => <StatutBadge statut={row.original.statut} partiel={row.original.besoinPartiel} />,
     },
   ]
 }
@@ -386,12 +394,11 @@ const caieuxColumns: ColumnDef<BesoinSemence>[] = [
   {
     accessorKey: "statut",
     header: "Statut",
-    cell: ({ row }) => <StatutBadge statut={row.original.statut} />,
+    cell: ({ row }) => <StatutBadge statut={row.original.statut} partiel={row.original.besoinPartiel} />,
   },
 ]
 
 function SemencesContent() {
-  const searchParams = useSearchParams()
   const { toast } = useToast()
 
   const [data, setData] = React.useState<BesoinSemence[]>([])
@@ -491,6 +498,8 @@ function SemencesContent() {
   const graineDirecte = data.filter(b => b.mode === "graine_directe" && b.statut !== "IGNORE")
   const plantRepique = data.filter(b => b.mode === "plant_repique" && b.statut !== "IGNORE")
   const bulbeCaieu = data.filter(b => b.mode === "bulbe_caieu" && b.statut !== "IGNORE")
+  // Une ligne « Besoin partiel » compte ses cultures dosées dans les totaux.
+  const avecBesoinPartiel = data.some(b => b.besoinPartiel)
 
   // BUG-01 : total brut sommé ligne à ligne (chaque espèce peut avoir une
   // marge différente). Le serveur ne renvoie que le total majoré.
@@ -594,13 +603,23 @@ function SemencesContent() {
             <CardContent className="py-3 flex items-start gap-3">
               <AlertTriangle className="h-5 w-5 text-amber-600 flex-shrink-0" />
               <div className="text-sm text-amber-800">
-                Besoin non calculable pour{" "}
+                {avecBesoinPartiel ? "Besoin non calculable ou partiel pour" : "Besoin non calculable pour"}{" "}
                 <strong>
                   {stats.especesDonneeManquante?.join(", ") || `${stats.nbDonneeManquante} espèce(s)`}
                 </strong>{" "}
-                : aucune dose de semis n&apos;est renseignée au référentiel. Ces lignes sont
-                listées avec le statut « Dose manquante » et n&apos;entrent pas dans les totaux à
-                commander.{" "}
+                {avecBesoinPartiel ? (
+                  <>
+                    : des doses de semis manquent au référentiel. Les lignes « Dose manquante »
+                    n&apos;entrent pas dans les totaux à commander ; les lignes « Besoin partiel »
+                    n&apos;y comptent que leurs cultures dosées.{" "}
+                  </>
+                ) : (
+                  <>
+                    : aucune dose de semis n&apos;est renseignée au référentiel. Ces lignes sont
+                    listées avec le statut « Dose manquante » et n&apos;entrent pas dans les totaux à
+                    commander.{" "}
+                  </>
+                )}
                 <Link
                   href="/maraichage?tab=referentiel"
                   className="underline underline-offset-2 hover:text-amber-900"
@@ -846,7 +865,7 @@ function SemencesContent() {
               onRefresh={fetchData}
               onExport={handleExport}
               searchPlaceholder="Rechercher..."
-              emptyMessage="Aucune culture en caieux/bulbes planifiée."
+              emptyMessage="Aucune culture en caïeux/bulbes planifiée."
             />
           </TabsContent>
         </Tabs>
