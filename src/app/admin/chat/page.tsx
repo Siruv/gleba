@@ -9,7 +9,7 @@ export default async function ChatSettingsPage() {
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-amber-50 to-white">
-      <header className="sticky top-0 z-50 border-b bg-white/80 backdrop-blur-sm">
+      <header className="sticky top-[var(--app-header-visible-h,var(--app-header-h,0px))] z-30 border-b bg-white/80 backdrop-blur-sm">
         <div className="container mx-auto flex items-center justify-between px-4 py-4">
           <div className="flex items-center gap-4">
             <Link href="/admin">

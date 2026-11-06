@@ -53,7 +53,7 @@ export function DailyBriefingPopup() {
         <DialogHeader>
           <DialogTitle>☀️ Briefing du jour</DialogTitle>
           <DialogDescription>
-            Voici un résumé de vos activités et alertes pour aujourd'hui.
+            Voici un résumé de vos activités et alertes pour aujourd&apos;hui.
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-4 py-4">
@@ -88,7 +88,7 @@ export function DailyBriefingPopup() {
               </ul>
             </div>
           )}
-          <Button onClick={ouvrirChat}>En discuter avec l'assistant</Button>
+          <Button onClick={ouvrirChat}>En discuter avec l&apos;assistant</Button>
         </div>
       </DialogContent>
     </Dialog>

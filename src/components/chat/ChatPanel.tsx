@@ -17,6 +17,8 @@ interface ChatPanelProps {
   sectionLabel?: string
   isExpanded?: boolean
   onToggleExpanded?: () => void
+  /** Question suggérée : préremplit la saisie sans l'envoyer. */
+  questionInitiale?: string
 }
 
 type ChatDisplayMessage = ChatMessage & {
@@ -50,12 +52,20 @@ export function ChatPanel({
   sectionLabel,
   isExpanded = false,
   onToggleExpanded,
+  questionInitiale,
 }: ChatPanelProps) {
   const [messages, setMessages] = useState<ChatDisplayMessage[]>([])
-  const [input, setInput] = useState("")
+  const [input, setInput] = useState(questionInitiale ?? "")
   const [isLoading, setIsLoading] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (questionInitiale) {
+      setInput(questionInitiale)
+      textareaRef.current?.focus()
+    }
+  }, [questionInitiale])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
