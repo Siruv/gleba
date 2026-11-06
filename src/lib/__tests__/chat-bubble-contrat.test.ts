@@ -6,7 +6,7 @@ import { EVENEMENT_OUVRIR_ASSISTANT } from "@/lib/accueil/evenements"
 
 // Contrat avec les règles « coquille v2 » de globals.css et les déclencheurs de l'accueil.
 const sourceBulle = readFileSync(join(__dirname, "../../components/chat/ChatBubble.tsx"), "utf8")
-const css = readFileSync(join(__dirname, "../app/globals.css"), "utf8")
+const css = readFileSync(join(__dirname, "../../app/globals.css"), "utf8")
 
 describe("contrat ChatBubble / coquille v2", () => {
   it("expose les aria-labels ciblés par globals.css", () => {
