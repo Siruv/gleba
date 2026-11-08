@@ -75,3 +75,12 @@ describe("verifierContratAssistant : fonctions pures", () => {
     expect(typeof lireOptions(["--inconnue"])).toBe("string")
   })
 })
+
+describe("reexporteBriefingPrefs", () => {
+  it("lit les noms réexportés depuis briefing-prefs", async () => {
+    const { reexporteBriefingPrefs } = await import("../../../scripts/verifierContratAssistant")
+    const source = `export {\n  BRIEFING_AUTO_PAR_DEFAUT,\n  CLE_PREF_BRIEFING_AUTO,\n  briefingAutoActive,\n} from "@/lib/briefing-prefs";`
+    expect(reexporteBriefingPrefs(source)).toEqual(["BRIEFING_AUTO_PAR_DEFAUT", "CLE_PREF_BRIEFING_AUTO", "briefingAutoActive"])
+    expect(reexporteBriefingPrefs(`export { a } from "./autre"`)).toEqual([])
+  })
+})

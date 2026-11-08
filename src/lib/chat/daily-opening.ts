@@ -10,8 +10,13 @@
 
 import prisma from "@/lib/prisma";
 
-export const BRIEFING_AUTO_PAR_DEFAUT = false;
-export const CLE_PREF_BRIEFING_AUTO = 'briefingAuto';
+// Source de vérité d'upstream : la page Paramètres écrit cette clé. On délègue
+// au lieu de la redéfinir (une clé divergente empêchait l'ouverture automatique).
+export {
+  BRIEFING_AUTO_PAR_DEFAUT,
+  CLE_PREF_BRIEFING_AUTO,
+  briefingAutoActive,
+} from "@/lib/briefing-prefs";
 
 /**
  * Vérifie si le briefing a déjà été affiché aujourd'hui pour l'utilisateur.
@@ -36,25 +41,6 @@ export async function markBriefingAsShown(userId: string): Promise<void> {
     update: { valeur: date },
     create: { id: paramId, valeur: date },
   });
-}
-
-/**
- * Détermine si le briefing automatique est activé dans les préférences de l'utilisateur.
- *
- * @param prefs Les préférences de l'utilisateur ou null/undefined.
- * @returns true si activé, false sinon.
- */
-export function briefingAutoActive(
-  prefs: Record<string, unknown> | null | undefined
-): boolean {
-  if (!prefs) {
-    return BRIEFING_AUTO_PAR_DEFAUT;
-  }
-  const valeur = prefs[CLE_PREF_BRIEFING_AUTO];
-  if (typeof valeur === 'boolean') {
-    return valeur;
-  }
-  return BRIEFING_AUTO_PAR_DEFAUT;
 }
 
 /**

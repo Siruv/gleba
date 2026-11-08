@@ -4,7 +4,7 @@ import { useEffect, useState } from "react"
 import { useSession } from "next-auth/react"
 import { fetchDailyBriefing } from "@/app/actions/chat-briefing"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog"
-import { briefingAutoActive } from "@/lib/chat/daily-opening"
+import { briefingAutoActive } from "@/lib/briefing-prefs"
 import { Button } from "@/components/ui/button"
 import type { BriefingPayload } from "@/lib/chat/daily-briefing"
 
@@ -24,7 +24,7 @@ export function DailyBriefingPopup() {
         const prefs = await res.json()
         
         if (briefingAutoActive(prefs)) {
-          const data = await fetchDailyBriefing(session.user.id)
+          const data = await fetchDailyBriefing()
           if (data && (data.taches.length > 0 || data.alertesUrgentes.length > 0 || data.alertesMeteo.length > 0)) {
             setBriefing(data)
             setOpen(true)

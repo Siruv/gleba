@@ -233,6 +233,19 @@ export function extraireConstanteTexte(source: string, nom: string): string | nu
   return m ? m[1] : null
 }
 
+/** Noms réexportés depuis `@/lib/briefing-prefs` : `export { A, B } from "@/lib/briefing-prefs"`. */
+export function reexporteBriefingPrefs(source: string): string[] {
+  const noms: string[] = []
+  const motif = /export\s*\{([^}]*)\}\s*from\s*["']@\/lib\/briefing-prefs["']/g
+  for (const m of source.matchAll(motif)) {
+    for (const nom of m[1].split(",")) {
+      const propre = nom.trim().split(/\s+as\s+/).pop()?.trim()
+      if (propre) noms.push(propre)
+    }
+  }
+  return noms
+}
+
 /** Méthodes HTTP exportées par une route Next.js. */
 export function extraireMethodesHttp(source: string): string[] {
   const methodes: string[] = []
@@ -509,19 +522,23 @@ function controlerContratDailyOpening(ctx: Contexte, strict: boolean): Resultat 
   const prive = ctx.lireArbre(CHEMIN_DAILY_OPENING)
   if (!prefs) return resultat("C09", "Contrat de types @/lib/chat/daily-opening (briefing-prefs)", [`${CHEMIN_PREFS_BRIEFING} absent de ${ctx.base}`])
   if (!prive) return resultat("C09", "Contrat de types @/lib/chat/daily-opening (briefing-prefs)", [`${CHEMIN_DAILY_OPENING} absent de l'arbre de travail`])
+  // Délégation : le plugin réexporte la source de vérité d'upstream. Dans ce cas la clé
+  // est celle d'upstream par construction ; sinon on compare les deux définitions.
+  const delegue = reexporteBriefingPrefs(prive)
   for (const nom of EXPORTS_PREFS_BRIEFING) {
     if (!new RegExp(`export\\s+(?:async\\s+)?(?:const|function)\\s+${nom}\\b`).test(prefs)) echecs.push(`upstream n'exporte plus ${nom} (contrat à réviser)`)
-    if (!new RegExp(`export\\s+(?:async\\s+)?(?:const|function)\\s+${nom}\\b`).test(prive)) echecs.push(`daily-opening.ts n'exporte pas ${nom}`)
+    const definiLocalement = new RegExp(`export\\s+(?:async\\s+)?(?:const|function)\\s+${nom}\\b`).test(prive)
+    if (!definiLocalement && !delegue.includes(nom)) echecs.push(`daily-opening.ts n'exporte pas ${nom}`)
   }
   const cleUpstream = extraireConstanteTexte(prefs, "CLE_PREF_BRIEFING_AUTO")
-  const clePrive = extraireConstanteTexte(prive, "CLE_PREF_BRIEFING_AUTO")
+  const clePrive = delegue.includes("CLE_PREF_BRIEFING_AUTO") ? cleUpstream : extraireConstanteTexte(prive, "CLE_PREF_BRIEFING_AUTO")
   if (cleUpstream !== clePrive) {
     const message = `CLE_PREF_BRIEFING_AUTO diverge : upstream "${cleUpstream}", plugin "${clePrive}" (la page Paramètres écrit la clé upstream, le popup du plugin lit l'autre : le briefing automatique ne s'ouvre jamais)`
     if (strict) echecs.push(message)
     else avertissements.push(`ECART CONNU : ${message}`)
   }
   const defautUpstream = /BRIEFING_AUTO_PAR_DEFAUT\s*=\s*(true|false)/.exec(prefs)?.[1]
-  const defautPrive = /BRIEFING_AUTO_PAR_DEFAUT\s*=\s*(true|false)/.exec(prive)?.[1]
+  const defautPrive = delegue.includes("BRIEFING_AUTO_PAR_DEFAUT") ? defautUpstream : /BRIEFING_AUTO_PAR_DEFAUT\s*=\s*(true|false)/.exec(prive)?.[1]
   if (defautUpstream !== defautPrive) echecs.push(`BRIEFING_AUTO_PAR_DEFAUT diverge : upstream ${defautUpstream}, plugin ${defautPrive}`)
   return resultat("C09", "Contrat de types @/lib/chat/daily-opening (briefing-prefs)", echecs, avertissements)
 }
