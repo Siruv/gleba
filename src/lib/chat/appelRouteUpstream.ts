@@ -39,7 +39,8 @@ export type ResultatRoute =
   | { ok: true; statut: number; donnees: Record<string, unknown> }
   | { ok: false; statut: number; message: string; avertissement: boolean }
 
-type HandlerRoute = (requete: NextRequest, contexte?: never) => Promise<Response> | Response
+/** Handler de route Next : `(requete)` ou `(requete, { params })`. */
+export type HandlerRoute = (requete: NextRequest, contexte: never) => Promise<Response> | Response
 
 const MESSAGE_INTERNE = "Erreur interne : l'opération n'a pas pu aboutir. Rien n'a été modifié de façon certaine, réessayez plus tard."
 
@@ -115,7 +116,7 @@ function refus(statut: number, message: string, avertissement = false): Resultat
  *   (rotation « Continuer ? ») et n'est JAMAIS rejoué avec une confirmation ;
  * - 5xx, exception, réponse illisible : message générique, sans détail.
  */
-export async function appelerRouteUpstream(handler: HandlerRoute | ((requete: NextRequest, contexte: never) => Promise<Response> | Response), appel: AppelRoute): Promise<ResultatRoute> {
+export async function appelerRouteUpstream(handler: HandlerRoute, appel: AppelRoute): Promise<ResultatRoute> {
   try {
     const init: { method: string; headers: Headers; body?: string } = {
       method: appel.methode,

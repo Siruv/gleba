@@ -17,11 +17,8 @@ import { lireAnnee } from "@/lib/api/annee"
 import { getKpiMaraichage } from "@/lib/kpi"
 import { fetchOpenMeteoForecast } from "@/lib/meteo"
 import type { Prisma } from "@prisma/client"
-import { createPlancheSchema } from "@/lib/validations/planche"
-
-import { cleanReferentielName, normalizeVarieteName } from "@/lib/normalize"
-
-import { invalidateKpi } from "@/lib/kpi"
+import { jourLocalISO } from "@/lib/jour-civil"
+import { appelerRouteUpstream, type ResultatRoute } from "@/lib/chat/appelRouteUpstream"
 
 // ============================================================
 // INTERFACES
@@ -55,8 +52,7 @@ async function resoudreEspeceParNom(
   // 1. Correspondance exacte (insensible à la casse)
   const exactes = await prisma.espece.findMany({
     where: {
-      nom: { equals: nomRecherche, mode: "insensitive" },
-      OR: [{ userId }, { userId: null }],
+      AND: [{ nom: { equals: nomRecherche, mode: "insensitive" } }, visibiliteReferentiel(userId)],
     },
     select: { id: true, nom: true, userId: true },
     take: 5,
@@ -76,8 +72,7 @@ async function resoudreEspeceParNom(
   // 2. Correspondance partielle
   const partielles = await prisma.espece.findMany({
     where: {
-      nom: { contains: nomRecherche, mode: "insensitive" },
-      OR: [{ userId }, { userId: null }],
+      AND: [{ nom: { contains: nomRecherche, mode: "insensitive" } }, visibiliteReferentiel(userId)],
     },
     select: { id: true, nom: true, userId: true },
     take: 6,
@@ -93,6 +88,52 @@ async function resoudreEspeceParNom(
   }
 
   return { erreur: `Aucune espèce trouvée pour "${nomRecherche}".` }
+}
+
+
+// ============================================================
+// ÉCRITURES : appel des routes d'upstream (phase 2c)
+// ============================================================
+
+const TYPES_INTERVENTION = [
+  "semis", "plantation", "desherbage", "binage", "paillage",
+  "traitement_phyto", "fertilisation", "recolte", "taille",
+  "arrosage", "tuteurage", "autre",
+]
+
+const TYPES_OBJET_JARDIN = ["allee", "passage", "bordure", "serre", "compost", "autre"]
+
+/** Nombre fini, ou message d'erreur lisible (jamais `NaN` transmis à une route). */
+function lireNombre(valeur: unknown, champ: string): number | string {
+  const nombre = typeof valeur === "string" && valeur.trim() === "" ? Number.NaN : Number(valeur)
+  return Number.isFinite(nombre) ? nombre : `${champ} invalide : un nombre est attendu.`
+}
+
+/**
+ * Refus d'upstream propagé au modèle : message tel quel, en français. Un 409
+ * « avertissement » (rotation) est signalé mais jamais forcé : la confirmation
+ * explicite de l'utilisateur viendra en phase 5.
+ */
+function refusOutil(res: Extract<ResultatRoute, { ok: false }>): { erreur: string; avertissement?: true } {
+  return res.avertissement ? { erreur: res.message, avertissement: true } : { erreur: res.message }
+}
+
+/**
+ * Les routes d'upstream appliquent le rôle de la session : un administrateur
+ * qui crée ou supprime une variété agit sur le catalogue OFFICIEL (userId nul),
+ * pas sur une variété perso. Les outils « _perso » ne doivent jamais le faire
+ * par la voix de l'assistant : refus explicite, l'écran dédié reste disponible.
+ */
+async function refuserSiAdminReferentiel(): Promise<{ erreur: string } | null> {
+  const { getSession } = await import("@/lib/auth-utils")
+  const session = await getSession()
+  if (session?.user?.role === "ADMIN") {
+    return {
+      erreur:
+        "Un compte administrateur agit sur le catalogue officiel : les variétés se gèrent depuis l'écran Variétés, pas par l'assistant.",
+    }
+  }
+  return null
 }
 
 // ============================================================
@@ -521,54 +562,33 @@ export const outilsChat: OutilChat[] = [
       },
       required: ["type"],
     },
-    handler: async (args: Record<string, unknown>, userId: string) => {
-      try {
-        const type = String(args.type ?? "")
-        const typesValides = [
-          "semis", "plantation", "desherbage", "binage", "paillage",
-          "traitement_phyto", "fertilisation", "recolte", "taille",
-          "arrosage", "tuteurage", "autre",
-        ]
-        if (!typesValides.includes(type)) {
-          return { erreur: `Type d'intervention invalide : "${type}". Types acceptés : ${typesValides.join(", ")}.` }
-        }
+    handler: async (args: Record<string, unknown>) => {
+      const type = String(args.type ?? "")
+      if (!TYPES_INTERVENTION.includes(type)) {
+        return { erreur: `Type d'intervention invalide : "${type}". Types acceptés : ${TYPES_INTERVENTION.join(", ")}.` }
+      }
+      const corps: Record<string, unknown> = {
+        type,
+        fait: args.fait === undefined ? true : Boolean(args.fait),
+        // Jour civil local : `date` est obligatoire côté route.
+        date: args.date ? String(args.date) : jourLocalISO(new Date()),
+      }
+      if (args.description) corps.description = String(args.description)
+      if (args.datePrevue) corps.datePrevue = String(args.datePrevue)
+      if (args.dureeMinutes !== undefined) {
+        const duree = lireNombre(args.dureeMinutes, "dureeMinutes")
+        if (typeof duree === "string") return { erreur: duree }
+        corps.dureeMinutes = duree
+      }
 
-        const donnees: Record<string, unknown> = {
-          userId,
-          type,
-          fait: args.fait === undefined ? true : Boolean(args.fait),
-        }
-        if (args.description) donnees.description = String(args.description)
-        if (args.date) {
-          const dateParsee = new Date(String(args.date))
-          if (!Number.isNaN(dateParsee.getTime())) donnees.date = dateParsee
-        }
-        if (args.datePrevue) {
-          const datePrevueParsee = new Date(String(args.datePrevue))
-          if (!Number.isNaN(datePrevueParsee.getTime())) donnees.datePrevue = datePrevueParsee
-        }
-        if (args.dureeMinutes !== undefined) {
-          donnees.dureeMinutes = Number(args.dureeMinutes)
-        }
-
-        const intervention = await prisma.intervention.create({
-          data: donnees as never,
-        })
-
-        return {
-          succes: true,
-          message: `Intervention "${type}" créée (id ${intervention.id}).`,
-          intervention: {
-            id: intervention.id,
-            type: intervention.type,
-            description: intervention.description,
-            date: intervention.date,
-            fait: intervention.fait,
-          },
-        }
-      } catch (caughtError) {
-        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-        return { erreur: `Impossible de créer l'intervention : ${message}` }
+      const { POST } = await import("@/app/api/interventions/route")
+      const res = await appelerRouteUpstream(POST, { methode: "POST", chemin: "/api/interventions", corps })
+      if (!res.ok) return refusOutil(res)
+      const d = res.donnees
+      return {
+        succes: true,
+        message: `Intervention "${type}" créée (id ${d.id}).`,
+        intervention: { id: d.id, type: d.type, description: d.description, date: d.date, fait: d.fait },
       }
     },
   },
@@ -618,63 +638,56 @@ export const outilsChat: OutilChat[] = [
       },
     },
     handler: async (args: Record<string, unknown>, userId: string) => {
-      try {
-        // Résolution de l'espèce
-        let especeId = args.especeId ? String(args.especeId) : ""
-        if (especeId === "") {
-          const especeNom = args.especeNom ? String(args.especeNom) : ""
-          if (especeNom === "") {
-            return { erreur: "Indiquez l'espèce (especeNom ou especeId)." }
-          }
-          const resolution = await resoudreEspeceParNom(especeNom, userId)
-          if (resolution.erreur) return { erreur: resolution.erreur }
-          especeId = resolution.especeId!
+      // Résolution de l'espèce (nom -> id) ; la route vérifie ensuite sa visibilité.
+      let especeId = args.especeId ? String(args.especeId) : ""
+      if (especeId === "") {
+        const especeNom = args.especeNom ? String(args.especeNom) : ""
+        if (especeNom === "") {
+          return { erreur: "Indiquez l'espèce (especeNom ou especeId)." }
         }
+        const resolution = await resoudreEspeceParNom(especeNom, userId)
+        if (resolution.erreur) return { erreur: resolution.erreur }
+        especeId = resolution.especeId!
+      }
 
-        const donnees: Record<string, unknown> = {
-          userId,
-          especeId,
-          annee: args.annee !== undefined ? Number(args.annee) : new Date().getFullYear(),
-          semisFait: args.semisFait === true,
-          plantationFaite: args.plantationFaite === true,
-        }
-        if (args.dateSemis) {
-          const d = new Date(String(args.dateSemis))
-          if (!Number.isNaN(d.getTime())) donnees.dateSemis = d
-        }
-        if (args.datePlantation) {
-          const d = new Date(String(args.datePlantation))
-          if (!Number.isNaN(d.getTime())) donnees.datePlantation = d
-        }
-        if (args.dateRecolte) {
-          const d = new Date(String(args.dateRecolte))
-          if (!Number.isNaN(d.getTime())) donnees.dateRecolte = d
-        }
-        if (args.quantite !== undefined) {
-          donnees.quantite = Number(args.quantite)
-        }
+      const annee = args.annee !== undefined ? lireNombre(args.annee, "annee") : new Date().getFullYear()
+      if (typeof annee === "string") return { erreur: annee }
+      const corps: Record<string, unknown> = {
+        especeId,
+        annee,
+        semisFait: args.semisFait === true,
+        plantationFaite: args.plantationFaite === true,
+        recolteFaite: false,
+      }
+      for (const champ of ["dateSemis", "datePlantation", "dateRecolte"] as const) {
+        if (args[champ]) corps[champ] = String(args[champ])
+      }
+      if (args.quantite !== undefined) {
+        const quantite = lireNombre(args.quantite, "quantite")
+        if (typeof quantite === "string") return { erreur: quantite }
+        corps.quantite = quantite
+      }
 
-        const culture = await prisma.culture.create({
-          data: donnees as never,
-          include: { espece: { select: { nom: true } } },
-        })
-
-        return {
-          succes: true,
-          message: `Culture "${culture.espece?.nom ?? especeId}" créée (id ${culture.id}).`,
-          culture: {
-            id: culture.id,
-            espece: culture.espece?.nom ?? especeId,
-            annee: culture.annee,
-            dateSemis: culture.dateSemis,
-            datePlantation: culture.datePlantation,
-            semisFait: culture.semisFait,
-            plantationFaite: culture.plantationFaite,
-          },
-        }
-      } catch (caughtError) {
-        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-        return { erreur: `Impossible de créer la culture : ${message}` }
+      // Pas de `confirmRotation` : un avertissement de rotation n'est jamais forcé ici.
+      const { POST } = await import("@/app/api/cultures/route")
+      const res = await appelerRouteUpstream(POST, { methode: "POST", chemin: "/api/cultures", corps })
+      if (!res.ok) return refusOutil(res)
+      const d = res.donnees
+      const nomEspece = (d.espece as { nom?: string } | null | undefined)?.nom ?? especeId
+      return {
+        succes: true,
+        message: `Culture "${nomEspece}" créée (id ${d.id}).`,
+        culture: {
+          id: d.id,
+          espece: nomEspece,
+          annee: d.annee,
+          dateSemis: d.dateSemis,
+          datePlantation: d.datePlantation,
+          semisFait: d.semisFait,
+          plantationFaite: d.plantationFaite,
+        },
+        ...(Array.isArray(d.warnings) ? { avertissements: d.warnings } : {}),
+        ...(d.alerteSaison ? { alerteSaison: d.alerteSaison } : {}),
       }
     },
   },
@@ -708,71 +721,76 @@ export const outilsChat: OutilChat[] = [
       },
       required: ["cultureId"],
     },
-    handler: async (args: Record<string, unknown>, userId: string) => {
-      try {
-        const cultureId = Number(args.cultureId)
-        if (!Number.isFinite(cultureId) || cultureId <= 0) {
-          return { erreur: "cultureId invalide." }
-        }
+    handler: async (args: Record<string, unknown>) => {
+      const cultureId = Number(args.cultureId)
+      if (!Number.isInteger(cultureId) || cultureId <= 0) {
+        return { erreur: "cultureId invalide." }
+      }
 
-        // Vérifier que la culture appartient bien à l'utilisateur
-        const existante = await prisma.culture.findFirst({
-          where: { id: cultureId, userId },
-          select: { id: true },
-        })
-        if (!existante) {
-          return { erreur: `Culture ${cultureId} introuvable ou n'appartient pas à l'utilisateur.` }
-        }
+      // Étapes et dates : PATCH rapide (garde des récoltes, cohérence du cycle).
+      // Quantité : PUT, que PATCH n'accepte pas.
+      const patch: Record<string, unknown> = {}
+      for (const champ of ["semisFait", "plantationFaite", "recolteFaite"] as const) {
+        if (args[champ] !== undefined) patch[champ] = Boolean(args[champ])
+      }
+      for (const champ of ["dateSemis", "datePlantation", "dateRecolte"] as const) {
+        if (args[champ]) patch[champ] = String(args[champ])
+      }
+      let quantite: number | undefined
+      if (args.quantite !== undefined) {
+        const lue = lireNombre(args.quantite, "quantite")
+        if (typeof lue === "string") return { erreur: lue }
+        quantite = lue
+      }
+      if (Object.keys(patch).length === 0 && quantite === undefined) {
+        return { erreur: "Aucun champ à mettre à jour." }
+      }
 
-        const donnees: Record<string, unknown> = {}
-        if (args.semisFait !== undefined) donnees.semisFait = Boolean(args.semisFait)
-        if (args.plantationFaite !== undefined) donnees.plantationFaite = Boolean(args.plantationFaite)
-        if (args.recolteFaite !== undefined) donnees.recolteFaite = Boolean(args.recolteFaite)
-        if (args.quantite !== undefined) donnees.quantite = Number(args.quantite)
-        for (const [cle, valeur] of Object.entries({
-          dateSemis: args.dateSemis,
-          datePlantation: args.datePlantation,
-          dateRecolte: args.dateRecolte,
-        })) {
-          if (valeur) {
-            const d = new Date(String(valeur))
-            if (!Number.isNaN(d.getTime())) donnees[cle] = d
-          }
+      const params = { id: String(cultureId) }
+      const chemin = `/api/cultures/${cultureId}`
+      const { PATCH, PUT } = await import("@/app/api/cultures/[id]/route")
+      let derniere: Record<string, unknown> = {}
+      let patchAppliquee = false
+      if (Object.keys(patch).length > 0) {
+        const res = await appelerRouteUpstream(PATCH, { methode: "PATCH", chemin, corps: patch, params })
+        if (!res.ok) return refusOutil(res)
+        derniere = res.donnees
+        patchAppliquee = true
+      }
+      if (quantite !== undefined) {
+        const res = await appelerRouteUpstream(PUT, { methode: "PUT", chemin, corps: { quantite }, params })
+        if (!res.ok) {
+          const refus = refusOutil(res)
+          return patchAppliquee
+            ? { ...refus, erreur: `Les étapes et dates ont été enregistrées, mais pas la quantité : ${res.message}` }
+            : refus
         }
+        derniere = { ...derniere, ...res.donnees }
+      }
 
-        if (Object.keys(donnees).length === 0) {
-          return { erreur: "Aucun champ à mettre à jour." }
-        }
-
-        const culture = await prisma.culture.update({
-          where: { id: cultureId },
-          data: donnees as never,
-          include: { espece: { select: { nom: true } } },
-        })
-
-        return {
-          succes: true,
-          message: `Culture "${culture.espece?.nom ?? ""}" (id ${culture.id}) mise à jour.`,
-          culture: {
-            id: culture.id,
-            espece: culture.espece?.nom,
-            semisFait: culture.semisFait,
-            plantationFaite: culture.plantationFaite,
-            recolteFaite: culture.recolteFaite,
-            dateSemis: culture.dateSemis,
-            datePlantation: culture.datePlantation,
-            dateRecolte: culture.dateRecolte,
-          },
-        }
-      } catch (caughtError) {
-        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-        return { erreur: `Impossible de mettre à jour la culture : ${message}` }
+      const c = derniere
+      const nomEspece = (c.espece as { nom?: string } | null | undefined)?.nom
+      return {
+        succes: true,
+        message: `Culture${nomEspece ? ` "${nomEspece}"` : ""} (id ${cultureId}) mise à jour.`,
+        culture: {
+          id: cultureId,
+          espece: nomEspece,
+          semisFait: c.semisFait,
+          plantationFaite: c.plantationFaite,
+          recolteFaite: c.recolteFaite,
+          dateSemis: c.dateSemis,
+          datePlantation: c.datePlantation,
+          dateRecolte: c.dateRecolte,
+          quantite: c.quantite,
+        },
+        ...(Array.isArray(c.warnings) ? { avertissements: c.warnings } : {}),
       }
     },
   },
   {
     name: "create_planche",
-    description: "Crée une nouvelle planche de culture. Supprime définitivement les données existantes si une planche du même nom existe déjà.",
+    description: "Crée une nouvelle planche de culture. Refusée si une planche du même nom existe déjà.",
     parameters: {
       type: "object",
       properties: {
@@ -790,56 +808,30 @@ export const outilsChat: OutilChat[] = [
       },
       required: ["nom"],
     },
-    handler: async (args: Record<string, unknown>, userId: string) => {
-      try {
-        const validation = createPlancheSchema.safeParse(args)
-        if (!validation.success) {
-          return { erreur: validation.error.issues.map((e) => e.message).join(", ") }
+    handler: async (args: Record<string, unknown>) => {
+      const corps: Record<string, unknown> = { nom: String(args.nom ?? "") }
+      for (const champ of ["largeur", "longueur", "surface", "posX", "posY"] as const) {
+        if (args[champ] !== undefined) {
+          const lue = lireNombre(args[champ], champ)
+          if (typeof lue === "string") return { erreur: lue }
+          corps[champ] = lue
         }
-
-        const nom = String(args.nom)
-        const existante = await prisma.planche.findUnique({
-          where: { nom_userId: { nom, userId } },
-        })
-        if (existante) {
-          return { erreur: `La planche "${nom}" existe déjà.` }
-        }
-
-        const largeur = args.largeur !== undefined ? Number(args.largeur) : null
-        const longueur = args.longueur !== undefined ? Number(args.longueur) : null
-        let surface = args.surface !== undefined ? Number(args.surface) : null
-        if (largeur !== null && longueur !== null && largeur > 0 && longueur > 0) {
-          surface = largeur * longueur
-        }
-
-        const data: Record<string, unknown> = {
-          nom,
-          userId,
-          surface,
-        }
-        if (args.type) data.type = String(args.type)
-        if (args.irrigation) data.irrigation = String(args.irrigation)
-        if (args.ilot) data.ilot = String(args.ilot)
-        if (args.parcelleGeoId) data.parcelleGeoId = String(args.parcelleGeoId)
-        if (args.notes) data.notes = String(args.notes)
-        if (args.posX !== undefined) data.posX = Number(args.posX)
-        if (args.posY !== undefined) data.posY = Number(args.posY)
-
-        const planche = await prisma.planche.create({
-          data: data as never,
-        })
-
-        await invalidateKpi(userId)
-        return { succes: true, planche: { id: planche.id, nom: planche.nom, surface: planche.surface, type: planche.type, ilot: planche.ilot } }
-      } catch (caughtError) {
-        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-        return { erreur: `Impossible de créer la planche : ${message}` }
       }
+      for (const champ of ["type", "irrigation", "ilot", "parcelleGeoId", "notes"] as const) {
+        if (args[champ]) corps[champ] = String(args[champ])
+      }
+
+      // Validation, doublon (409), surface arrondie et cache KPI : route d'upstream.
+      const { POST } = await import("@/app/api/planches/route")
+      const res = await appelerRouteUpstream(POST, { methode: "POST", chemin: "/api/planches", corps })
+      if (!res.ok) return refusOutil(res)
+      const d = res.donnees
+      return { succes: true, planche: { id: d.id, nom: d.nom, surface: d.surface, type: d.type, ilot: d.ilot } }
     },
   },
   {
     name: "delete_planche",
-    description: "Supprime définitivement une planche de culture par son nom. Vérifie qu'aucune culture n'est liée avant suppression.",
+    description: "Supprime définitivement une planche de culture par son nom. Refusée si une culture ou une intervention est liée à la planche.",
     parameters: {
       type: "object",
       properties: {
@@ -847,26 +839,19 @@ export const outilsChat: OutilChat[] = [
       },
       required: ["nom"],
     },
-    handler: async (args: Record<string, unknown>, userId: string) => {
-      try {
-        const nom = String(args.nom)
-        const planche = await prisma.planche.findUnique({
-          where: { nom_userId: { nom, userId } },
-          include: { _count: { select: { cultures: true } } },
-        })
-        if (!planche) {
-          return { erreur: `Planche "${nom}" non trouvée.` }
-        }
-        if (planche._count.cultures > 0) {
-          return { erreur: `Impossible de supprimer la planche "${nom}" car elle a ${planche._count.cultures} culture(s) liée(s).` }
-        }
-        await prisma.planche.delete({ where: { id: planche.id } })
-        await invalidateKpi(userId)
-        return { succes: true, supprimee: nom }
-      } catch (caughtError) {
-        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-        return { erreur: `Impossible de supprimer la planche : ${message}` }
-      }
+    handler: async (args: Record<string, unknown>) => {
+      const nom = String(args.nom ?? "").trim()
+      if (nom === "") return { erreur: "Le nom de la planche est requis." }
+
+      // La route résout un identifiant ou un nom, et refuse si une culture OU une intervention la retient.
+      const { DELETE } = await import("@/app/api/planches/[id]/route")
+      const res = await appelerRouteUpstream(DELETE, {
+        methode: "DELETE",
+        chemin: `/api/planches/${encodeURIComponent(nom)}`,
+        params: { id: encodeURIComponent(nom) },
+      })
+      if (!res.ok) return refusOutil(res)
+      return { succes: true, supprimee: typeof res.donnees.deleted === "string" ? res.donnees.deleted : nom }
     },
   },
   {
@@ -887,38 +872,30 @@ export const outilsChat: OutilChat[] = [
       },
       required: ["type", "largeur", "longueur", "posX", "posY"],
     },
-    handler: async (args: Record<string, unknown>, userId: string) => {
-      try {
-        const type = String(args.type)
-        const typesValides = ["allee", "passage", "bordure", "serre", "compost", "autre"]
-        if (!typesValides.includes(type)) {
-          return { erreur: `Type d'objet invalide : "${type}". Types acceptés : ${typesValides.join(", ")}.` }
-        }
-        const largeur = Number(args.largeur)
-        const longueur = Number(args.longueur)
-        const posX = Number(args.posX)
-        const posY = Number(args.posY)
-        if (largeur <= 0 || longueur <= 0) {
-          return { erreur: "Largeur et longueur doivent être positives." }
-        }
-        const data: Record<string, unknown> = {
-          type,
-          largeur,
-          longueur,
-          posX,
-          posY,
-          userId,
-        }
-        if (args.nom) data.nom = String(args.nom)
-        if (args.parcelleGeoId) data.parcelleGeoId = String(args.parcelleGeoId)
-        if (args.couleur) data.couleur = String(args.couleur)
-        if (args.notes) data.notes = String(args.notes)
-        const objet = await prisma.objetJardin.create({ data: data as never })
-        return { succes: true, objet: { id: objet.id, nom: objet.nom, type: objet.type, largeur: objet.largeur, longueur: objet.longueur } }
-      } catch (caughtError) {
-        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-        return { erreur: `Impossible de créer l'objet jardin : ${message}` }
+    handler: async (args: Record<string, unknown>) => {
+      const type = String(args.type)
+      if (!TYPES_OBJET_JARDIN.includes(type)) {
+        return { erreur: `Type d'objet invalide : "${type}". Types acceptés : ${TYPES_OBJET_JARDIN.join(", ")}.` }
       }
+      const nombres: Record<string, number> = {}
+      for (const champ of ["largeur", "longueur", "posX", "posY"] as const) {
+        const lue = lireNombre(args[champ], champ)
+        if (typeof lue === "string") return { erreur: lue }
+        nombres[champ] = lue
+      }
+      if (nombres.largeur <= 0 || nombres.longueur <= 0) {
+        return { erreur: "Largeur et longueur doivent être positives." }
+      }
+      const corps: Record<string, unknown> = { type, ...nombres }
+      for (const champ of ["nom", "parcelleGeoId", "couleur", "notes"] as const) {
+        if (args[champ]) corps[champ] = String(args[champ])
+      }
+
+      const { POST } = await import("@/app/api/objets-jardin/route")
+      const res = await appelerRouteUpstream(POST, { methode: "POST", chemin: "/api/objets-jardin", corps })
+      if (!res.ok) return refusOutil(res)
+      const d = res.donnees
+      return { succes: true, objet: { id: d.id, nom: d.nom, type: d.type, largeur: d.largeur, longueur: d.longueur } }
     },
   },
   {
@@ -931,24 +908,24 @@ export const outilsChat: OutilChat[] = [
       },
       required: ["objetId"],
     },
-    handler: async (args: Record<string, unknown>, userId: string) => {
-      try {
-        const objetId = Number(args.objetId)
-        const objet = await prisma.objetJardin.findUnique({ where: { id: objetId, userId } })
-        if (!objet) {
-          return { erreur: "Objet non trouvé." }
-        }
-        await prisma.objetJardin.delete({ where: { id: objetId } })
-        return { succes: true }
-      } catch (caughtError) {
-        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-        return { erreur: `Impossible de supprimer l'objet jardin : ${message}` }
+    handler: async (args: Record<string, unknown>) => {
+      const objetId = Number(args.objetId)
+      if (!Number.isInteger(objetId) || objetId <= 0) {
+        return { erreur: "objetId invalide." }
       }
+      const { DELETE } = await import("@/app/api/objets-jardin/[id]/route")
+      const res = await appelerRouteUpstream(DELETE, {
+        methode: "DELETE",
+        chemin: `/api/objets-jardin/${objetId}`,
+        params: { id: String(objetId) },
+      })
+      if (!res.ok) return refusOutil(res)
+      return { succes: true }
     },
   },
   {
     name: "create_variete_perso",
-    description: "Crée une nouvelle variété personnelle pour une espèce donnée. Supprime définitivement les données existantes si une variété du même nom existe déjà pour cette espèce.",
+    description: "Crée une nouvelle variété personnelle pour une espèce donnée. Refusée si une variété du même nom existe déjà pour cette espèce.",
     parameters: {
       type: "object",
       properties: {
@@ -962,43 +939,34 @@ export const outilsChat: OutilChat[] = [
       required: ["nom", "especeNom"],
     },
     handler: async (args: Record<string, unknown>, userId: string) => {
-      try {
-        const especeNom = String(args.especeNom)
-        const resolution = await resoudreEspeceParNom(especeNom, userId)
-        if (resolution.erreur) {
-          return { erreur: resolution.erreur }
+      const refusAdmin = await refuserSiAdminReferentiel()
+      if (refusAdmin) return refusAdmin
+      const nom = String(args.nom ?? "").trim()
+      if (nom === "") return { erreur: "Le nom de la variété est requis." }
+      const resolution = await resoudreEspeceParNom(String(args.especeNom ?? ""), userId)
+      if (resolution.erreur) return { erreur: resolution.erreur }
+
+      // `id` porte le NOM saisi (contrat de la route), conservé tel quel.
+      const corps: Record<string, unknown> = { id: nom, especeId: resolution.especeId!, bio: args.bio === true }
+      if (args.description) corps.description = String(args.description)
+      for (const champ of ["semaineRecolte", "dureeRecolte"] as const) {
+        if (args[champ] !== undefined) {
+          const lue = lireNombre(args[champ], champ)
+          if (typeof lue === "string") return { erreur: lue }
+          corps[champ] = lue
         }
-        const especeId = resolution.especeId!
-        const nomSaisi = cleanReferentielName(String(args.nom))
-        const nomNormalise = normalizeVarieteName(nomSaisi)
-        const existante = await prisma.variete.findFirst({
-          where: { especeId, nomNormalise, userId },
-        })
-        if (existante) {
-          return { erreur: `La variété "${nomSaisi}" existe déjà pour l'espèce "${especeNom}".` }
-        }
-        const data: Record<string, unknown> = {
-          nom: nomSaisi,
-          nomNormalise,
-          especeId,
-          userId,
-          partageCommunaute: false,
-        }
-        if (args.bio === true) data.bio = true
-        if (args.description) data.description = String(args.description)
-        if (args.semaineRecolte !== undefined) data.semaineRecolte = Number(args.semaineRecolte)
-        if (args.dureeRecolte !== undefined) data.dureeRecolte = Number(args.dureeRecolte)
-        const variete = await prisma.variete.create({ data: data as never })
-        return { succes: true, variete: { id: variete.id, nom: variete.nom, especeId: variete.especeId } }
-      } catch (caughtError) {
-        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-        return { erreur: `Impossible de créer la variété : ${message}` }
       }
+
+      const { POST } = await import("@/app/api/varietes/route")
+      const res = await appelerRouteUpstream(POST, { methode: "POST", chemin: "/api/varietes", corps })
+      if (!res.ok) return refusOutil(res)
+      const d = res.donnees
+      return { succes: true, variete: { id: d.id, nom: d.nom, especeId: d.especeId } }
     },
   },
   {
     name: "delete_variete_perso",
-    description: "Supprime définitivement une variété personnelle par son ID. Vérifie que l'utilisateur est bien le propriétaire.",
+    description: "Supprime définitivement une variété personnelle par son ID. Refusée si des cultures l'utilisent ou si elle n'appartient pas à l'utilisateur.",
     parameters: {
       type: "object",
       properties: {
@@ -1006,27 +974,26 @@ export const outilsChat: OutilChat[] = [
       },
       required: ["varieteId"],
     },
-    handler: async (args: Record<string, unknown>, userId: string) => {
-      try {
-        const varieteId = String(args.varieteId)
-        const variete = await prisma.variete.findUnique({ where: { id: varieteId } })
-        if (!variete) {
-          return { erreur: "Variété non trouvée." }
-        }
-        if (variete.userId !== userId) {
-          return { erreur: "Vous ne pouvez supprimer que vos propres variétés." }
-        }
-        await prisma.variete.delete({ where: { id: varieteId } })
-        return { succes: true }
-      } catch (caughtError) {
-        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-        return { erreur: `Impossible de supprimer la variété : ${message}` }
-      }
+    handler: async (args: Record<string, unknown>) => {
+      const refusAdmin = await refuserSiAdminReferentiel()
+      if (refusAdmin) return refusAdmin
+      const varieteId = String(args.varieteId ?? "").trim()
+      if (varieteId === "") return { erreur: "L'identifiant de la variété est requis." }
+
+      // La route refuse (409) si des cultures utilisent la variété, et (403) si elle n'est pas à l'utilisateur.
+      const { DELETE } = await import("@/app/api/varietes/[id]/route")
+      const res = await appelerRouteUpstream(DELETE, {
+        methode: "DELETE",
+        chemin: "/api/varietes/suppression",
+        params: { id: varieteId },
+      })
+      if (!res.ok) return refusOutil(res)
+      return { succes: true }
     },
   },
   {
     name: "delete_culture",
-    description: "Supprime définitivement une culture par son ID. Supprime également les ventes automatiques liées aux récoltes de cette culture.",
+    description: "Supprime définitivement une culture par son ID. Refusée si une récolte de la culture est vendue ou facturée, ou si ses lots sont liés à des bons ou factures.",
     parameters: {
       type: "object",
       properties: {
@@ -1034,34 +1001,20 @@ export const outilsChat: OutilChat[] = [
       },
       required: ["cultureId"],
     },
-    handler: async (args: Record<string, unknown>, userId: string) => {
-      try {
-        const cultureId = Number(args.cultureId)
-        const culture = await prisma.culture.findUnique({ where: { id: cultureId, userId } })
-        if (!culture) {
-          return { erreur: "Culture non trouvée." }
-        }
-        const recoltes = await prisma.recolte.findMany({
-          where: { cultureId, userId },
-          select: { id: true },
-        })
-        await prisma.$transaction(async (tx) => {
-          if (recoltes.length > 0) {
-            await tx.venteManuelle.deleteMany({
-              where: {
-                sourceType: "recolte",
-                sourceId: { in: recoltes.map((r) => r.id) },
-                auto: true,
-              },
-            })
-          }
-          await tx.culture.delete({ where: { id: cultureId } })
-        })
-        return { succes: true, supprimee: cultureId }
-      } catch (caughtError) {
-        const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-        return { erreur: `Impossible de supprimer la culture : ${message}` }
+    handler: async (args: Record<string, unknown>) => {
+      const cultureId = Number(args.cultureId)
+      if (!Number.isInteger(cultureId) || cultureId <= 0) {
+        return { erreur: "cultureId invalide." }
       }
+      // La route refuse (409) une culture dont une récolte est vendue ou facturée, ou dont les lots sont liés à des bons.
+      const { DELETE } = await import("@/app/api/cultures/[id]/route")
+      const res = await appelerRouteUpstream(DELETE, {
+        methode: "DELETE",
+        chemin: `/api/cultures/${cultureId}`,
+        params: { id: String(cultureId) },
+      })
+      if (!res.ok) return refusOutil(res)
+      return { succes: true, supprimee: cultureId }
     },
   },
 ]
@@ -1134,7 +1087,11 @@ export async function executerOutil(
     const resultat = await outil.handler(args, userId)
     return JSON.stringify(resultat)
   } catch (caughtError) {
-    const message = caughtError instanceof Error ? caughtError.message : String(caughtError)
-    return JSON.stringify({ erreur: message })
+    if (caughtError instanceof SyntaxError) {
+      return JSON.stringify({ erreur: "Arguments de l'outil invalides (JSON illisible)." })
+    }
+    // Détail au journal serveur seulement : le modèle ne reçoit jamais un message technique brut.
+    console.error(`executerOutil(${name}) :`, caughtError)
+    return JSON.stringify({ erreur: "L'outil a échoué : l'opération n'a pas pu aboutir." })
   }
 }
