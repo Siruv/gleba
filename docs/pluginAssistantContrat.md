@@ -218,8 +218,22 @@ Sources : `docs/integrations-elevage.md` (section Authentification) et `src/app/
 1. Le jeton appartient à la PERSONNE (`getActeurId`), pas au tenant : `/api/user/api-token` est hors du refus par méthode (`entete-mutation.ts:50`), un membre en consultation ne doit donc jamais obtenir un jeton posé sur le compte du propriétaire.
 2. L'authentification résout ensuite le contexte avec `resoudreContexteExploitation(acteur)` : les outils reçoivent le tenant, comme dans le chat.
 3. Jeton comparé en temps constant (empreintes SHA-256), 401 unique et générique, aucun message d'exception renvoyé, jeton jamais journalisé ni utilisé en clair dans une clé.
-4. MCP en lecture seule : un outil dont le nom ne commence pas par `get_` répond 403, y compris pour un propriétaire, tant que les outils d'écriture n'appliquent pas les règles d'upstream (phase 2c).
+4. MCP en lecture seule : un outil dont le nom ne commence pas par `get_` répond 403, y compris pour un propriétaire, car l'écriture par la logique d'upstream (phase 2c, 2.11) exige une session et un cookie, que le chemin par jeton n'a pas.
 5. Reste : jeton stocké en clair en base (upstream hache le jeton de capteur en SHA-256, `lib/capteurs/jeton.ts`) ; limite de débit en mémoire donc par processus ; changer cela demande une migration, hors périmètre.
+
+### 2.11 Écritures de l'assistant : appel en processus des routes d'upstream (phase 2c)
+
+Décision (approche A de `pluginAssistantAuditOutils.md`, section 4) : les outils d'écriture de `chat-tools.ts` appellent les handlers de `/api/cultures`, `/api/cultures/[id]`, `/api/planches`, `/api/planches/[id]`, `/api/interventions`, `/api/objets-jardin`, `/api/objets-jardin/[id]`, `/api/varietes` et `/api/varietes/[id]`, par `src/lib/chat/appelRouteUpstream.ts`. Aucun fichier d'upstream n'est modifié ; toutes ses règles s'appliquent (validation, rotation, occupation, ventes, jour civil, cache KPI).
+
+Mécanisme, vérifié avec Next 16.2.10 et next-auth 5.0.0-beta.31 : les handlers appellent `requireAuthApi()` sans argument, `auth()` lit `headers()` de la requête courante (celle de `/api/chat`, cookie compris). Le helper transmet le cookie et l'IP, jamais l'en-tête de mutation. Test : `chat-tools-ecriture-garde.test.ts`.
+
+Limites à connaître :
+1. Garde lecture seule : l'en-tête de mutation vaut « 0 » pour `/api/chat`, donc la garde d'upstream ne se déclenche pas (prouvé par test). Le refus explicite de `executerOutil` (`executerAvecDroitsChat`) reste indispensable.
+2. Dépendance au contexte de requête : hors requête (script, tâche de fond, MCP par jeton), `auth()` rend `null` et le handler répond 401.
+3. Rate limit par IP : les handlers n'en appliquent pas (appel sans argument) ; le chat garde le sien.
+4. Un 409 d'avertissement (rotation) n'est jamais forcé ; message renvoyé tel quel. Confirmation explicite : phase 5.
+5. Le contrat HTTP des routes (corps, forme de réponse) devient une dépendance à surveiller à chaque synchro ; les tests des outils appellent les vrais handlers et le détectent.
+6. Aucune pile ni message d'exception ne remonte au modèle (500 et exceptions : message générique, journal serveur).
 
 ## 3. b) Côté plugin : inventaire des fichiers (hors tests)
 
@@ -244,6 +258,7 @@ Source : `git diff --name-status $(git merge-base HEAD origin/main) HEAD`, 15 co
 | `src/lib/chat-contexte.ts` | contexte météo injecté |
 | `src/lib/chat-openai-tools.ts`, `chat-anthropic-tools.ts`, `chat-ollama-tools.ts`, `chat-codex.ts` | boucles d'appel d'outils par provider |
 | `src/lib/chat/daily-opening.ts`, `daily-briefing.ts` | briefing quotidien |
+| `src/lib/chat/appelRouteUpstream.ts` | appel en processus des routes d'upstream (2.11) |
 
 Attention : `src/app/api/user/api-token/` est classé « plugin » mais sert aussi la page Paramètres d'upstream (`parametres/page.tsx:248-283`). C'est un point d'ancrage inverse : upstream consomme une route du plugin. Le contrat doit le dire (2.5) et le plugin ne peut pas la retirer sans casser Paramètres.
 

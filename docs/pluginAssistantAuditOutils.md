@@ -26,12 +26,33 @@ Constats classés par gravité.
 |---|---|---|
 | 1 | Jeton MCP rattaché au tenant | **Corrigé** : `getActeurId` dans `api-token/route.ts`, `/api/mcp` résout le contexte et passe en lecture seule (403 pour toute écriture), limite 200/15 min par jeton. Tests : `api/user/api-token/route.test.ts`, `api/mcp/route.test.ts` |
 | 2 | Écriture par le chat en consultation | **Corrigé** : `executerAvecDroitsChat` (route chat) et refus dans `executerOutil` ; les lectures restent permises. Tests : `chat-tools-ecriture.test.ts`, `api/chat/route.test.ts` |
-| 3 | `delete_culture` supprime les ventes | **Reste** (phase 2c) |
-| 4 | `get_especes` expose les espèces privées | **Corrigé** (`visibiliteReferentiel`, test dans `chat-tools.test.ts`). Reste : `especeId` non vérifié dans `create_culture` (phase 2c) |
-| 5 | Suppressions sans comptage | **Reste** (phase 2c) |
-| 6 | Cache KPI et irrigation | **Reste** (phase 2c) |
+| 3 | `delete_culture` supprime les ventes | **Corrigé** (phase 2c) : l'outil appelle `DELETE /api/cultures/[id]`, qui refuse en 409 une culture à récolte vendue ou à lots liés. Test : `chat-tools-ecriture.test.ts` (aucune `venteManuelle` supprimée) |
+| 4 | `get_especes` expose les espèces privées | **Corrigé** (`visibiliteReferentiel`, test dans `chat-tools.test.ts`). `especeId` non vérifié dans `create_culture` : **corrigé en 2c** (la route d'upstream vérifie la visibilité, 400 sinon) ; la résolution par nom utilise aussi `visibiliteReferentiel` (espèces communautaires trouvées) |
+| 5 | Suppressions sans comptage | **Corrigé** (phase 2c) : `delete_variete_perso` (409 si des cultures l'utilisent), `delete_planche` (409 si cultures ou interventions), via les routes d'upstream |
+| 6 | Cache KPI et irrigation | **Corrigé** (phase 2c) : les routes invalident KPI (et irrigation pour `create_intervention`). Exception : `create_objet_jardin` / `delete_objet_jardin` (la route d'upstream n'invalide rien, aucun KPI ne dépend des objets) |
 | 7 | Lectures fausses | **Corrigé** (phase 2b) : `get_cultures` (`whereEtatCulture`/`etatCulture`, état inconnu refusé), `get_recoltes` (`quantite` + `unite`, bornes `lireAnnee`), `get_planification` (`whereItpUtilisable` + `whereItpApplicable`, calage de zone, `masquerReferentielsEmbarques`, plafond 200), `get_dashboard_stats` (`getKpiMaraichage`). Tests : `chat-tools-lectures.test.ts` (deux comptes) |
 | 8 | `fetchDailyBriefing(userId)` | **Corrigé** : sans paramètre, identité par `requireAuth`. Test : `actions/chat-briefing.test.ts`. La clé de préférence du briefing est aussi alignée sur upstream (C09 sans avertissement) |
+
+### Statut après la phase 2c (écritures par les routes d'upstream, approche A)
+
+Les 10 outils d'écriture n'appellent plus Prisma : chacun appelle EN PROCESSUS le handler de la route d'upstream (helper `src/lib/chat/appelRouteUpstream.ts`). Test de contrat : plus aucun `prisma.*.create/update/delete` ni `$transaction` dans `chat-tools.ts`.
+
+| Outil | Route appelée | Refus métier testé |
+|---|---|---|
+| `create_intervention` | `POST /api/interventions` | réalisée datée dans le futur (400) ; KPI et irrigation invalidés |
+| `create_culture` | `POST /api/cultures` | espèce privée d'un autre compte (400), récolte avant semis (400), année invalide (400), rotation en 409 NON forcée |
+| `update_culture` | `PATCH /api/cultures/[id]` (étapes, dates) puis `PUT` (quantité) | annulation d'étape avec récoltes (409), culture inconnue (404) |
+| `create_planche` | `POST /api/planches` | doublon (409), largeur hors bornes (400) |
+| `delete_planche` | `DELETE /api/planches/[id]` | intervention ou culture retient la planche (409), inconnue (404) |
+| `create_objet_jardin` | `POST /api/objets-jardin` | dimensions non positives (refus avant route) |
+| `delete_objet_jardin` | `DELETE /api/objets-jardin/[id]` | objet d'un autre compte (404), identifiant `NaN` refusé |
+| `create_variete_perso` | `POST /api/varietes` | doublon (409), semaine hors bornes (400), administrateur refusé |
+| `delete_variete_perso` | `DELETE /api/varietes/[id]` | utilisée par des cultures (409), variété d'autrui (403) |
+| `delete_culture` | `DELETE /api/cultures/[id]` | récolte vendue (409, aucune vente supprimée), lots liés (409), inconnue (404) |
+
+Constats de la section 1 : 1.1 (validation, date réalisée, KPI et irrigation) **corrigé** ; 1.2 (dates au jour civil, étapes faites, espèce visible, variété placeholder, dates contre ITP, KPI) **corrigé** ; 1.3 (garde des récoltes, cohérence du cycle, écritures de passage à fait, KPI) **corrigé** ; 1.4 (surface arrondie, doublon, champs validés) **corrigé** ; 1.5 **corrigé** ; 1.6 et 1.7 : routes d'upstream appelées, `NaN` refusé avant la route ; 1.8 (libellé conservé tel que saisi, validation, doublon scopé) **corrigé** ; 1.9 et 1.10 **corrigés**. Descriptions fausses (« Supprime définitivement les données existantes ») **corrigées**. Le message d'exception brut n'est plus renvoyé au modèle (`executerOutil` et le helper).
+
+Restant : (a) rotation « Continuer ? » : le 409 est renvoyé tel quel, la confirmation explicite viendra en phase 5, aucun `confirmRotation` n'est jamais envoyé ; (b) `create_culture` ne peut toujours pas viser planche, variété ni ITP (extension future : tous les contrôles d'upstream s'appliqueront alors) ; (c) confirmation serveur des suppressions (3.5) : toujours à décider ; (d) `/api/mcp` reste en lecture seule (403 sur toute écriture), l'approche A exige une session ; (e) un administrateur est refusé sur `create_variete_perso` et `delete_variete_perso` (sa session écrirait dans le catalogue officiel). Aucune route d'upstream appelée n'est inappelable en processus (JSON seulement, pas de flux ni de formData).
 
 Briefing quotidien (phase 2b) : `fetchDailyBriefing` ne marque plus « vu » un briefing vide (`briefingEstVide`, `lib/chat/daily-briefing.ts`, partagée avec le popup). Tests : `actions/chat-briefing.test.ts`. Limite : `hasAlreadyShownBriefingToday` puis `markBriefingAsShown` ne sont pas atomiques (lecture puis upsert) ; deux onglets simultanés peuvent chacun afficher un popup. Piste hors périmètre : un `updateMany` conditionnel ou un `create` sur clé unique dans `daily-opening.ts`.
 
