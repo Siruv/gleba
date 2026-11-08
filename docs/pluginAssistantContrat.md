@@ -271,10 +271,10 @@ Hors assistant, présent dans le diff : `scripts/seed-associations.ts` (ajout au
 | `src/app/layout.tsx` | +2 lignes : import de `DailyBriefingPopup` (l.16) et montage `<DailyBriefingPopup />` (l.242) juste avant `<ChatBubble />`. L'import et le montage de `ChatBubble` sont d'origine. | faible, 2 points d'insertion |
 | `src/app/admin/page.tsx` | import de l'icône `Bot` ajouté à la ligne d'import lucide-react (l.10) ; un bloc `<Card>` « Réglages du chat IA » inséré (l.183-201) avec lien vers `/admin/chat` | moyen : la ligne d'import lucide est modifiée par tout ajout d'icône |
 | `src/lib/settings.ts` | 7 entrées dans le type `SettingsRegistry` (l.21-27) et 7 définitions dans `settingsRegistry` (début de l'objet, l.48+) | élevé : insertion en tête de deux blocs fermés |
-| `docker-entrypoint.sh` | le seed arboricole devient opt-in (`SEED_ARBRES=true`), lignes 57-70 : remplace l'exécution inconditionnelle d'upstream. Sans rapport avec l'assistant. | élevé : réécrit un bloc d'upstream |
 | `package.json` | + `react-markdown`, `remark-gfm` en dépendances ; + script `verifier:contratAssistant` | faible, mais `package-lock.json` change |
 | `tsconfig.json` | + `"scripts"` dans `exclude` (l.45), qui masque tout le dossier au compilateur | faible, mais exclut aussi les futurs scripts d'upstream du typage |
-| `prisma/seed-varietes-arbres.sql` | réécriture de 287 lignes (116 ajouts, 171 suppressions) | élevé, et voir ci-dessous |
+
+Note (phase 2d) : `docker-entrypoint.sh` et `prisma/seed-varietes-arbres.sql` sont revenus à la version d'upstream (le seed arboricole est de nouveau systématique, correctifs de l'issue 30 rétablis). Les deux puces suivantes sur ces fichiers sont historiques.
 
 À trancher sur ce delta (voir section 5) :
 - **Le seed arboricole annule des correctifs d'upstream.** Par rapport à `origin/main`, notre version supprime le commentaire de l'Issue #30, remet `intervalle` à `0` au lieu de `4` pour 9 familles (le commentaire d'upstream explique que 0 autoriserait un retour immédiat sur la même planche), n'insère plus la colonne `nom`, et remplace `ON CONFLICT DO NOTHING` par `ON CONFLICT (variete) DO NOTHING`. Le commit d'origine est `513f5b74`. Ce n'est pas une greffe du plugin assistant : c'est une régression de synchro à reprendre depuis `origin/main`.

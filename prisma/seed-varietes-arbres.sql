@@ -8,17 +8,24 @@
 -- 1. FAMILLES BOTANIQUES MANQUANTES
 -- ============================================================
 
+-- Issue #30 : les noms de familles étaient en français. Le trigger
+-- `enforce_famille_latine` impose la nomenclature APG IV en latin sur `especes`,
+-- si bien que l'INSERT des espèces échouait en bloc (« Famille "Rosacées" :
+-- utiliser le nom latin ») — et les familles françaises, elles, passaient,
+-- créant 9 doublons du référentiel. `intervalle` passe de 0 à 4, valeur portée
+-- par les 62 familles déjà en base : c'est le délai de retour en rotation, et 0
+-- autoriserait un retour immédiat sur la même planche.
 INSERT INTO familles (famille, intervalle, couleur, description)
 VALUES
-  ('Oleaceae', 0, '#808000', 'Oliviers, frênes, lilas'),
-  ('Moraceae', 0, '#6b4226', 'Figuiers, mûriers'),
-  ('Juglandaceae', 0, '#8B7355', 'Noyers, caryers'),
-  ('Fagaceae', 0, '#654321', 'Châtaigniers, chênes, hêtres'),
-  ('Actinidiaceae', 0, '#556B2F', 'Kiwis'),
-  ('Lythraceae', 0, '#DC143C', 'Grenadiers, salicaires'),
-  ('Ebenaceae', 0, '#FF8C00', 'Plaqueminiers (kakis)'),
-  ('Rutaceae', 0, '#FFD700', 'Agrumes : citronniers, orangers, mandariniers'),
-  ('Grossulariaceae', 0, '#B22222', 'Groseilliers, cassissiers')
+  ('Oleaceae', 4, '#808000', 'Oliviers, frênes, lilas'),
+  ('Moraceae', 4, '#6b4226', 'Figuiers, mûriers'),
+  ('Juglandaceae', 4, '#8B7355', 'Noyers, caryers'),
+  ('Fagaceae', 4, '#654321', 'Châtaigniers, chênes, hêtres'),
+  ('Actinidiaceae', 4, '#556B2F', 'Kiwis'),
+  ('Lythraceae', 4, '#DC143C', 'Grenadiers, salicaires'),
+  ('Ebenaceae', 4, '#FF8C00', 'Plaqueminiers (kakis)'),
+  ('Rutaceae', 4, '#FFD700', 'Agrumes : citronniers, orangers, mandariniers'),
+  ('Grossulariaceae', 4, '#B22222', 'Groseilliers, cassissiers')
 ON CONFLICT (famille) DO NOTHING;
 
 
@@ -50,6 +57,9 @@ VALUES
   ('Kiwi',           'arbre_fruitier', 'Actinidiaceae',   'Actinidia deliciosa',    30.0,  true, 3, 4, '#556B2F', 'Liane vigoureuse, fruits à peau velue, plante dioïque sauf var. autofertiles'),
   ('Cognassier',     'arbre_fruitier', 'Rosaceae',        'Cydonia oblonga',        25.0,  true, 2, 3, '#F4D03F', 'Petit arbre rustique, coings parfumés pour gelées et pâtes de fruits'),
   ('Néflier',        'arbre_fruitier', 'Rosaceae',        'Mespilus germanica',     20.0,  true, 1, 2, '#A0522D', 'Petit arbre rustique, nèfles à consommer après blettissement')
+-- Leçon Marc 2026-05-16 (V3 bug 2) : un import rejoué à CHAQUE démarrage ne
+-- doit jamais réécrire des valeurs agronomiques corrigées depuis. Ce seed
+-- complète, il ne corrige pas — les corrections passent par une migration.
 ON CONFLICT (espece) DO NOTHING;
 
 
@@ -62,9 +72,11 @@ ON CONFLICT (espece) DO NOTHING;
 -- Rendement: kg/plant/an | Récolte exprimée en semaine ISO
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Meeker', gleba_cle_referentiel('Framboisier Meeker'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Meeker',
    'Framboisier', 26, 5,
    'NON REMONTANT. Origine: USA (Washington). Floraison: mai. Récolte: fin juin à fin juillet (5 semaines). '
    || 'Rendement: 1.5-2 kg/plant. Fruit: 3.5-10 g, rouge foncé, ferme, excellente tenue. '
@@ -74,7 +86,7 @@ VALUES
    || 'Particularités: variété de référence pour l''industrie de transformation et la congélation. Très bonne aptitude au transport.'
   ),
 
-  ('Heritage', gleba_cle_referentiel('Framboisier Heritage'),
+  ('Heritage',
    'Framboisier', 27, 14,
    'REMONTANT. Origine: USA (Cornell University, 1969). Floraison: mai puis août. Récolte: 1ère fin juin-juillet, 2nde septembre-octobre. '
    || 'Rendement: 1.5-2 kg/plant. Fruit: 3-4 g, rouge moyen, ferme, saveur équilibrée sucrée-acide. '
@@ -84,7 +96,7 @@ VALUES
    || 'Particularités: variété remontante de référence mondiale. Double récolte possible. Très rustique (-25°C).'
   ),
 
-  ('Tulameen', gleba_cle_referentiel('Framboisier Tulameen'),
+  ('Tulameen',
    'Framboisier', 25, 6,
    'NON REMONTANT. Origine: Canada (Colombie-Britannique). Floraison: mai-juin (4-6 semaines). Récolte: mi-juin à fin juillet. '
    || 'Rendement: 2-3 kg/plant. Fruit: 4-6 g (jusqu''à 10-15 g), rouge clair, très gros calibre, juteux, saveur sucrée. '
@@ -94,7 +106,7 @@ VALUES
    || 'Particularités: référence en calibre de fruit. Excellente qualité gustative pour le frais. La plus vendue en pépinière.'
   ),
 
-  ('Autumn Bliss', gleba_cle_referentiel('Framboisier Autumn Bliss'),
+  ('Autumn Bliss',
    'Framboisier', 30, 10,
    'REMONTANT. Origine: UK (East Malling, 1984). Floraison: avril-mai puis juillet-août. Récolte: fin juillet à mi-octobre. '
    || 'Rendement: 1.5-2 kg/plant. Fruit: 3-5 g, rouge foncé, moyennement ferme, saveur douce et parfumée. '
@@ -104,7 +116,7 @@ VALUES
    || 'Particularités: variété compacte idéale en pot. Très précoce parmi les remontants. Bonne rusticité.'
   ),
 
-  ('Maravilla', gleba_cle_referentiel('Framboisier Maravilla'),
+  ('Maravilla',
    'Framboisier', 26, 16,
    'REMONTANT. Origine: USA (Driscoll''s, Californie). Floraison: mai puis août. Récolte: fin juin-juillet puis août-octobre. '
    || 'Rendement: 2-3 kg/plant. Fruit: 6-8 g, rouge brillant, très gros, ferme, saveur sucrée. '
@@ -114,7 +126,7 @@ VALUES
    || 'Particularités: variété premium du marché frais. Production étalée. Rendement élevé sous tunnel.'
   ),
 
-  ('Glen Ample', gleba_cle_referentiel('Framboisier Glen Ample'),
+  ('Glen Ample',
    'Framboisier', 27, 6,
    'NON REMONTANT. Origine: Écosse (James Hutton Institute). Floraison: mai-juin. Récolte: début juillet à mi-août. '
    || 'Rendement: 2-3 kg/plant. Fruit: 4-6 g, rouge foncé, juteux, très parfumé. '
@@ -123,7 +135,8 @@ VALUES
    || 'Vigueur: forte, tiges SANS épines, dressées. '
    || 'Particularités: variété sans épines facilitant la récolte. Très bon rendement. Rustique. Idéale pour le marché frais.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -131,9 +144,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/plant/an
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Jonkheer van Tets', gleba_cle_referentiel('Groseillier Jonkheer van Tets'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Jonkheer van Tets',
    'Groseillier', 25, 3,
    'Origine: Pays-Bas. Floraison: avril (fleurs jaune miel). Récolte: fin juin à mi-juillet (précoce). '
    || 'Rendement: 3-4 kg/plant. Fruit: gros, rouge translucide, longues grappes, légèrement acide. '
@@ -143,7 +158,7 @@ VALUES
    || 'Particularités: variété précoce de référence. Excellente pour le frais et la transformation. Très rustique.'
   ),
 
-  ('Rovada', gleba_cle_referentiel('Groseillier Rovada'),
+  ('Rovada',
    'Groseillier', 30, 4,
    'Origine: Pays-Bas. Floraison: avril-mai. Récolte: fin juillet à fin août (tardive). '
    || 'Rendement: 4-6 kg/plant. Fruit: gros, rouge vif, grappes très longues (15-20 cm), saveur acidulée. '
@@ -153,7 +168,7 @@ VALUES
    || 'Particularités: variété tardive de référence pour le marché frais. Grappes spectaculaires. Rendement record.'
   ),
 
-  ('Versaillaise rouge', gleba_cle_referentiel('Groseillier Versaillaise rouge'),
+  ('Versaillaise rouge',
    'Groseillier', 27, 3,
    'Origine: France (Versailles, XIXe siècle). Floraison: avril. Récolte: juillet (mi-saison). '
    || 'Rendement: 3-5 kg/plant. Fruit: moyen, rouge brillant, grappes moyennes, acidité marquée. '
@@ -163,7 +178,7 @@ VALUES
    || 'Particularités: variété traditionnelle française. Excellente pour la transformation (jus, gelées). Bon rendement en jus.'
   ),
 
-  ('Blanka', gleba_cle_referentiel('Groseillier Blanka'),
+  ('Blanka',
    'Groseillier', 28, 4,
    'Origine: Tchéquie. Floraison: avril-mai. Récolte: juillet à août. '
    || 'Rendement: 5-8 kg/plant (jusqu''à 11 kg). Fruit: groseille blanche translucide à ambrée, très gros, saveur douce et sucrée. '
@@ -172,7 +187,8 @@ VALUES
    || 'Vigueur: forte, port étalé. '
    || 'Particularités: variété la plus productive en groseille blanche. Saveur très douce, idéale pour le frais. Peu acide.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -180,9 +196,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/plant/an
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Noir de Bourgogne', gleba_cle_referentiel('Cassissier Noir de Bourgogne'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Noir de Bourgogne',
    'Cassissier', 28, 2,
    'Origine: France (Bourgogne, variété ancienne). Floraison: avril. Récolte: mi-juillet (2 semaines). '
    || 'Rendement: 1.5-2.5 kg/plant. Fruit: moyen, noir, très aromatique et parfumé, saveur typique. '
@@ -192,7 +210,7 @@ VALUES
    || 'Particularités: variété emblématique de la crème de cassis de Dijon. Arôme incomparable. Rendement modeste.'
   ),
 
-  ('Andega', gleba_cle_referentiel('Cassissier Andega'),
+  ('Andega',
    'Cassissier', 29, 3,
    'Origine: Lituanie. Floraison: tardive (avril-mai). Récolte: fin juillet à mi-août. '
    || 'Rendement: 3-4 kg/plant. Fruit: gros, noir, acidulé, très bon arôme. '
@@ -202,7 +220,7 @@ VALUES
    || 'Particularités: excellent pollinisateur pour Noir de Bourgogne. Floraison tardive évitant les gelées. Très productif.'
   ),
 
-  ('Titania', gleba_cle_referentiel('Cassissier Titania'),
+  ('Titania',
    'Cassissier', 28, 3,
    'Origine: Suède. Floraison: avril. Récolte: mi-juillet à début août. '
    || 'Rendement: 2.5-3.5 kg/plant. Fruit: moyen, noir, saveur douce et légèrement acide. '
@@ -212,7 +230,7 @@ VALUES
    || 'Particularités: variété robuste très résistante. Goût moins prononcé que Noir de Bourgogne. Bien adaptée au nord.'
   ),
 
-  ('Big Ben', gleba_cle_referentiel('Cassissier Big Ben'),
+  ('Big Ben',
    'Cassissier', 26, 3,
    'Origine: Écosse (James Hutton Institute). Floraison: avril. Récolte: fin juin à mi-juillet (précoce). '
    || 'Rendement: 3-5 kg/plant. Fruit: TRÈS gros (2-3× la taille standard, jusqu''à 2.5 g/baie), noir brillant, sucré et doux. '
@@ -221,7 +239,8 @@ VALUES
    || 'Vigueur: forte, port érigé, 1.5 m à maturité. '
    || 'Particularités: créé pour le marché du frais. Baies assez sucrées pour être consommées crues directement.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -229,9 +248,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/plant/an
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Thornfree', gleba_cle_referentiel('Mûrier-Thornfree'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Thornfree',
    'Mûrier', 30, 8,
    'Origine: USA (USDA, 1966). Floraison: mai-juin (fleurs blanc-rosé). Récolte: fin juillet à septembre. '
    || 'Rendement: 5-10 kg/plant. Fruit: très gros, noir, ferme, saveur douce à maturité. '
@@ -241,7 +262,7 @@ VALUES
    || 'Particularités: variété pionnière sans épine. Récolte tardive et abondante. Adapté climat tempéré.'
   ),
 
-  ('Loch Ness', gleba_cle_referentiel('Mûrier-Loch Ness'),
+  ('Loch Ness',
    'Mûrier', 29, 5,
    'Origine: Écosse (James Hutton Institute). Floraison: mai-juin. Récolte: mi-juillet à fin août. '
    || 'Rendement: 5-8 kg/plant. Fruit: gros (6-9 g), noir brillant, ferme, saveur aromatique et douce. '
@@ -251,7 +272,7 @@ VALUES
    || 'Particularités: excellente tenue en barquette. Très productive. Port semi-érigé facilitant la récolte.'
   ),
 
-  ('Triple Crown', gleba_cle_referentiel('Mûrier-Triple Crown'),
+  ('Triple Crown',
    'Mûrier', 31, 8,
    'Origine: USA (USDA, 1996). Floraison: mai-juin (fleurs blanc-rose). Récolte: août à octobre. '
    || 'Rendement: 5-12 kg/plant (jusqu''à 25 kg en conditions optimales). Fruit: énorme (jusqu''à 8 g), noir, sucré, excellente saveur. '
@@ -261,7 +282,7 @@ VALUES
    || 'Particularités: « triple couronne » = gros fruit + très bon goût + absence d''épines. Rendement exceptionnel.'
   ),
 
-  ('Dirksen', gleba_cle_referentiel('Mûrier-Dirksen'),
+  ('Dirksen',
    'Mûrier', 30, 8,
    'Origine: USA. Floraison: mai-juin (fleurs blanc rosé). Récolte: fin juillet à septembre. '
    || 'Rendement: 5-8 kg/plant. Fruit: gros, noir à maturité, bonne saveur. '
@@ -270,7 +291,8 @@ VALUES
    || 'Vigueur: forte, sans épines. '
    || 'Particularités: variété la plus rustique parmi les mûriers sans épines. Très résistante au froid.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -278,9 +300,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/arbre/an (arbre adulte 15+ ans)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Aglandau', gleba_cle_referentiel('Olivier Aglandau'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Aglandau (Verdale de Carpentras)',
    'Olivier', 44, 6,
    'Origine: Haute-Provence (Alpes-de-Haute-Provence, Bouches-du-Rhône, Var). Floraison: mai-juin. Récolte: début novembre à mi-décembre. '
    || 'Rendement: 30-50 kg/arbre. Rendement huile: 21%. Usage: huile (20% production française). '
@@ -290,7 +314,7 @@ VALUES
    || 'Particularités: variété la mieux adaptée aux régions froides. Très productive et régulière. Huile AOP Haute-Provence.'
   ),
 
-  ('Bouteillan', gleba_cle_referentiel('Olivier Bouteillan'),
+  ('Bouteillan',
    'Olivier', 43, 5,
    'Origine: Var, Bouches-du-Rhône. Floraison: mai. Récolte: fin octobre à décembre. '
    || 'Rendement: 20-40 kg/arbre. Rendement huile: 18-20%. Usage: huile (saveur herbacée, notes de pomme et poire). '
@@ -300,7 +324,7 @@ VALUES
    || 'Particularités: huile de qualité fine. Olive pulpeuse et grosse. Bon rendement en huile.'
   ),
 
-  ('Picholine', gleba_cle_referentiel('Olivier Picholine'),
+  ('Picholine',
    'Olivier', 39, 8,
    'Origine: Languedoc (variété la plus répandue en France). Floraison: mai-juin. Récolte: vert en septembre, noir en novembre-décembre. '
    || 'Rendement: 20-40 kg/arbre. Rendement huile: 15-18%. Usage: double (table verte + huile). '
@@ -310,7 +334,7 @@ VALUES
    || 'Particularités: N°1 en France en superficie. Double usage table/huile. Huile forte et légèrement amère. AOP Nîmes et Picholine.'
   ),
 
-  ('Lucques', gleba_cle_referentiel('Olivier Lucques'),
+  ('Lucques',
    'Olivier', 46, 4,
    'Origine: Languedoc (Hérault, Aude). Floraison: mai-juin (longue durée). Récolte: mi-novembre à mi-décembre. '
    || 'Rendement: 15-30 kg/arbre. Rendement huile: 14-16% (faible). Usage: principalement olive de table verte (chair fine, fondante). '
@@ -320,7 +344,7 @@ VALUES
    || 'Particularités: olive de table la plus réputée de France. Forme en croissant caractéristique. AOP Lucques du Languedoc.'
   ),
 
-  ('Tanche', gleba_cle_referentiel('Olivier Tanche'),
+  ('Tanche',
    'Olivier', 44, 8,
    'Origine: Drôme, Baronnies provençales (Nyons). Floraison: mai-juin. Récolte: novembre à janvier (complète maturité). '
    || 'Rendement: 20-50 kg/arbre. Rendement huile: 20-25% (élevé). Usage: double (olive noire de table + huile douce). '
@@ -330,7 +354,7 @@ VALUES
    || 'Particularités: AOP Olive et Huile de Nyons. Entrée en production rapide (3-4 ans). Production régulière. 98% des vergers de Nyons.'
   ),
 
-  ('Arbequina', gleba_cle_referentiel('Olivier Arbequina'),
+  ('Arbequina',
    'Olivier', 43, 6,
    'Origine: Catalogne (Espagne). Floraison: fin avril à mai. Récolte: fin octobre à décembre. '
    || 'Rendement: 20-50 kg/arbre. Rendement huile: 18-22%. Usage: huile (dorée, douce, arômes amande et tomate). '
@@ -339,7 +363,8 @@ VALUES
    || 'Vigueur: moyenne, port étalé, petit arbre (3-4 m). '
    || 'Particularités: mise à fruit très rapide (2-3 ans). Adaptée haute densité. Productivité élevée. Pollinisateur utile pour Lucques.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -347,9 +372,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/arbre/an (arbre adulte 8+ ans)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Violette de Solliès', gleba_cle_referentiel('Figuier-Violette de Solliès'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Violette de Solliès',
    'Figuier', 35, 8,
    'UNIFÈRE. Origine: Solliès-Pont, Var (AOP Figue de Solliès). Floraison: auto-fécondation (caprification non nécessaire). Récolte: fin août à octobre. '
    || 'Rendement: 20-40 kg/arbre. Fruit: gros, aplati, peau bleu-noir ardoise, chair rouge, sucrée, très parfumée. '
@@ -359,7 +386,7 @@ VALUES
    || 'Particularités: 75% de la production française de figues. AOP. Aussi appelée Bourjassotte Noire. Récolte tardive et abondante.'
   ),
 
-  ('Goutte d''Or', gleba_cle_referentiel('Figuier-Goutte d''Or'),
+  ('Goutte d''Or',
    'Figuier', 27, 8,
    'BIFÈRE. Origine: France (variété ancienne). Floraison: auto-fécondation. Récolte 1: début juillet (faible). Récolte 2: fin août à octobre (abondante). '
    || 'Rendement: 15-25 kg/arbre. Fruit: très gros, doré, chair rosée, juteux et très parfumé. '
@@ -369,7 +396,7 @@ VALUES
    || 'Particularités: idéale petits jardins et culture en bac. Variété bifère ancienne. Très grosse figue dorée.'
   ),
 
-  ('Ronde de Bordeaux', gleba_cle_referentiel('Figuier Ronde de Bordeaux'),
+  ('Ronde de Bordeaux',
    'Figuier', 30, 5,
    'UNIFÈRE. Origine: Bordeaux, France. Floraison: auto-fécondation. Récolte: fin juillet à début septembre (précoce). '
    || 'Rendement: 15-30 kg/arbre. Fruit: petit à moyen, brun-noir, chair rouge foncé, très sucré et parfumé. '
@@ -379,7 +406,7 @@ VALUES
    || 'Particularités: parmi les plus rustiques des figuiers. Récolte précoce et abondante. Convient au nord de la Loire.'
   ),
 
-  ('Dauphine', gleba_cle_referentiel('Figuier Dauphine'),
+  ('Dauphine',
    'Figuier', 23, 14,
    'BIFÈRE. Origine: France (variété ancienne). Floraison: auto-fécondation. Récolte 1: juin (grosse figue-fleur). Récolte 2: fin septembre. '
    || 'Rendement: 20-35 kg/arbre. Fruit: gros, brun-rose, juteux et très parfumé, chair rose. '
@@ -389,7 +416,7 @@ VALUES
    || 'Particularités: variété bifère précoce. Première récolte importante dès juin. Aussi appelée Boule d''Or.'
   ),
 
-  ('Brown Turkey', gleba_cle_referentiel('Figuier Brown Turkey'),
+  ('Brown Turkey',
    'Figuier', 27, 12,
    'BIFÈRE. Origine: USA (variété ancienne, très répandue). Floraison: auto-fécondation. Récolte 1: juillet. Récolte 2: septembre-octobre. '
    || 'Rendement: 15-25 kg/arbre. Fruit: petit à moyen (30-40 g), brun-violet, chair rose, sucré. '
@@ -399,7 +426,7 @@ VALUES
    || 'Particularités: variété la plus fiable et tolérante. Bifère selon climat. Convient partout en France. Valeur sûre.'
   ),
 
-  ('Pastilière', gleba_cle_referentiel('Figuier-Pastilière'),
+  ('Pastilière (Rouge de Bordeaux)',
    'Figuier', 31, 4,
    'UNIFÈRE. Origine: France (Sud-Ouest). Floraison: auto-fécondation. Récolte: début août à début septembre (précoce pour une unifère). '
    || 'Rendement: 10-20 kg/arbre. Fruit: moyen, allongé, violet-noir, chair rouge foncé, saveur sucrée et musquée. '
@@ -408,7 +435,8 @@ VALUES
    || 'Vigueur: faible à moyenne, petit arbre compact. '
    || 'Particularités: figue allongée originale en forme de goutte. Précoce et productive pour sa taille. Bonne rusticité.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -416,9 +444,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/arbre/an (arbre adulte 15+ ans)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Franquette', gleba_cle_referentiel('Noyer Franquette'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Franquette',
    'Noyer', 40, 3,
    'Origine: Isère, France (variété traditionnelle). Floraison: tardive (mai). Récolte: fin septembre à mi-octobre. '
    || 'Rendement: 30-50 kg/arbre (2-3 t/ha). Noix: coque assez dure, cerneaux clairs, saveur douce et fine. '
@@ -428,7 +458,7 @@ VALUES
    || 'Particularités: N°1 en France (AOP Noix de Grenoble + Périgord). Floraison tardive évitant les gelées. Mise à fruit lente (8-10 ans).'
   ),
 
-  ('Lara', gleba_cle_referentiel('Noyer Lara'),
+  ('Lara',
    'Noyer', 39, 3,
    'Origine: USA, introduite en France. Floraison: précoce (avril). Récolte: fin septembre à début octobre. '
    || 'Rendement: 40-70 kg/arbre (5-6 t/ha à 8 ans). Noix: grosse, coque tendre, cerneaux clairs. '
@@ -438,7 +468,7 @@ VALUES
    || 'Particularités: mise à fruit très rapide (3-5 ans). Fructification latérale. Très productive. Débourrement précoce (attention gel).'
   ),
 
-  ('Fernor', gleba_cle_referentiel('Noyer Fernor'),
+  ('Fernor',
    'Noyer', 41, 3,
    'Origine: France (INRA Bordeaux, 1978, croisement Franquette × Lara). Floraison: tardive (mai). Récolte: mi-octobre. '
    || 'Rendement: 40-60 kg/arbre (4-5 t/ha). Noix: grosse (légèrement plus que Franquette), coque mi-dure, cerneaux clairs. '
@@ -448,7 +478,7 @@ VALUES
    || 'Particularités: combine rusticité de Franquette et productivité de Lara. Mise à fruit rapide (5-7 ans). Variété typique du Sud-Ouest.'
   ),
 
-  ('Parisienne', gleba_cle_referentiel('Noyer Parisienne'),
+  ('Parisienne',
    'Noyer', 40, 3,
    'Origine: France (bassin Sud-Est). Floraison: tardive. Récolte: fin septembre à mi-octobre. '
    || 'Rendement: 30-50 kg/arbre. Noix: grosse, ronde, coque dure, cerneaux de bonne qualité. '
@@ -458,7 +488,7 @@ VALUES
    || 'Particularités: variété traditionnelle du bassin grenoblois. Autofertile. AOP Noix de Grenoble.'
   ),
 
-  ('Mayette', gleba_cle_referentiel('Noyer Mayette'),
+  ('Mayette',
    'Noyer', 40, 3,
    'Origine: France (Isère, variété traditionnelle ancienne). Floraison: tardive (mai). Récolte: fin septembre à mi-octobre. '
    || 'Rendement: 25-40 kg/arbre. Noix: grosse, bien ronde, coque épaisse, cerneaux blancs de haute qualité gustative. '
@@ -467,7 +497,8 @@ VALUES
    || 'Vigueur: très forte, grand arbre majestueux. '
    || 'Particularités: variété noble historique de l''Isère. Noix de prestige. Mise à fruit longue (10+ ans). AOP Noix de Grenoble.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -475,9 +506,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/arbre/an (arbre adulte 10+ ans)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Marigoule', gleba_cle_referentiel('Châtaignier-Marigoule'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Marigoule',
    'Châtaignier', 41, 3,
    'Origine: France (INRA, hybride naturel C. sativa × C. crenata, Migoule/Ussac, Corrèze, 1986). Floraison: juin-juillet. Récolte: mi-octobre (3 semaines). '
    || 'Rendement: 25-40 kg/arbre (3 t/ha). Fruit: moyen à gros, parfois cloisonné, peau mince, chair blanc-doré, très tendre et sucrée. '
@@ -487,7 +520,7 @@ VALUES
    || 'Particularités: avec Bouche de Bétizac, variété hybride la plus cultivée en France. Mise à fruit: ~5 ans. Qualité gustative excellente pour un hybride.'
   ),
 
-  ('Bouche de Bétizac', gleba_cle_referentiel('Châtaignier-Bouche de Bétizac'),
+  ('Bouche de Bétizac',
    'Châtaignier', 40, 3,
    'Origine: France (INRA, Malemort-sur-Corrèze, 1962, hybride C. sativa × C. crenata). Floraison: juin-juillet. Récolte: début octobre (3 semaines). '
    || 'Rendement: 25-40 kg/arbre (3 t/ha). Fruit: gros à très gros (calibre imposant), chair tendre, bonne saveur pour un hybride. '
@@ -497,7 +530,7 @@ VALUES
    || 'Particularités: variété hybride la plus cultivée en France. Mise à fruit rapide. Excellent calibre pour la vente au détail. Nécessite irrigation.'
   ),
 
-  ('Comballe', gleba_cle_referentiel('Châtaignier-Comballe'),
+  ('Comballe',
    'Châtaignier', 42, 3,
    'Origine: France (Saint-Pierreville, Ardèche, XVIIe siècle, C. sativa pure). Floraison: juin-juillet. Récolte: 2e quinzaine d''octobre (tardive). '
    || 'Rendement: 20-35 kg/arbre. Fruit: bon calibre (30-70 fruits/kg), forme elliptique, écorce brillante châtain à reflets miel, stries sombres. '
@@ -507,7 +540,7 @@ VALUES
    || 'Particularités: variété traditionnelle emblématique de l''Ardèche. Qualité gustative très bonne (texture fine, sucrée, parfumée). AOP Châtaigne d''Ardèche.'
   ),
 
-  ('Belle Épine', gleba_cle_referentiel('Châtaignier-Belle Épine'),
+  ('Belle Épine',
    'Châtaignier', 41, 3,
    'Origine: France (Ardèche, C. sativa pure). Floraison: juin-juillet (longue durée). Récolte: mi-octobre. '
    || 'Rendement: 25-40 kg/arbre. Fruit: très gros calibre (65-85 fruits/kg), précoce, légèrement cloisonné, bonne saveur. '
@@ -516,7 +549,8 @@ VALUES
    || 'Vigueur: très forte. '
    || 'Particularités: EXCELLENT POLLINISATEUR universel compatible avec de nombreuses variétés. 25% de déchet à l''épluchage mais fort rendement. Très rustique.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -524,9 +558,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/pied/an (pied adulte 7+ ans)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Hayward', gleba_cle_referentiel('Kiwi Hayward'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Hayward',
    'Kiwi', 44, 3,
    'Origine: Nouvelle-Zélande (la plus cultivée au monde). Floraison: mai-juin. Récolte: début novembre aux premières gelées. '
    || 'Rendement: 20-30 kg/pied (20 t/ha). Fruit: gros (80-120 g), peau brune velue, chair verte, acidulé et sucré. '
@@ -536,7 +572,7 @@ VALUES
    || 'Particularités: variété de référence mondiale. Mise en production 3-5 ans, pleine production à 7 ans. Nécessite palissage solide. Kiwi de France AOC.'
   ),
 
-  ('Solissimo', gleba_cle_referentiel('Kiwi Solissimo'),
+  ('Solissimo (Renact)',
    'Kiwi', 42, 3,
    'Origine: France (INRA, variété Renact®). Floraison: mai-juin. Récolte: octobre-novembre. '
    || 'Rendement: 30-60 kg/pied (sur pied de 10 ans). Fruit: moyen à gros, peau brune, chair verte, saveur douce et sucrée. '
@@ -546,7 +582,7 @@ VALUES
    || 'Particularités: kiwi autofertile le plus productif. Pas besoin de mâle. Très bonne alternative à Hayward pour jardins familiaux.'
   ),
 
-  ('Jenny', gleba_cle_referentiel('Kiwi Jenny'),
+  ('Jenny',
    'Kiwi', 41, 3,
    'Origine: sélection horticole. Floraison: mai-juin. Récolte: mi-octobre à novembre. '
    || 'Rendement: 10-20 kg/pied. Fruit: petit à moyen (40-60 g), chair douce et juteuse. '
@@ -556,7 +592,7 @@ VALUES
    || 'Particularités: autofertile avec fruits plus petits que Hayward. Convient pour petits jardins. Peut servir de pollinisateur.'
   ),
 
-  ('Issai', gleba_cle_referentiel('Kiwi Issai'),
+  ('Issai (Actinidia arguta)',
    'Kiwi', 36, 3,
    'Origine: Japon (Actinidia arguta, mini-kiwi ou kiwaï). Floraison: mai-juin. Récolte: septembre (précoce). '
    || 'Rendement: 5-15 kg/pied. Fruit: petit (taille grosse cerise, 3-5 g), peau lisse comestible, chair douce et très sucrée. '
@@ -565,7 +601,8 @@ VALUES
    || 'Vigueur: forte, liane vigoureuse. '
    || 'Particularités: mini-kiwi (kiwaï) sans épluchage. Récolte bien plus précoce que le kiwi classique. Convient régions au nord de la Loire. Très rustique.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -573,9 +610,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/arbre/an (arbre adulte 8+ ans)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Wonderful', gleba_cle_referentiel('Grenadier Wonderful'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Wonderful',
    'Grenadier', 39, 4,
    'Origine: USA (Californie, variété la plus cultivée au monde). Floraison: juin-juillet (fleurs rouge-orangé, plusieurs vagues). Récolte: fin septembre à fin octobre. '
    || 'Rendement: 40-50 kg/arbre. Fruit: gros (Ø 120 mm), rouge profond, arilles rouge rubis, saveur équilibrée sucré-acide. '
@@ -585,7 +624,7 @@ VALUES
    || 'Particularités: variété de référence mondiale. Fruits précoces et réguliers. Excellent pour le jus. Meilleurs fruits des premières fleurs.'
   ),
 
-  ('Mollar de Elche', gleba_cle_referentiel('Grenadier Mollar de Elche'),
+  ('Mollar de Elche',
    'Grenadier', 40, 3,
    'Origine: Espagne (Elche, Alicante). Floraison: juin-juillet (fleurs orange foncé). Récolte: début octobre (maturité légèrement plus précoce que Wonderful). '
    || 'Rendement: 30-50 kg/arbre. Fruit: très gros, peau rouge-rosé, arilles roses à rouge clair, pépins très petits et souples, chair très sucrée. '
@@ -595,7 +634,7 @@ VALUES
    || 'Particularités: grenade de table par excellence. Pépins quasi imperceptibles. Saveur très douce. Adaptée climats méditerranéens à automnes doux.'
   ),
 
-  ('Fina Tendral', gleba_cle_referentiel('Grenadier Fina Tendral'),
+  ('Fina Tendral',
    'Grenadier', 41, 3,
    'Origine: Espagne (Murcia, variété de connaisseurs). Floraison: juin-juillet. Récolte: mi-octobre à début novembre. '
    || 'Rendement: 25-40 kg/arbre. Fruit: gros, peau épaisse jaune-rosé, arilles croquantes, saveur riche et très fruitée. '
@@ -604,7 +643,8 @@ VALUES
    || 'Vigueur: moyenne à forte. '
    || 'Particularités: production régulière sous forte insolation. Peau épaisse = meilleure conservation. Variété tardive.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -612,9 +652,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/arbre/an (arbre adulte 8+ ans)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Fuyu', gleba_cle_referentiel('Plaqueminier Fuyu'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Fuyu',
    'Plaqueminier', 43, 3,
    'NON ASTRINGENT (PCNA). Origine: Japon. Floraison: fin avril à mai. Récolte: fin octobre à novembre. '
    || 'Rendement: 30-60 kg/arbre. Fruit: moyen à gros, aplati, rouge-orangé brillant, chair ferme et sucrée, consommable dès la récolte. '
@@ -624,7 +666,7 @@ VALUES
    || 'Particularités: « kaki-pomme », se consomme ferme comme une pomme sans attendre le blettissement. Très productif.'
   ),
 
-  ('Hachiya', gleba_cle_referentiel('Plaqueminier Hachiya'),
+  ('Hachiya',
    'Plaqueminier', 43, 3,
    'ASTRINGENT. Origine: Japon (variété la plus cultivée au Japon). Floraison: mai-juin. Récolte: fin octobre à novembre. '
    || 'Rendement: 30-50 kg/arbre. Fruit: gros, conique (en cœur), rouge-orangé, chair molle et mielleuse à maturité. '
@@ -634,7 +676,7 @@ VALUES
    || 'Particularités: astringent → consommer uniquement blet (mou). Excellent séché (hoshigaki). Meilleure saveur mielleuse une fois blet.'
   ),
 
-  ('Muscat', gleba_cle_referentiel('Plaqueminier Muscat'),
+  ('Muscat (Cioccolatino)',
    'Plaqueminier', 43, 3,
    'ASTRINGENT. Origine: ancienne variété européenne. Floraison: mai-juin. Récolte: fin octobre à novembre. '
    || 'Rendement: 25-40 kg/arbre. Fruit: gros, légèrement conique, rouge-orangé, chair miellée et parfumée au goût musqué caractéristique. '
@@ -644,7 +686,7 @@ VALUES
    || 'Particularités: variété la plus répandue en France. Texture miellée à surmaturité. Goût musqué unique. Très rustique.'
   ),
 
-  ('Rojo Brillante', gleba_cle_referentiel('Plaqueminier Rojo Brillante'),
+  ('Rojo Brillante',
    'Plaqueminier', 44, 4,
    'ASTRINGENT (traitable au CO2 → non astringent = Persimon®). Origine: Espagne (Valence). Floraison: mai-juin. Récolte: début novembre à fin novembre. '
    || 'Rendement: 30-60 kg/arbre. Fruit: gros à très gros, ovale, rouge brillant intense, chair ferme et sucrée après traitement CO2. '
@@ -653,7 +695,8 @@ VALUES
    || 'Vigueur: forte, productif. '
    || 'Particularités: « Persimon® » (marque commerciale après traitement CO2). N°1 en Espagne. Se consomme ferme comme Fuyu après traitement. Très beau fruit.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -661,9 +704,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/arbre/an (arbre adulte 5+ ans)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Champion', gleba_cle_referentiel('Cognassier Champion'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Champion',
    'Cognassier', 41, 3,
    'Origine: USA (variété ancienne très répandue). Floraison: tardive (mai, fleurs rose clair). Récolte: mi-octobre à début novembre. '
    || 'Rendement: 20-40 kg/arbre. Fruit: très gros (~500 g), jaune vif, piriforme, chair ferme, très parfumé. '
@@ -673,7 +718,7 @@ VALUES
    || 'Particularités: variété robuste et productive. Floraison tardive = protection gel. Excellente pour gelées, pâtes de fruits et cotignac.'
   ),
 
-  ('Vranja', gleba_cle_referentiel('Cognassier Vranja'),
+  ('Vranja',
    'Cognassier', 41, 3,
    'Origine: Serbie (aussi appelé Géant de Vranja ou Monstrueux de Vranja). Floraison: tardive (mai, fleurs rose clair). Récolte: mi-octobre. '
    || 'Rendement: 25-50 kg/arbre. Fruit: TRÈS gros (jusqu''à 1.5 kg!), allongé/piriforme, peau jaune d''or, chair jaune clair, doux et très parfumé. '
@@ -683,7 +728,7 @@ VALUES
    || 'Particularités: les plus gros coings existants. Variété patrimoniale serbe d''une grande robustesse. Très décoratif au jardin.'
   ),
 
-  ('Géant de Leskovac', gleba_cle_referentiel('Cognassier-Géant de Leskovac'),
+  ('Géant de Leskovac',
    'Cognassier', 42, 3,
    'Origine: Balkans (Leskovac, Serbie). Floraison: tardive (mai). Récolte: mi-octobre à fin octobre. '
    || 'Rendement: 20-40 kg/arbre. Fruit: très gros, piriforme, jaune, chair ferme, TRÈS parfumé (parmi les plus parfumés). '
@@ -692,7 +737,8 @@ VALUES
    || 'Vigueur: forte. '
    || 'Particularités: réputé pour le parfum exceptionnel de ses fruits. Origine balkanique, idéal pour les climates plus frais. Bonne productivité.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -700,9 +746,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/arbre/an (arbre adulte 6+ ans)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Nottingham', gleba_cle_referentiel('Néflier-Nottingham'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Nottingham',
    'Néflier', 43, 3,
    'Origine: Angleterre. Floraison: mai (grandes fleurs blanches en coupe). Récolte: fin octobre à novembre (après premières gelées). '
    || 'Rendement: 15-30 kg/arbre. Fruit: petit (~4 cm Ø), mais excellente saveur, chair brune et fondante après blettissement. '
@@ -712,7 +760,7 @@ VALUES
    || 'Particularités: RHS Award of Garden Merit. Meilleur goût parmi les néfliers. Petit fruit compensé par la qualité. Arbre ornemental.'
   ),
 
-  ('Royal', gleba_cle_referentiel('Néflier-Royal'),
+  ('Royal',
    'Néflier', 43, 3,
    'Origine: sélection européenne. Floraison: mai (fleurs blanches). Récolte: fin octobre à novembre. '
    || 'Rendement: 30-50 kg/arbre (le plus productif). Fruit: moyen à gros, bonne saveur après blettissement. '
@@ -722,7 +770,7 @@ VALUES
    || 'Particularités: variété la plus productive. Bon équilibre entre rendement et qualité. Rendement très élevé pour un néflier.'
   ),
 
-  ('Dutch', gleba_cle_referentiel('Néflier-Dutch'),
+  ('Dutch (Monstrueuse d''Evreinoff)',
    'Néflier', 43, 3,
    'Origine: Pays-Bas (aussi appelé Giant ou Monstrous). Floraison: mai (fleurs blanches). Récolte: fin octobre à novembre. '
    || 'Rendement: 20-40 kg/arbre. Fruit: GROS (le plus gros des néfliers, 5-6 cm Ø), chair fondante après blettissement. '
@@ -731,7 +779,8 @@ VALUES
    || 'Vigueur: forte, port étalé, arbre plus grand (4-6 m). '
    || 'Particularités: les plus gros fruits parmi les néfliers. Bonne productivité. Idéal si on veut de gros fruits pour compotes et confitures.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -739,9 +788,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/arbre/an (arbre adulte 5+ ans, en pleine terre climat doux)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Quatre Saisons', gleba_cle_referentiel('Citronnier Quatre Saisons'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Quatre Saisons (Eureka)',
    'Citronnier', 40, 20,
    'Aussi appelé Eureka. Origine: Californie (1858, variété la plus cultivée au monde). Floraison: quasi permanente (3-4 floraisons/an, principale au printemps). Récolte: toute l''année, principale automne-hiver. '
    || 'Rendement: 30-100 kg/arbre. Fruit: moyen à gros, ovale, jaune, zeste très parfumé, jus abondant (rendement jus 40-45%). '
@@ -751,7 +802,7 @@ VALUES
    || 'Particularités: le citronnier le plus cultivé au monde. Production étalée toute l''année. Culture possible en pot (rentrée hors gel). Floraison remontante très odorante.'
   ),
 
-  ('Meyer', gleba_cle_referentiel('Citronnier Meyer'),
+  ('Meyer',
    'Citronnier', 28, 20,
    'Origine: Chine (hybride probable Citrus limon × Citrus sinensis, importé par F. Meyer en 1908). Floraison: 2-4 fois/an (printemps et automne principaux). Récolte: 1ère en juillet, 2nde octobre-décembre. '
    || 'Rendement: 20-50 kg/arbre. Fruit: gros, rond, peau lisse et fine, jaune vif à orangée à maturité, pulpe orange, goût plus doux et moins acide. '
@@ -761,7 +812,7 @@ VALUES
    || 'Particularités: le citronnier le plus rustique. Hybride naturel citron-orange. Goût plus doux, très apprécié en cuisine. Idéal pour les régions moins clémentes.'
   ),
 
-  ('Eureka', gleba_cle_referentiel('Citronnier Eureka'),
+  ('Eureka',
    'Citronnier', 40, 20,
    'Identique à Quatre Saisons (même variété, noms différents). Origine: Californie (1858). Floraison: quasi permanente. Récolte: étalée toute l''année. '
    || 'Rendement: 30-100 kg/arbre. Fruit: ovale, jaune, classique, très juteux, acidité marquée. '
@@ -770,7 +821,8 @@ VALUES
    || 'Vigueur: faible à moyenne. '
    || 'Particularités: synonyme de « Quatre Saisons ». Le citron standard du commerce mondial. Aussi appelé Garey''s Eureka ou Citron de Menton.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ----------------------------------------------------------
@@ -778,9 +830,11 @@ ON CONFLICT (variete) DO NOTHING;
 -- Rendement: kg/arbre/an (arbre adulte 5+ ans, en pleine terre climat doux)
 -- ----------------------------------------------------------
 
-INSERT INTO varietes (variete, nom_normalise, espece, s_recolte, d_recolte, description)
-VALUES
-  ('Washington Navel', gleba_cle_referentiel('Oranger Washington Navel'),
+INSERT INTO varietes (variete, nom, nom_normalise, espece, s_recolte, d_recolte, description)
+SELECT v.variete, v.variete, gleba_cle_referentiel(v.variete),
+       v.espece, v.s_recolte, v.d_recolte, v.description
+FROM (VALUES
+  ('Washington Navel',
    'Oranger', 49, 14,
    'Origine: Brésil puis USA (la plus courante des navelines). Floraison: printemps (avril-mai, fleurs blanches très parfumées). Récolte: décembre à mars. '
    || 'Rendement: 40-80 kg/arbre. Fruit: gros, sans pépins, peau épaisse facile à peler, chair juteuse et sucrée, nombril (navel) caractéristique. '
@@ -790,7 +844,7 @@ VALUES
    || 'Particularités: orange de table N°1 mondiale. Sans pépins. Se pèle facilement. Excellent à manger frais. Variété la plus courante en pépinière.'
   ),
 
-  ('Valencia Late', gleba_cle_referentiel('Oranger Valencia Late'),
+  ('Valencia Late',
    'Oranger', 8, 12,
    'Origine: Espagne puis Californie (orange à jus de référence). Floraison: printemps (avril-mai). Récolte: février à juin (très tardive). '
    || 'Rendement: 50-100 kg/arbre. Fruit: moyen, sans pépins, peau fine, très juteux, sucré et parfumé, excellent pour le jus. '
@@ -800,7 +854,7 @@ VALUES
    || 'Particularités: variété la plus tardive = récolte quand les autres sont finies. Orange à jus de référence mondiale. Fruits et fleurs coexistent sur l''arbre.'
   ),
 
-  ('Sanguinelli', gleba_cle_referentiel('Oranger Sanguinelli'),
+  ('Sanguinelli',
    'Oranger', 5, 8,
    'Origine: Espagne (Murcia). Floraison: printemps (avril-mai). Récolte: février à avril (tardive). '
    || 'Rendement: 40-70 kg/arbre. Fruit: moyen, peau orange veinée de rouge, chair orange veinée de rouge sang, jus doux et très parfumé. '
@@ -809,7 +863,8 @@ VALUES
    || 'Vigueur: forte, arbre vigoureux non épineux. '
    || 'Particularités: orange sanguine à jus coloré exceptionnel. Très riche en anthocyanes (antioxydants). Coloration accentuée par les écarts thermiques jour/nuit.'
   )
-ON CONFLICT (variete) DO NOTHING;
+) AS v(variete, espece, s_recolte, d_recolte, description)
+ON CONFLICT DO NOTHING;
 
 
 -- ============================================================
