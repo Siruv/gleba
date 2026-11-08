@@ -1,3 +1,5 @@
+import { creerGardeEcritures, messageTropAppels, type GardeEcritures } from "@/lib/chat/gardeEcritures"
+
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const CODEX_ISSUER = "https://auth.openai.com"
 const CODEX_DEVICE_CODE_URL = `${CODEX_ISSUER}/api/accounts/deviceauth/usercode`
@@ -305,7 +307,8 @@ export async function envoyerMessageCodex(
   messages: MessageCodex[],
   model: string,
   systeme: string,
-  userId?: string
+  userId?: string,
+  garde: GardeEcritures = creerGardeEcritures()
 ): Promise<string> {
   const { getSetting, setSetting } = await import("@/lib/settings")
   let accessToken = (await getSetting("chat.codexAccessToken")).trim()
@@ -356,7 +359,7 @@ export async function envoyerMessageCodex(
           const results = await Promise.all(
             functionCalls.map(async (fc) => {
               try {
-                const resultat = await executerOutil(fc.name, fc.arguments, userId!)
+                const resultat = await executerOutil(fc.name, fc.arguments, userId!, { garde })
                 return {
                   type: "function_call_output" as const,
                   call_id: fc.call_id,
@@ -400,5 +403,5 @@ export async function envoyerMessageCodex(
   }
   
   // Si on atteint le nombre maximum d'itérations
-  throw new Error("Trop d'appels d'outils consécutifs.")
+  throw new Error(messageTropAppels(garde))
 }

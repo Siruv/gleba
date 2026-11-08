@@ -1,3 +1,5 @@
+import { creerGardeEcritures } from "@/lib/chat/gardeEcritures"
+
 export type ChatProvider = "ollama" | "openai" | "anthropic" | "custom" | "openai-codex" | "mistral"
 
 export interface ChatMessage {
@@ -130,16 +132,18 @@ export async function envoyerMessageChat(
   const model = modeleEffectif(provider, await getSetting("chat.model"))
   const historique = messages.slice(-20)
   const systeme = construireMessageSysteme(section, contexte)
+  // État de garde propre à CETTE requête (jamais global) : voir chat/gardeEcritures.ts
+  const garde = creerGardeEcritures()
 
   if (provider === "ollama") {
     const ollamaHost = (await getSetting("chat.ollamaHost")).trim()
     const { envoyerMessageOllamaAvecOutils } = await import("@/lib/chat-ollama-tools")
-    return envoyerMessageOllamaAvecOutils(ollamaHost, model, systeme, historique, userId)
+    return envoyerMessageOllamaAvecOutils(ollamaHost, model, systeme, historique, userId, garde)
   }
 
   if (provider === "openai-codex") {
     const { envoyerMessageCodex } = await import("@/lib/chat-codex")
-    return envoyerMessageCodex(historique, model, systeme, userId)
+    return envoyerMessageCodex(historique, model, systeme, userId, garde)
   }
 
   const apiKey = (await getSetting("chat.apiKey")).trim()
@@ -147,13 +151,13 @@ export async function envoyerMessageChat(
   if (provider === "mistral" || provider === "openai" || provider === "custom") {
     const baseUrl = (await getSetting("chat.baseUrl")).trim() || urlsParDefaut[provider]
     const { envoyerMessageAvecOutils } = await import("@/lib/chat-openai-tools")
-    return envoyerMessageAvecOutils(baseUrl, apiKey, model, systeme, historique, userId)
+    return envoyerMessageAvecOutils(baseUrl, apiKey, model, systeme, historique, userId, garde)
   }
 
   if (provider === "anthropic") {
     const baseUrl = (await getSetting("chat.baseUrl")).trim() || "https://api.anthropic.com/v1"
     const { envoyerMessageAnthropicAvecOutils } = await import("@/lib/chat-anthropic-tools")
-    return envoyerMessageAnthropicAvecOutils(baseUrl, apiKey, model, systeme, historique, userId)
+    return envoyerMessageAnthropicAvecOutils(baseUrl, apiKey, model, systeme, historique, userId, garde)
   }
 
   throw new Error(`Provider de chat non géré : ${provider}`)

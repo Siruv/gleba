@@ -82,3 +82,19 @@ describe("garde lecture seule avec le vrai requireAuthApi", () => {
     expect(mocks.cultureDelete).not.toHaveBeenCalled()
   })
 })
+
+describe("garde par requête (executerOutil avec contexte)", () => {
+  it("sans contexte, executerOutil garde son comportement (rétrocompatible, /api/mcp)", async () => {
+    const resultat = JSON.parse(await executerOutil("outil_inconnu", "{}", "u1"))
+    expect(resultat.erreur).toContain("Outil inconnu")
+  })
+
+  it("les lectures (get_) ne passent pas par la garde", async () => {
+    const { creerGardeEcritures } = await import("../chat/gardeEcritures")
+    const garde = creerGardeEcritures()
+    const espion = vi.spyOn(garde, "executer")
+    await executerOutil("get_inconnu", "{}", "u1", { garde })
+    await executerOutil("get_inconnu", "{}", "u1", { garde })
+    expect(espion).not.toHaveBeenCalled()
+  })
+})

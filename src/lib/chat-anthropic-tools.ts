@@ -3,6 +3,8 @@
  * Consomme les outils partagés de chat-tools.ts.
  */
 
+import { creerGardeEcritures, messageTropAppels, type GardeEcritures } from "@/lib/chat/gardeEcritures"
+
 type MessageChat = { role: string; content: string }
 
 /** Convertit les outils au format Anthropic Messages API */
@@ -25,7 +27,8 @@ export async function envoyerMessageAnthropicAvecOutils(
   model: string,
   systeme: string,
   messages: MessageChat[],
-  userId?: string
+  userId?: string,
+  garde: GardeEcritures = creerGardeEcritures()
 ): Promise<string> {
   const url = `${baseUrl.replace(/\/+$/, "")}/messages`
 
@@ -93,7 +96,8 @@ export async function envoyerMessageAnthropicAvecOutils(
         const resultat = await executerOutil(
           bloc.name,
           JSON.stringify(bloc.input ?? {}),
-          userId
+          userId,
+          { garde }
         )
         blocsResultat.push({
           type: "tool_result",
@@ -117,5 +121,5 @@ export async function envoyerMessageAnthropicAvecOutils(
     throw new Error("Réponse vide du modèle Anthropic.")
   }
 
-  throw new Error("Trop d'appels d'outils consécutifs.")
+  throw new Error(messageTropAppels(garde))
 }

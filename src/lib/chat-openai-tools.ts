@@ -3,6 +3,8 @@
  * Fonctionne avec Mistral, OpenAI, et tout provider custom compatible.
  */
 
+import { creerGardeEcritures, messageTropAppels, type GardeEcritures } from "@/lib/chat/gardeEcritures"
+
 type MessageChat = { role: string; content: string }
 
 type ToolCallRecu = {
@@ -39,7 +41,8 @@ export async function envoyerMessageAvecOutils(
   model: string,
   systeme: string,
   messages: MessageChat[],
-  userId?: string
+  userId?: string,
+  garde: GardeEcritures = creerGardeEcritures()
 ): Promise<string> {
   const url = `${baseUrl.replace(/\/+$/, "")}/chat/completions`
   
@@ -104,7 +107,8 @@ export async function envoyerMessageAvecOutils(
         const resultat = await executerOutil(
           toolCall.function.name,
           toolCall.function.arguments,
-          userId
+          userId,
+          { garde }
         )
         messagesComplets.push({
           role: "tool",
@@ -124,5 +128,5 @@ export async function envoyerMessageAvecOutils(
     throw new Error("Réponse vide du modèle.")
   }
 
-  throw new Error("Trop d'appels d'outils consécutifs.")
+  throw new Error(messageTropAppels(garde))
 }

@@ -68,7 +68,7 @@ describe("chat-anthropic-tools", () => {
     )
 
     expect(resultat).toBe("Voici la météo pour vos parcelles.")
-    expect(mocks.executerOutil).toHaveBeenCalledWith("get_meteo_parcelles", "{}", "user-test")
+    expect(mocks.executerOutil).toHaveBeenCalledWith("get_meteo_parcelles", "{}", "user-test", { garde: expect.anything() })
   })
 
   it("lève une erreur pour une réponse API invalide", async () => {

@@ -5,6 +5,8 @@
  * si un modèle renvoie une erreur sur les tools, l'appel retombe en mode sans outils.
  */
 
+import { creerGardeEcritures, messageTropAppels, type GardeEcritures } from "@/lib/chat/gardeEcritures"
+
 type MessageChat = { role: string; content: string }
 
 /** Convertit les outils au format Ollama (compatible OpenAI function) */
@@ -28,7 +30,8 @@ export async function envoyerMessageOllamaAvecOutils(
   model: string,
   systeme: string,
   messages: MessageChat[],
-  userId?: string
+  userId?: string,
+  garde: GardeEcritures = creerGardeEcritures()
 ): Promise<string> {
   const url = `${ollamaHost.replace(/\/+$/, "")}/api/chat`
 
@@ -106,7 +109,7 @@ export async function envoyerMessageOllamaAvecOutils(
       for (const toolCall of message.tool_calls) {
         const nomFonction = toolCall.function?.name ?? ""
         const args = toolCall.function?.arguments ?? {}
-        const resultat = await executerOutil(nomFonction, JSON.stringify(args), userId)
+        const resultat = await executerOutil(nomFonction, JSON.stringify(args), userId, { garde })
         messagesComplets.push({
           role: "tool",
           content: resultat,
@@ -123,5 +126,5 @@ export async function envoyerMessageOllamaAvecOutils(
     throw new Error("Réponse vide du modèle Ollama.")
   }
 
-  throw new Error("Trop d'appels d'outils consécutifs.")
+  throw new Error(messageTropAppels(garde))
 }

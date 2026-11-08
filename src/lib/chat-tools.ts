@@ -19,6 +19,7 @@ import { fetchOpenMeteoForecast } from "@/lib/meteo"
 import type { Prisma } from "@prisma/client"
 import { jourLocalISO } from "@/lib/jour-civil"
 import { appelerRouteUpstream, type ResultatRoute } from "@/lib/chat/appelRouteUpstream"
+import { estOutilEcriture, type GardeEcritures } from "@/lib/chat/gardeEcritures"
 
 // ============================================================
 // INTERFACES
@@ -1216,10 +1217,6 @@ export function executerAvecDroitsChat<T>(droits: { peutEcrire: boolean }, fn: (
   return droitsChat.run(droits, fn)
 }
 
-/** Les outils de lecture sont préfixés `get_` ; tout le reste écrit. */
-function estOutilEcriture(name: string): boolean {
-  return !name.startsWith("get_")
-}
 
 /**
  * Exécute un outil par son nom et retourne le résultat sous forme de chaîne JSON
@@ -1227,8 +1224,13 @@ function estOutilEcriture(name: string): boolean {
 export async function executerOutil(
   name: string,
   argsJson: string,
-  userId: string
+  userId: string,
+  contexte?: { garde?: GardeEcritures }
 ): Promise<string> {
+  const garde = contexte?.garde
+  if (garde && estOutilEcriture(name)) {
+    return garde.executer(name, argsJson, () => executerOutil(name, argsJson, userId))
+  }
   try {
     const args = argsJson ? JSON.parse(argsJson) : {}
     const outil = outilsChat.find((o) => o.name === name)

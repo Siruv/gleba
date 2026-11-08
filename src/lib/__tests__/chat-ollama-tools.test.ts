@@ -70,7 +70,7 @@ describe("chat-ollama-tools", () => {
     )
 
     expect(resultat).toBe("Voici la météo pour vos parcelles.")
-    expect(mocks.executerOutil).toHaveBeenCalledWith("get_meteo_parcelles", "{}", "user-test")
+    expect(mocks.executerOutil).toHaveBeenCalledWith("get_meteo_parcelles", "{}", "user-test", { garde: expect.anything() })
   })
 
   it("retombe en mode sans outils si le modèle ne supporte pas les tools", async () => {
