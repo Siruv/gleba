@@ -8,6 +8,13 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 import prisma from "@/lib/prisma"
 import { visibiliteReferentiel } from "@/lib/referentiel-communaute"
+import { whereItpApplicable, whereItpUtilisable } from "@/lib/itp-acces"
+import { masquerReferentielsEmbarques } from "@/lib/referentiel-embarque"
+import { appliquerDecalageItp, decalageItpPourLecteur } from "@/lib/calendrier-climat"
+import { zoneEffectiveUser } from "@/lib/terroir"
+import { ETATS_CULTURE, estEtatCulture, etatCulture, whereEtatCulture } from "@/lib/cultures/etat"
+import { lireAnnee } from "@/lib/api/annee"
+import { getKpiMaraichage } from "@/lib/kpi"
 import { fetchOpenMeteoForecast } from "@/lib/meteo"
 import type { Prisma } from "@prisma/client"
 import { createPlancheSchema } from "@/lib/validations/planche"
@@ -170,39 +177,24 @@ export const outilsChat: OutilChat[] = [
       try {
         const where: Prisma.CultureWhereInput = { userId }
         
-        if (args.annee) {
-          where.annee = Number(args.annee)
+        const annee = Number(args.annee)
+        if (args.annee && Number.isInteger(annee)) {
+          where.annee = annee
         }
-        
+
         if (args.espece) {
           where.especeId = String(args.espece)
         }
-        
+
+        // Même règle que GET /api/cultures : le filtre est le miroir exact de
+        // la cascade d'affichage (lib/cultures/etat). Un état inconnu est
+        // refusé, il ne doit pas être pris pour « toutes les cultures ».
         if (args.etat) {
           const etat = String(args.etat)
-          switch (etat) {
-            case "Planifiée":
-              where.semisFait = false
-              where.terminee = null
-              break
-            case "Semée":
-              where.semisFait = true
-              where.plantationFaite = false
-              where.terminee = null
-              break
-            case "Plantée":
-              where.plantationFaite = true
-              where.recolteFaite = false
-              where.terminee = null
-              break
-            case "En récolte":
-              where.recolteFaite = true
-              where.terminee = null
-              break
-            case "Terminée":
-              where.terminee = { not: null }
-              break
+          if (!estEtatCulture(etat)) {
+            return { erreur: `État inconnu : "${etat}". Valeurs possibles : ${ETATS_CULTURE.join(", ")}.` }
           }
+          where.AND = [whereEtatCulture(etat)]
         }
 
         const cultures = await prisma.culture.findMany({
@@ -222,15 +214,7 @@ export const outilsChat: OutilChat[] = [
           variete: culture.variete?.nom,
           planche: culture.planche?.nom,
           annee: culture.annee,
-          etat: culture.terminee
-            ? "Terminée"
-            : culture.recolteFaite
-              ? "En récolte"
-              : culture.plantationFaite
-                ? "Plantée"
-                : culture.semisFait
-                  ? "Semée"
-                  : "Planifiée",
+          etat: etatCulture(culture),
           dateSemis: culture.dateSemis,
           datePlantation: culture.datePlantation,
           dateRecolte: culture.dateRecolte,
@@ -296,18 +280,18 @@ export const outilsChat: OutilChat[] = [
         const where: Prisma.RecolteWhereInput = { userId }
         
         if (args.annee) {
-          const annee = Number(args.annee)
-          where.date = {
-            gte: new Date(annee, 0, 1),
-            lt: new Date(annee + 1, 0, 1),
-          }
+          // Mêmes bornes civiles que les routes d'upstream (fin de journée du
+          // 31/12 incluse) ; une année invalide retombe sur l'année courante.
+          const { bornes } = lireAnnee(new URLSearchParams({ annee: String(args.annee) }))
+          if (bornes) where.date = bornes
         }
         
         if (args.espece) {
           where.especeId = String(args.espece)
         }
 
-        const limit = args.limit ? Math.min(Number(args.limit), 100) : 30
+        const limitDemande = Number(args.limit)
+        const limit = Number.isFinite(limitDemande) && limitDemande >= 1 ? Math.min(Math.floor(limitDemande), 100) : 30
 
         const recoltes = await prisma.recolte.findMany({
           where,
@@ -321,7 +305,9 @@ export const outilsChat: OutilChat[] = [
         return recoltes.map((recolte) => ({
           date: recolte.date,
           espece: recolte.espece?.nom,
-          quantiteKg: recolte.quantite,
+          // Quantité dans l'unité figée à la saisie (kg, tige, piece, botte).
+          quantite: recolte.quantite,
+          unite: recolte.unite ?? "kg",
           statut: recolte.statut,
         }))
       } catch {
@@ -428,31 +414,34 @@ export const outilsChat: OutilChat[] = [
   },
   {
     name: "get_planification",
-    description: "Récupère la planification (ITP) pour une année donnée",
-    parameters: {
-      type: "object",
-      properties: {
-        annee: { type: "number", description: "Année de planification" },
-      },
-    },
+    description:
+      "Récupère les itinéraires techniques (ITP) utilisables par l'utilisateur : référentiel officiel, ITP partagés par la communauté et ITP personnels, adaptés à sa zone climatique",
+    parameters: {},
     handler: async (args: Record<string, unknown>, userId: string) => {
       try {
+        // Mêmes règles d'accès que GET /api/itps?applicable=1&calibre=1 :
+        // visible, actif, applicable à la zone, semaines calées sur la zone.
+        const userZone = await zoneEffectiveUser(prisma, userId)
         const itps = await prisma.iTP.findMany({
-          where: { userId },
+          where: { AND: [whereItpUtilisable(userId), whereItpApplicable(userZone)] },
           include: {
             espece: { select: { nom: true } },
           },
-          orderBy: { semaineSemis: "asc" },
+          orderBy: [{ semaineSemis: "asc" }, { id: "asc" }],
+          take: 200,
         })
 
-        return itps.map((itp) => ({
-          id: itp.id,
-          espece: itp.espece?.nom,
-          semaineSemis: itp.semaineSemis,
-          semainePlantation: itp.semainePlantation,
-          semaineRecolte: itp.semaineRecolte,
-          dureeCulture: itp.dureeCulture,
-        }))
+        return masquerReferentielsEmbarques(itps, userId).map((itp) => {
+          const calage = appliquerDecalageItp(itp, decalageItpPourLecteur(itp, userZone, userId))
+          return {
+            id: itp.id,
+            espece: itp.espece?.nom,
+            semaineSemis: calage.semaineSemis,
+            semainePlantation: calage.semainePlantation,
+            semaineRecolte: calage.semaineRecolte,
+            dureeCulture: itp.dureeCulture,
+          }
+        })
       } catch {
         return { erreur: "Impossible de récupérer la planification" }
       }
@@ -464,44 +453,20 @@ export const outilsChat: OutilChat[] = [
     parameters: {},
     handler: async (args: Record<string, unknown>, userId: string) => {
       try {
-        const now = new Date()
-        const startOfYear = new Date(now.getFullYear(), 0, 1)
-
-        const [culturesActives, surfaceCultivee, recoltesAnnee, tachesSemaine] = await Promise.all([
-          prisma.culture.count({
-            where: {
-              userId,
-              terminee: null,
-            },
-          }),
-          prisma.planche.aggregate({
-            where: { userId },
-            _sum: { surface: true },
-          }),
-          prisma.recolte.aggregate({
-            where: {
-              userId,
-              date: { gte: startOfYear },
-            },
-            _sum: { quantite: true },
-          }),
-          prisma.culture.count({
-            where: {
-              userId,
-              terminee: null,
-              OR: [
-                { aFaire: { not: null } },
-                { aIrriguer: true },
-              ],
-            },
-          }),
-        ])
+        // Source de vérité du tableau de bord (lib/kpi), pas un recalcul local.
+        const asOf = new Date()
+        const kpi = await getKpiMaraichage(userId, asOf.getFullYear(), asOf)
 
         return {
-          culturesActives,
-          surfaceCultivee: surfaceCultivee._sum.surface || 0,
-          recoltesAnneeKg: recoltesAnnee._sum.quantite || 0,
-          tachesSemaine,
+          annee: kpi.year,
+          culturesActives: kpi.culturesActives,
+          culturesPlanifiees: kpi.culturesPlanifiees,
+          culturesTerminees: kpi.culturesTerminees,
+          surfaceCultiveeM2: kpi.surfaceCultiveeM2,
+          surfacePlanifieeM2: kpi.surfacePlanifieeM2,
+          planchesCount: kpi.planchesCount,
+          recoltesKgYtd: kpi.recoltesKgYtd,
+          recoltesParUniteYtd: kpi.recoltesParUniteYtd,
         }
       } catch {
         return { erreur: "Impossible de récupérer les statistiques" }

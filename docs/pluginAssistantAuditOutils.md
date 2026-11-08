@@ -30,8 +30,12 @@ Constats classés par gravité.
 | 4 | `get_especes` expose les espèces privées | **Corrigé** (`visibiliteReferentiel`, test dans `chat-tools.test.ts`). Reste : `especeId` non vérifié dans `create_culture` (phase 2c) |
 | 5 | Suppressions sans comptage | **Reste** (phase 2c) |
 | 6 | Cache KPI et irrigation | **Reste** (phase 2c) |
-| 7 | Lectures fausses | **Reste** (phase 2b) : `get_cultures`, `get_recoltes`, `get_planification`, `get_dashboard_stats` ; `get_especes` corrigé pour la visibilité |
+| 7 | Lectures fausses | **Corrigé** (phase 2b) : `get_cultures` (`whereEtatCulture`/`etatCulture`, état inconnu refusé), `get_recoltes` (`quantite` + `unite`, bornes `lireAnnee`), `get_planification` (`whereItpUtilisable` + `whereItpApplicable`, calage de zone, `masquerReferentielsEmbarques`, plafond 200), `get_dashboard_stats` (`getKpiMaraichage`). Tests : `chat-tools-lectures.test.ts` (deux comptes) |
 | 8 | `fetchDailyBriefing(userId)` | **Corrigé** : sans paramètre, identité par `requireAuth`. Test : `actions/chat-briefing.test.ts`. La clé de préférence du briefing est aussi alignée sur upstream (C09 sans avertissement) |
+
+Briefing quotidien (phase 2b) : `fetchDailyBriefing` ne marque plus « vu » un briefing vide (`briefingEstVide`, `lib/chat/daily-briefing.ts`, partagée avec le popup). Tests : `actions/chat-briefing.test.ts`. Limite : `hasAlreadyShownBriefingToday` puis `markBriefingAsShown` ne sont pas atomiques (lecture puis upsert) ; deux onglets simultanés peuvent chacun afficher un popup. Piste hors périmètre : un `updateMany` conditionnel ou un `create` sur clé unique dans `daily-opening.ts`.
+
+Conformité des autres lectures (phase 2b) : `get_meteo_parcelles` (tenant, `take: 5`), `get_planches` (tenant, `take: 50`), `get_stocks` (tenant, `take: 50`) et `get_especes` (`visibiliteReferentiel`, `take: 30`) sont conformes ; aucun ne renvoie d'identifiant d'un autre compte.
 
 Limite connue du refus de lecture seule : il repose sur le nom (`get_` = lecture), et sur un contexte asynchrone posé par la route chat ; un nouvel outil d'écriture nommé autrement serait traité comme écriture, un nouvel outil `get_` qui écrirait ne serait pas refusé.
 
@@ -177,7 +181,7 @@ Tous les outils filtrent sur `userId` (le tenant dans le chat), sauf `get_espece
 | Outil (ligne) | Tenant | Visibilité du référentiel | Filtre d'état | Écart | Classe |
 |---|---|---|---|---|---|
 | `get_meteo_parcelles` (l.95) | oui (`parcelleGeo.userId`) | n/a | n/a | aucun | n/a |
-| `get_cultures` (l.157) | oui (`:169`) | n/a (renvoie des noms) | **incohérent** | Le filtre `etat` est un `switch` local (`:182-205`) qui diverge de `whereEtatCulture` (`lib/cultures/etat.ts:42-55`) : « Planifiée » ne teste pas `recolteFaite` ni `plantationFaite`, « Semée » ne teste pas `recolteFaite`. Une culture récoltée sans semis enregistré passe le filtre « Planifiée » et s'affiche « En récolte » (même défaut que le ticket cmsp59tdu corrigé par upstream). Pas de pagination au-delà de 50. | I |
+| `get_cultures` (l.157) | oui (`:169`) | n/a (renvoie des noms) | **corrigé en 2b** (écart ci-dessous = état avant) | Le filtre `etat` est un `switch` local (`:182-205`) qui diverge de `whereEtatCulture` (`lib/cultures/etat.ts:42-55`) : « Planifiée » ne teste pas `recolteFaite` ni `plantationFaite`, « Semée » ne teste pas `recolteFaite`. Une culture récoltée sans semis enregistré passe le filtre « Planifiée » et s'affiche « En récolte » (même défaut que le ticket cmsp59tdu corrigé par upstream). Pas de pagination au-delà de 50. | I |
 | `get_planches` (l.243) | oui (`:253`) | n/a | n/a | aucun écart de règle | n/a |
 | `get_recoltes` (l.282) | oui (`:294`) | n/a | n/a | La colonne `quantiteKg` est la quantité brute, exprimée dans `Recolte.unite` (`schema.prisma`, commentaire « dans l'unité ci-dessous », l'unité de référence est `unite`, pas le kilo). Des litres ou des oeufs sont annoncés en kg. | I |
 | `get_especes` (l.331) | **non** (`_userId` ignoré, `:341`) | **non** | n/a | `where` sans visibilité : toutes les espèces, y compris les espèces privées d'autres comptes. Upstream filtre par `visibiliteReferentiel` et masque le propriétaire (`especes/route.ts:161,203`). | S |
