@@ -235,7 +235,7 @@ Limites à connaître :
 5. Le contrat HTTP des routes (corps, forme de réponse) devient une dépendance à surveiller à chaque synchro ; les tests des outils appellent les vrais handlers et le détectent.
 6. Aucune pile ni message d'exception ne remonte au modèle (500 et exceptions : message générique, journal serveur).
 
-Une garde par requête (`src/lib/chat/gardeEcritures.ts`, état créé dans `envoyerMessageChat`, jamais global) empêche un modèle qui boucle de dupliquer une écriture (même outil, mêmes arguments) et plafonne les écritures par demande ; elle ne remplace pas la confirmation avant écriture (phase 5), et `/api/mcp` n'en dépend pas.
+Une garde par requête (`src/lib/chat/gardeEcritures.ts`, état créé dans `envoyerMessageChat`, jamais global) empêche un modèle qui boucle de dupliquer une écriture (mêmes arguments, ou même sens : même corps envoyé à la route d'upstream après valeurs par défaut et résolution des noms) et plafonne les écritures par demande ; elle ne remplace pas la confirmation avant écriture (phase 5), et `/api/mcp` n'en dépend pas.
 
 ## 3. b) Côté plugin : inventaire des fichiers (hors tests)
 

@@ -288,11 +288,22 @@ La demande de confirmation avant suppression n'existe que dans le prompt systèm
 
 **Constat (test réel, instance locale).** Le fournisseur `combo/combo_PI` d'OmniRoute est une cascade de 20 modèles gratuits : à chaque tour de la boucle d'outils, un modèle différent peut répondre, et certains rappellent `create_culture` au lieu de conclure. Résultat : 5 appels identiques jusqu'au plafond d'itérations (« Trop d'appels d'outils consécutifs », `chat-openai-tools.ts`) et 5 cultures en double, alors que le résultat de l'outil était clair.
 
-**Statut : corrigé (garde par requête, `src/lib/chat/gardeEcritures.ts`).**
-- Un outil d'écriture rappelé avec le même nom et les mêmes arguments (JSON à clés triées) dans la même requête n'est pas réexécuté : le modèle reçoit le résultat de la première exécution avec une consigne de conclure.
+**Premier correctif insuffisant (garde par arguments bruts, commit 514f8844).** Un nouveau test réel (journaux OmniRoute du 2026-11-08, 17:16:15 à 17:16:35) a pris la garde en défaut : pour UNE demande, `create_culture` a été appelé deux fois (cultures 47 et 48 créées) avec des arguments différents mais de même sens, pour Chou brocoli sur la planche A1 :
+- A : `{"especeNom":"Chou brocoli","notes":"TEST_CHAT_A_SUPPRIMER","plancheNom":"A1","semisFait":false,"annee":2026}`
+- B : `{"semisFait":false,"notes":"TEST_CHAT_A_SUPPRIMER","especeNom":"Chou brocoli","plantationFaite":false,"plancheNom":"A1"}` (sans `annee`, `plantationFaite` explicite)
+- C : `{"especeNom":"Chou brocoli","annee":2026,"semisFait":false,"notes":"TEST_CHAT_A_SUPPRIMER","plancheNom":"A1"}` (clés dans un autre ordre)
+
+A et C ne diffèrent que par l'ordre des clés (unifiés par la normalisation), mais B ajoute une valeur par défaut (`plantationFaite:false`) et omet `annee` (défaut : année courante) : clé brute différente, donc seconde création. Comparer les arguments bruts ne suffit pas avec une cascade de modèles.
+
+**Statut : corrigé (garde par requête, `src/lib/chat/gardeEcritures.ts`, seconde ligne de défense par le sens).**
+- Première ligne : un outil d'écriture rappelé avec le même nom et les mêmes arguments (JSON à clés triées) dans la même requête n'est pas réexécuté.
+- Seconde ligne, par le SENS : l'identité d'une écriture est (méthode, chemin, paramètres, corps) réellement envoyés à la route d'upstream par `appelerRouteUpstream`, donc après application des valeurs par défaut (`annee`, `semisFait`, `plantationFaite`, `recolteFaite`) et résolution des noms en identifiants (`especeId`, `plancheId`). Les clés `undefined`, `null` ou vides sont ignorées. Les formes A, B et C n'écrivent qu'une culture.
+- Un doublon ne s'exécute pas : le modèle reçoit le résultat de la première exécution (avec l'id déjà créé) et la consigne « Cette opération a déjà été exécutée, ne la répète pas, conclus maintenant pour l'utilisateur. » Il ne consomme pas le plafond.
+- Deux écritures légitimement différentes passent (même espèce sur deux planches, deux dates, notes différentes). Un refus métier n'est pas retenu : la tentative corrigée s'exécute.
 - Plafond de `PLAFOND_ECRITURES_PAR_REQUETE` (5) écritures distinctes ; au-delà, « Limite d'opérations atteinte pour cette demande, confirmez ce qui reste à faire » sans rien exécuter.
 - Si la boucle atteint son plafond d'itérations, l'erreur liste les écritures déjà réalisées (outil et résumé).
-- L'état est créé dans `envoyerMessageChat` et passé aux quatre boucles (openai, anthropic, ollama, codex) : jamais global. `/api/mcp` n'est pas concerné.
+- L'état est créé dans `envoyerMessageChat` et passé aux quatre boucles (openai, anthropic, ollama, codex), relayé à `appelerRouteUpstream` par un contexte asynchrone propre à l'appel d'outil : jamais global. Aucun argument n'est journalisé. `/api/mcp` n'est pas concerné.
+- Tests : `src/lib/__tests__/chat-tools-ecriture-sens.test.ts`.
 
 **Limite.** Cette garde ne remplace PAS la confirmation avant écriture (phase 5) : elle borne seulement les dégâts d'une boucle de modèle, elle ne demande pas l'accord de l'utilisateur.
 

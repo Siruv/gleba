@@ -23,6 +23,7 @@
 
 import { NextRequest } from "next/server"
 import { headers } from "next/headers"
+import { cleSens, executerSensCourant } from "@/lib/chat/gardeEcritures"
 
 export type MethodeRoute = "POST" | "PATCH" | "PUT" | "DELETE"
 
@@ -117,6 +118,16 @@ function refus(statut: number, message: string, avertissement = false): Resultat
  * - 5xx, exception, réponse illisible : message générique, sans détail.
  */
 export async function appelerRouteUpstream(handler: HandlerRoute, appel: AppelRoute): Promise<ResultatRoute> {
+  // Garde par sens : deux appels au corps final identique (défauts appliqués, noms
+  // résolus) ne s'exécutent qu'une fois par requête de chat. Sans garde, simple exécution.
+  return executerSensCourant(
+    cleSens(appel.methode, appel.chemin, appel.params, appel.corps),
+    () => executerAppel(handler, appel),
+    (resultat) => resultat.ok
+  )
+}
+
+async function executerAppel(handler: HandlerRoute, appel: AppelRoute): Promise<ResultatRoute> {
   try {
     const init: { method: string; headers: Headers; body?: string } = {
       method: appel.methode,
