@@ -52,7 +52,7 @@ Les 10 outils d'écriture n'appellent plus Prisma : chacun appelle EN PROCESSUS 
 
 Constats de la section 1 : 1.1 (validation, date réalisée, KPI et irrigation) **corrigé** ; 1.2 (dates au jour civil, étapes faites, espèce visible, variété placeholder, dates contre ITP, KPI) **corrigé** ; 1.3 (garde des récoltes, cohérence du cycle, écritures de passage à fait, KPI) **corrigé** ; 1.4 (surface arrondie, doublon, champs validés) **corrigé** ; 1.5 **corrigé** ; 1.6 et 1.7 : routes d'upstream appelées, `NaN` refusé avant la route ; 1.8 (libellé conservé tel que saisi, validation, doublon scopé) **corrigé** ; 1.9 et 1.10 **corrigés**. Descriptions fausses (« Supprime définitivement les données existantes ») **corrigées**. Le message d'exception brut n'est plus renvoyé au modèle (`executerOutil` et le helper).
 
-Restant : (a) rotation « Continuer ? » : le 409 est renvoyé tel quel, la confirmation explicite viendra en phase 5, aucun `confirmRotation` n'est jamais envoyé ; (b) `create_culture` ne peut toujours pas viser planche, variété ni ITP (extension future : tous les contrôles d'upstream s'appliqueront alors) ; (c) confirmation serveur des suppressions (3.5) : toujours à décider ; (d) `/api/mcp` reste en lecture seule (403 sur toute écriture), l'approche A exige une session ; (e) un administrateur est refusé sur `create_variete_perso` et `delete_variete_perso` (sa session écrirait dans le catalogue officiel). Aucune route d'upstream appelée n'est inappelable en processus (JSON seulement, pas de flux ni de formData).
+Restant : (a) rotation « Continuer ? » : le 409 est renvoyé tel quel, la confirmation explicite viendra en phase 5, aucun `confirmRotation` n'est jamais envoyé ; (b) `create_culture` ne pouvait viser ni planche, variété, ITP ni notes : **corrigé** (voir « Constat du test réel » ci-dessous) ; (c) confirmation serveur des suppressions (3.5) : toujours à décider ; (d) `/api/mcp` reste en lecture seule (403 sur toute écriture), l'approche A exige une session ; (e) un administrateur est refusé sur `create_variete_perso` et `delete_variete_perso` (sa session écrirait dans le catalogue officiel). Aucune route d'upstream appelée n'est inappelable en processus (JSON seulement, pas de flux ni de formData).
 
 Briefing quotidien (phase 2b) : `fetchDailyBriefing` ne marque plus « vu » un briefing vide (`briefingEstVide`, `lib/chat/daily-briefing.ts`, partagée avec le popup). Tests : `actions/chat-briefing.test.ts`. Limite : `hasAlreadyShownBriefingToday` puis `markBriefingAsShown` ne sont pas atomiques (lecture puis upsert) ; deux onglets simultanés peuvent chacun afficher un popup. Piste hors périmètre : un `updateMany` conditionnel ou un `create` sur clé unique dans `daily-opening.ts`.
 
@@ -68,6 +68,18 @@ Corrections au contexte transmis avec la demande d'audit :
 - `src/lib/verger/creation-arbre.ts:7-14` raconte exactement le même défaut sur l'assistant privé d'upstream (outil `create_arbre` qui écrit par `prisma.arbre.create` et contourne le calendrier d'entretien). Le piège est connu d'upstream.
 - Lignes des outils confirmées : 508, 607, 713, 805, 872, 904, 956, 981, 1031, 1059 (lignes `name:`). 32 lignes contiennent `prisma.` dans le fichier, dont 2 dans l'aide `resoudreEspeceParNom`.
 - Les tailles de `cultures/route.ts` (641) et `interventions/route.ts` (803) sont exactes.
+
+### Constat du test réel : `create_culture` sans planche (statut : corrigé)
+
+Un test sur l'instance locale a montré que `create_culture` n'acceptait ni planche, ni variété, ni ITP, ni notes. La culture était créée sans planche : la route d'upstream ne pouvait donc pas appliquer l'occupation, la rotation ni le verdict ITP, et ses refus ne se déclenchaient jamais. Le résultat ne mentionnait pas la planche, et le modèle a affirmé « créée sur planche A1 » sans que ce soit vrai ; la note demandée était perdue en silence. Le modèle avait aussi lu « semée aujourd'hui » comme `semisFait=true`. Défaut déjà présent avant la phase 2c.
+
+Correction (`src/lib/chat-tools.ts`) :
+- paramètres `plancheNom`/`plancheId`, `varieteNom`/`varieteId`, `itpId`, `notes` transmis à `POST /api/cultures` ; résolution des noms bornée au compte courant (planche) ou à l'espèce avec la visibilité du référentiel (variété) ; exacte puis partielle, ambiguïté = erreur listant les candidats ; planche ou variété demandée mais introuvable = erreur, jamais de création sans elle ;
+- le résultat relit planche, variété, ITP et notes dans la réponse de la route et signale « aucune planche rattachée » quand c'est le cas ;
+- descriptions : `semisFait` et `plantationFaite` ne valent true que sur déclaration explicite d'un fait accompli ; le modèle ne doit jamais affirmer un rattachement que le résultat ne confirme pas ;
+- la rotation en 409 reste non forcée (`confirmRotation` jamais transmis, confirmation en phase 5).
+
+Vérification des autres outils : `update_culture` vise la culture par `cultureId` et ne rapporte que les champs réellement modifiés, non concerné. `create_intervention` n'accepte ni planche ni culture et ne les affirme pas dans son résultat ; sa description interdit désormais d'affirmer un rattachement. Un paramètre de rattachement reste une extension possible. Tests : `chat-tools-ecriture.test.ts` (blocs « create_culture : planche, variété, ITP et notes » et « create_intervention : pas de rattachement affirmé »).
 
 ## 1. Outils d'écriture : ce que la route d'upstream fait et que l'outil ne fait pas
 
