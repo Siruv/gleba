@@ -18,7 +18,8 @@
     "db:seed-admin": "tsx prisma/seed-admin.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "growth:campaign": "tsx scripts/growth-campaign.ts"
+    "growth:campaign": "tsx scripts/growth-campaign.ts",
+    "verifier:contratAssistant": "tsx scripts/verifierContratAssistant.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
