@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   cultureFindMany: vi.fn(),
   parcelleFindMany: vi.fn(),
+  especeFindMany: vi.fn(),
   fetchOpenMeteoForecast: vi.fn(),
 }))
 
@@ -10,6 +11,7 @@ vi.mock("@/lib/prisma", () => ({
   default: {
     culture: { findMany: mocks.cultureFindMany },
     parcelleGeo: { findMany: mocks.parcelleFindMany },
+    espece: { findMany: mocks.especeFindMany },
   },
 }))
 
@@ -100,5 +102,18 @@ describe("outils du chat", () => {
       outil.description !== "" &&
       typeof outil.parameters === "object"
     )).toBe(true)
+  })
+
+  describe("get_especes : visibilité du référentiel", () => {
+    it("ne liste que le référentiel commun, partagé ou propre au compte (jamais l'espèce privée d'un autre)", async () => {
+      mocks.especeFindMany.mockResolvedValue([])
+      await executerOutil("get_especes", JSON.stringify({ search: "tom" }), "tenant-A")
+      const where = mocks.especeFindMany.mock.calls[0][0].where
+      const serialise = JSON.stringify(where)
+      expect(serialise).toContain('"userId":null')
+      expect(serialise).toContain('"partageCommunaute":true')
+      expect(serialise).toContain('"userId":"tenant-A"')
+      expect(serialise).toContain('"contains":"tom"')
+    })
   })
 })

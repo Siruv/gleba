@@ -5,7 +5,9 @@
  * 2. La route /api/mcp pour les connexions MCP externes
  */
 
+import { AsyncLocalStorage } from "node:async_hooks"
 import prisma from "@/lib/prisma"
+import { visibiliteReferentiel } from "@/lib/referentiel-communaute"
 import { fetchOpenMeteoForecast } from "@/lib/meteo"
 import type { Prisma } from "@prisma/client"
 import { createPlancheSchema } from "@/lib/validations/planche"
@@ -337,19 +339,21 @@ export const outilsChat: OutilChat[] = [
         type: { type: "string", description: "Type d'espèce (legume, aromatique, etc.)" },
       },
     },
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    handler: async (args: Record<string, unknown>, _userId: string) => {
-      
+    handler: async (args: Record<string, unknown>, userId: string) => {
       try {
-        const where: Prisma.EspeceWhereInput = {}
-        
+        const filtres: Prisma.EspeceWhereInput = {}
+
         if (args.search) {
-          where.nom = { contains: String(args.search), mode: "insensitive" }
+          filtres.nom = { contains: String(args.search), mode: "insensitive" }
         }
-        
+
         if (args.type) {
-          where.type = String(args.type)
+          filtres.type = String(args.type)
         }
+
+        // Référentiel commun, partagé à la communauté, ou propre au compte :
+        // jamais l'espèce privée d'un autre compte (même règle que /api/especes).
+        const where: Prisma.EspeceWhereInput = { AND: [filtres, visibiliteReferentiel(userId)] }
 
         const especes = await prisma.espece.findMany({
           where,
@@ -1118,6 +1122,28 @@ export function outilsPourBackend(): Array<{
   }))
 }
 
+// ============================================================
+// DROITS D'ÉCRITURE (chat)
+// ============================================================
+
+/**
+ * Upstream exclut /api/chat du refus de mutation par méthode et refuse les
+ * outils d'écriture « à l'exécution ». Ce contexte porte le droit d'écrire de
+ * la session pendant toute la requête de chat, sans changer la signature des
+ * outils ni des boucles de providers. Sans contexte (appel direct, tests),
+ * aucun refus : le chemin MCP, lui, n'exécute que des lectures.
+ */
+const droitsChat = new AsyncLocalStorage<{ peutEcrire: boolean }>()
+
+export function executerAvecDroitsChat<T>(droits: { peutEcrire: boolean }, fn: () => Promise<T>): Promise<T> {
+  return droitsChat.run(droits, fn)
+}
+
+/** Les outils de lecture sont préfixés `get_` ; tout le reste écrit. */
+function estOutilEcriture(name: string): boolean {
+  return !name.startsWith("get_")
+}
+
 /**
  * Exécute un outil par son nom et retourne le résultat sous forme de chaîne JSON
  */
@@ -1129,6 +1155,12 @@ export async function executerOutil(
   try {
     const args = argsJson ? JSON.parse(argsJson) : {}
     const outil = outilsChat.find((o) => o.name === name)
+
+    if (outil && estOutilEcriture(name) && droitsChat.getStore()?.peutEcrire === false) {
+      return JSON.stringify({
+        erreur: "Votre rôle dans cette exploitation est en lecture seule : cette modification est refusée.",
+      })
+    }
     
     if (!outil) {
       return JSON.stringify({ erreur: `Outil inconnu : ${name}` })

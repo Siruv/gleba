@@ -20,7 +20,7 @@ vi.mock("@/lib/prisma", () => ({
   },
 }))
 
-import { executerOutil, outilsChat } from "../chat-tools"
+import { executerOutil, outilsChat, executerAvecDroitsChat } from "../chat-tools"
 
 describe("outils d'écriture du chat", () => {
   beforeEach(() => {
@@ -186,5 +186,36 @@ describe("outils d'écriture du chat", () => {
       ["create_intervention", "create_culture", "update_culture"].includes(outil.name)
     )
     expect(outilsEcriture).toHaveLength(3)
+  })
+
+  describe("refus de lecture seule dans le chat", () => {
+    const outilsEcriture = ["create_culture", "update_culture", "delete_culture", "create_planche", "delete_planche", "create_intervention", "create_objet_jardin", "delete_objet_jardin", "create_variete_perso", "delete_variete_perso"]
+
+    it("couvre tous les outils d'écriture déclarés (aucun outil non get_ oublié)", () => {
+      const declares = outilsChat.map((o) => o.name).filter((n) => !n.startsWith("get_")).sort()
+      expect(declares).toEqual([...outilsEcriture].sort())
+    })
+
+    it.each(outilsEcriture)("%s est refusé pour une session en consultation, sans toucher la base", async (nom) => {
+      const res = await executerAvecDroitsChat({ peutEcrire: false }, () => executerOutil(nom, "{}", "tenant1"))
+      expect(JSON.parse(res).erreur).toMatch(/lecture seule|ne permet pas/i)
+      expect(mocks.interventionCreate).not.toHaveBeenCalled()
+      expect(mocks.cultureCreate).not.toHaveBeenCalled()
+      expect(mocks.cultureUpdate).not.toHaveBeenCalled()
+    })
+
+    it("un propriétaire (peutEcrire) exécute l'écriture", async () => {
+      mocks.interventionCreate.mockResolvedValue({ id: 1 })
+      const res = await executerAvecDroitsChat({ peutEcrire: true }, () =>
+        executerOutil("create_intervention", JSON.stringify({ type: "arrosage" }), "tenant1"))
+      expect(JSON.parse(res).erreur).toBeUndefined()
+      expect(mocks.interventionCreate).toHaveBeenCalled()
+    })
+
+    it("les lectures restent permises en consultation", async () => {
+      mocks.especeFindMany.mockResolvedValue([])
+      const res = await executerAvecDroitsChat({ peutEcrire: false }, () => executerOutil("get_especes", "{}", "tenant1"))
+      expect(JSON.parse(res)).toEqual([])
+    })
   })
 })

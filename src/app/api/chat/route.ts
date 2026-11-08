@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { requireAuthApi } from "@/lib/auth-utils"
 import { envoyerMessageChat, type ChatMessage } from "@/lib/chat"
+import { executerAvecDroitsChat } from "@/lib/chat-tools"
 
 export const dynamic = "force-dynamic"
 
@@ -61,7 +62,12 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const reply = await envoyerMessageChat(messages, section as string | undefined, contexte ?? undefined, userId)
+    // Upstream exclut /api/chat du refus par méthode : le refus des outils
+    // d'écriture pour un rôle en lecture seule est posé ici, à l'exécution.
+    const peutEcrire = session!.user.peutEcrireExploitation !== false
+    const reply = await executerAvecDroitsChat({ peutEcrire }, () =>
+      envoyerMessageChat(messages, section as string | undefined, contexte ?? undefined, userId)
+    )
     return NextResponse.json({ reply })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
