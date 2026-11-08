@@ -6,7 +6,7 @@ import { fetchDailyBriefing } from "@/app/actions/chat-briefing"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog"
 import { briefingAutoActive } from "@/lib/briefing-prefs"
 import { Button } from "@/components/ui/button"
-import type { BriefingPayload } from "@/lib/chat/daily-briefing"
+import { briefingEstVide, type BriefingPayload } from "@/lib/chat/daily-briefing"
 
 export function DailyBriefingPopup() {
   const { data: session } = useSession()
@@ -25,7 +25,7 @@ export function DailyBriefingPopup() {
         
         if (briefingAutoActive(prefs)) {
           const data = await fetchDailyBriefing()
-          if (data && (data.taches.length > 0 || data.alertesUrgentes.length > 0 || data.alertesMeteo.length > 0)) {
+          if (data && !briefingEstVide(data)) {
             setBriefing(data)
             setOpen(true)
           }

@@ -12,6 +12,16 @@ export interface BriefingPayload {
 }
 
 /**
+ * Vrai quand le briefing n'a rien à afficher : ni tâche, ni alerte urgente,
+ * ni alerte météo. Source unique de la condition d'affichage du popup, lue par
+ * l'action serveur (marquage « vu ») et par le composant.
+ */
+export function briefingEstVide(data: BriefingPayload | null | undefined): boolean {
+  if (!data) return true;
+  return data.taches.length === 0 && data.alertesUrgentes.length === 0 && data.alertesMeteo.length === 0;
+}
+
+/**
  * Assemble les données pour le briefing quotidien de l'utilisateur.
  */
 export async function getDailyBriefingData(userId: string): Promise<BriefingPayload> {

@@ -2,7 +2,7 @@
 
 import { requireAuth } from "@/lib/auth-utils"
 import { getActeurId } from "@/lib/exploitation/garde-session"
-import { getDailyBriefingData } from "@/lib/chat/daily-briefing"
+import { briefingEstVide, getDailyBriefingData } from "@/lib/chat/daily-briefing"
 import { hasAlreadyShownBriefingToday, markBriefingAsShown } from "@/lib/chat/daily-opening"
 
 /**
@@ -17,6 +17,9 @@ export async function fetchDailyBriefing() {
   if (await hasAlreadyShownBriefingToday(acteurId)) return null
 
   const data = await getDailyBriefingData(session.user.id)
+  // Briefing vide : le popup ne s'affichera pas, on ne consomme donc pas
+  // l'affichage du jour (des tâches ajoutées plus tard doivent pouvoir sortir).
+  if (briefingEstVide(data)) return null
   await markBriefingAsShown(acteurId)
   return data
 }
