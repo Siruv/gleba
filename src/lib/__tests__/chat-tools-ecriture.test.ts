@@ -23,6 +23,9 @@ const mocks = vi.hoisted(() => ({
   especeFindMany: vi.fn(),
   especeFindFirst: vi.fn(),
   varieteFindFirst: vi.fn(),
+  varieteFindMany: vi.fn(),
+  itpFindFirst: vi.fn(),
+  plancheFindMany: vi.fn(),
   varieteCreate: vi.fn(),
   varieteDelete: vi.fn(),
   // cultures
@@ -78,7 +81,8 @@ vi.mock("@/lib/prisma", () => {
   return {
     default: {
       espece: { findMany: mocks.especeFindMany, findFirst: mocks.especeFindFirst },
-      variete: { findFirst: mocks.varieteFindFirst, delete: mocks.varieteDelete },
+      variete: { findFirst: mocks.varieteFindFirst, findMany: mocks.varieteFindMany, delete: mocks.varieteDelete },
+      iTP: { findFirst: mocks.itpFindFirst },
       culture: {
         findUnique: mocks.cultureFindUnique,
         update: mocks.cultureUpdate,
@@ -89,6 +93,7 @@ vi.mock("@/lib/prisma", () => {
       mouvementStockCommercial: { count: mocks.stockCommercialCount },
       planche: {
         findFirst: mocks.plancheFindFirst,
+        findMany: mocks.plancheFindMany,
         findUnique: mocks.plancheFindUnique,
         create: mocks.plancheCreate,
         delete: mocks.plancheDelete,
@@ -101,6 +106,7 @@ vi.mock("@/lib/prisma", () => {
 })
 
 import { executerAvecDroitsChat, executerOutil, outilsChat } from "../chat-tools"
+import { jourLocalISO } from "@/lib/jour-civil"
 
 const tenant = "u1"
 const session = { user: { id: tenant, role: "USER", peutEcrireExploitation: true } }
@@ -121,6 +127,8 @@ beforeEach(() => {
   mocks.interventionGroupBy.mockResolvedValue([])
   mocks.especeFindMany.mockResolvedValue([{ id: "Tomate", nom: "Tomate", userId: null }])
   mocks.especeFindFirst.mockResolvedValue({ id: "Tomate", nom: "Tomate", besoinEau: 1, irrigation: null })
+  mocks.plancheFindMany.mockResolvedValue([])
+  mocks.varieteFindMany.mockResolvedValue([])
 })
 
 describe("create_intervention (POST /api/interventions)", () => {
@@ -195,6 +203,166 @@ describe("create_culture (POST /api/cultures)", () => {
     const res = await lancer("create_culture", { especeNom: "Tomate", quantite: "beaucoup" })
     expect(res.erreur).toMatch(/quantite invalide/)
     expect(mocks.requireAuthApi).not.toHaveBeenCalled()
+  })
+})
+
+describe("create_intervention : pas de rattachement affirmé", () => {
+  it("la description interdit d'affirmer un rattachement à une planche ou une culture, et le résultat n'en porte aucun", async () => {
+    const outil = outilsChat.find((o) => o.name === "create_intervention")!
+    expect(outil.description).toMatch(/AUCUNE planche ni culture/)
+    mocks.interventionCreate.mockImplementation(async ({ data }) => ({ id: 6, ...data }))
+    const res = await lancer("create_intervention", { type: "arrosage", description: "Planche A1", date: "2026-11-01" })
+    expect(JSON.stringify(res)).not.toMatch(/planche(Id)?"/i)
+  })
+})
+
+describe("create_culture : planche, variété, ITP et notes (défaut constaté en test réel)", () => {
+  const planche = { id: "pl-a1", nom: "A1", userId: tenant, largeur: 1, longueur: 10, cultures: [] }
+  const rendreCulture = (extra: Record<string, unknown> = {}) =>
+    mocks.cultureCreate.mockImplementation(async ({ data }) => ({
+      id: 41, annee: 2026, semisFait: data.semisFait, plantationFaite: data.plantationFaite,
+      espece: { nom: "Tomate" }, planche: null, variete: { id: "variete-placeholder", nom: "Non spécifiée", isPlaceholder: true },
+      itp: null, notes: data.notes ?? null, ...extra,
+    }))
+  beforeEach(() => {
+    mocks.plancheFindFirst.mockResolvedValue(planche)
+    mocks.plancheFindUnique.mockResolvedValue(planche)
+  })
+
+  it("planche par NOM : résolue sur le tenant, transmise à la route, mentionnée dans le résultat (relue de la réponse)", async () => {
+    mocks.plancheFindMany.mockResolvedValue([{ id: "pl-a1", nom: "A1" }])
+    rendreCulture({ planche: { id: "pl-a1", nom: "A1" } })
+    const res = await lancer("create_culture", { especeNom: "Tomate", plancheNom: "a1", annee: 2026 })
+    expect(mocks.plancheFindMany.mock.calls[0][0].where).toMatchObject({ userId: tenant })
+    expect(mocks.cultureCreate.mock.calls[0][0].data.plancheId).toBe("pl-a1")
+    expect(res.culture.planche).toEqual({ id: "pl-a1", nom: "A1" })
+    expect(res.message).toMatch(/planche « A1 »/)
+  })
+
+  it("planche par ID : transmise à la route, mentionnée dans le résultat", async () => {
+    rendreCulture({ planche: { id: "pl-a1", nom: "A1" } })
+    const res = await lancer("create_culture", { especeNom: "Tomate", plancheId: "pl-a1", annee: 2026 })
+    expect(mocks.cultureCreate.mock.calls[0][0].data.plancheId).toBe("pl-a1")
+    expect(res.culture.planche).toEqual({ id: "pl-a1", nom: "A1" })
+    expect(mocks.plancheFindMany).not.toHaveBeenCalled()
+  })
+
+  it("planche inconnue : erreur claire, AUCUNE création silencieuse sans planche", async () => {
+    const res = await lancer("create_culture", { especeNom: "Tomate", plancheNom: "Z9" })
+    expect(res.erreur).toMatch(/Aucune planche.*Z9/)
+    expect(mocks.cultureCreate).not.toHaveBeenCalled()
+  })
+
+  it("planche d'un AUTRE compte (id) : refus d'upstream, aucune création, aucun nom d'autrui dans l'erreur", async () => {
+    mocks.plancheFindFirst.mockResolvedValue(null)
+    mocks.plancheFindUnique.mockResolvedValue(null)
+    const res = await lancer("create_culture", { especeNom: "Tomate", plancheId: "pl-autrui" })
+    expect(res.erreur).toMatch(/introuvable pour votre compte/)
+    expect(mocks.cultureCreate).not.toHaveBeenCalled()
+  })
+
+  it("planche d'un autre compte (nom) : la recherche est bornée au tenant, donc introuvable", async () => {
+    mocks.plancheFindMany.mockResolvedValue([])
+    const res = await lancer("create_culture", { especeNom: "Tomate", plancheNom: "B1" })
+    expect(mocks.plancheFindMany.mock.calls[0][0].where).toMatchObject({ userId: tenant })
+    expect(res.erreur).toMatch(/Aucune planche/)
+    expect(mocks.cultureCreate).not.toHaveBeenCalled()
+  })
+
+  it("nom de planche ambigu : erreur listant les candidats, aucune création", async () => {
+    mocks.plancheFindMany.mockResolvedValue([{ id: "p1", nom: "Serre 1" }, { id: "p2", nom: "Serre 2" }])
+    const res = await lancer("create_culture", { especeNom: "Tomate", plancheNom: "Serre" })
+    expect(res.erreur).toMatch(/Plusieurs planches.*Serre 1.*Serre 2/)
+    expect(mocks.cultureCreate).not.toHaveBeenCalled()
+  })
+
+  it("variété par nom : résolue dans l'espèce avec la visibilité du référentiel, transmise et rapportée", async () => {
+    mocks.varieteFindMany.mockResolvedValue([{ id: "v-marmande", nom: "Marmande", userId: null }])
+    rendreCulture({ variete: { id: "v-marmande", nom: "Marmande", isPlaceholder: false } })
+    mocks.varieteFindFirst.mockResolvedValue({ id: "v-marmande" })
+    const res = await lancer("create_culture", { especeNom: "Tomate", varieteNom: "marmande" })
+    const where = JSON.stringify(mocks.varieteFindMany.mock.calls[0][0].where)
+    expect(where).toContain('"especeId":"Tomate"')
+    expect(where).toContain("partageCommunaute")
+    expect(mocks.cultureCreate.mock.calls[0][0].data.varieteId).toBe("v-marmande")
+    expect(res.culture.variete).toMatchObject({ id: "v-marmande", nom: "Marmande" })
+  })
+
+  it("variété introuvable pour l'espèce (ex. variété d'une autre espèce) : erreur, aucune création", async () => {
+    mocks.varieteFindMany.mockResolvedValue([])
+    const res = await lancer("create_culture", { especeNom: "Tomate", varieteNom: "Nantaise" })
+    expect(res.erreur).toMatch(/Aucune variété.*Nantaise.*Tomate/)
+    expect(mocks.cultureCreate).not.toHaveBeenCalled()
+  })
+
+  it("variété par id hors espèce : refus d'upstream propagé", async () => {
+    mocks.varieteFindFirst.mockResolvedValue(null)
+    const res = await lancer("create_culture", { especeNom: "Tomate", varieteId: "Nantaise" })
+    expect(res.erreur).toMatch(/n'est pas disponible pour l'espèce/)
+    expect(mocks.cultureCreate).not.toHaveBeenCalled()
+  })
+
+  it("ITP : transmis à la route et rapporté tel qu'enregistré", async () => {
+    mocks.itpFindFirst.mockResolvedValue({ id: "itp-1", nom: "Tomate sous abri", especeId: "Tomate", typePlanche: null })
+    rendreCulture({ itp: { id: "itp-1", nom: "Tomate sous abri" } })
+    const res = await lancer("create_culture", { especeNom: "Tomate", itpId: "itp-1" })
+    expect(mocks.cultureCreate.mock.calls[0][0].data.itpId).toBe("itp-1")
+    expect(res.culture.itp).toMatchObject({ id: "itp-1", nom: "Tomate sous abri" })
+  })
+
+  it("rotation violée avec planche : 409 non forcé, message d'upstream propagé, rien créé", async () => {
+    mocks.checkRotation.mockResolvedValue({ message: "Rotation non respectée sur A1 : Tomate après Tomate.", violations: [] })
+    const res = await lancer("create_culture", { especeNom: "Tomate", plancheId: "pl-a1", annee: 2026 })
+    expect(res).toEqual({ erreur: "Rotation non respectée sur A1 : Tomate après Tomate.", avertissement: true })
+    expect(mocks.checkRotation.mock.calls[0][0]).toBe("pl-a1")
+    expect(mocks.checkRotation).toHaveBeenCalledTimes(1)
+    expect(mocks.cultureCreate).not.toHaveBeenCalled()
+  })
+
+  it("planche occupée (largeur insuffisante pour les rangs) : refus d'upstream propagé, rien créé", async () => {
+    mocks.plancheFindFirst.mockResolvedValue({
+      ...planche, largeur: 0.6, longueur: 10,
+      cultures: [{ id: 7, dateSemis: new Date("2026-03-01"), datePlantation: null, dateRecolte: new Date("2026-09-01"), finRecolte: null, terminee: null, nbRangs: 2, itp: { espacementRangs: 50 }, espece: { id: "Carotte", vivace: false } }],
+    })
+    mocks.itpFindFirst.mockResolvedValue({ id: "itp-1", nom: "Tomate", especeId: "Tomate", typePlanche: null, espacementRangs: 60 })
+    const res = await lancer("create_culture", {
+      especeNom: "Tomate", plancheId: "pl-a1", itpId: "itp-1", annee: 2026, dateSemis: "2026-04-01", dateRecolte: "2026-08-01",
+    })
+    expect(res.erreur).toBeTruthy()
+    expect(mocks.cultureCreate).not.toHaveBeenCalled()
+  })
+
+  it("notes : transmises à la route et rapportées", async () => {
+    rendreCulture()
+    const res = await lancer("create_culture", { especeNom: "Tomate", notes: "Variété coeur de boeuf" })
+    expect(mocks.cultureCreate.mock.calls[0][0].data.notes).toBe("Variété coeur de boeuf")
+    expect(res.culture.notes).toBe("Variété coeur de boeuf")
+  })
+
+  it("semisFait et plantationFaite valent false par défaut, même avec une date « aujourd'hui »", async () => {
+    rendreCulture()
+    await lancer("create_culture", { especeNom: "Tomate", dateSemis: jourLocalISO(new Date()) })
+    const data = mocks.cultureCreate.mock.calls[0][0].data
+    expect(data.semisFait).toBe(false)
+    expect(data.plantationFaite).toBe(false)
+  })
+
+  it("culture créée sans planche : le résultat le signale explicitement", async () => {
+    rendreCulture()
+    const res = await lancer("create_culture", { especeNom: "Tomate" })
+    expect(res.culture.planche).toBeNull()
+    expect(res.aucunePlanche).toMatch(/aucune planche rattachée/i)
+    expect(res.message).toMatch(/aucune planche rattachée/i)
+  })
+
+  it("descriptions : les booléens « fait » sont réservés à un fait déclaré, la planche est à renseigner", () => {
+    const outil = outilsChat.find((o) => o.name === "create_culture")!
+    const props = (outil.parameters as { properties: Record<string, { description: string }> }).properties
+    expect(props.semisFait.description).toMatch(/UNIQUEMENT/)
+    expect(props.semisFait.description).toMatch(/aujourd'hui/)
+    expect(props.plantationFaite.description).toMatch(/UNIQUEMENT/)
+    expect(outil.description).toMatch(/plancheNom/)
+    expect(outil.description).toMatch(/jamais.*rattachement/i)
   })
 })
 

@@ -91,6 +91,89 @@ async function resoudreEspeceParNom(
 }
 
 
+/**
+ * Résout une planche par son nom pour les outils d'écriture. Le tenant courant
+ * est la seule portée : la planche d'un autre compte est introuvable, jamais
+ * nommée. Exacte d'abord (insensible à la casse), puis partielle ; une
+ * ambiguïté est une erreur listant les candidats.
+ */
+async function resoudrePlancheParNom(
+  nom: string,
+  userId: string
+): Promise<{ plancheId?: string; erreur?: string }> {
+  const nomRecherche = nom.trim()
+  if (nomRecherche === "") return { erreur: "Le nom de la planche est vide." }
+
+  const exactes = await prisma.planche.findMany({
+    where: { userId, nom: { equals: nomRecherche, mode: "insensitive" } },
+    select: { id: true, nom: true },
+    take: 5,
+  })
+  if (exactes.length === 1) return { plancheId: exactes[0].id }
+  if (exactes.length > 1) {
+    return {
+      erreur: `Plusieurs planches s'appellent "${nomRecherche}" : ${exactes.map((p) => `${p.nom} (id ${p.id})`).join(", ")}. Précisez avec plancheId.`,
+    }
+  }
+
+  const partielles = await prisma.planche.findMany({
+    where: { userId, nom: { contains: nomRecherche, mode: "insensitive" } },
+    select: { id: true, nom: true },
+    take: 6,
+  })
+  if (partielles.length === 1) return { plancheId: partielles[0].id }
+  if (partielles.length > 1) {
+    return {
+      erreur: `Plusieurs planches correspondent à "${nomRecherche}" : ${partielles.map((p) => p.nom).join(", ")}. Précisez le nom exact.`,
+    }
+  }
+  return { erreur: `Aucune planche trouvée pour "${nomRecherche}" : la culture n'a pas été créée.` }
+}
+
+/**
+ * Résout une variété par son nom DANS l'espèce donnée, avec la visibilité du
+ * référentiel (officielle, communautaire, ou perso du tenant). Exacte d'abord,
+ * puis partielle ; ambiguïté = erreur listant les candidats.
+ */
+async function resoudreVarieteParNom(
+  nom: string,
+  especeId: string,
+  userId: string
+): Promise<{ varieteId?: string; erreur?: string }> {
+  const nomRecherche = nom.trim()
+  if (nomRecherche === "") return { erreur: "Le nom de la variété est vide." }
+
+  const exactes = await prisma.variete.findMany({
+    where: {
+      AND: [{ especeId, nom: { equals: nomRecherche, mode: "insensitive" } }, visibiliteReferentiel(userId)],
+    },
+    select: { id: true, nom: true, userId: true },
+    take: 5,
+  })
+  if (exactes.length === 1) return { varieteId: exactes[0].id }
+  if (exactes.length > 1) {
+    const perso = exactes.find((v) => v.userId === userId)
+    if (perso) return { varieteId: perso.id }
+    return { erreur: `Plusieurs variétés correspondent à "${nomRecherche}" pour l'espèce « ${especeId} ». Précisez le nom exact.` }
+  }
+
+  const partielles = await prisma.variete.findMany({
+    where: {
+      AND: [{ especeId, nom: { contains: nomRecherche, mode: "insensitive" } }, visibiliteReferentiel(userId)],
+    },
+    select: { id: true, nom: true, userId: true },
+    take: 6,
+  })
+  if (partielles.length === 1) return { varieteId: partielles[0].id }
+  if (partielles.length > 1) {
+    return {
+      erreur: `Plusieurs variétés correspondent à "${nomRecherche}" : ${partielles.map((v) => v.nom ?? v.id).join(", ")}. Précisez le nom.`,
+    }
+  }
+  return { erreur: `Aucune variété trouvée pour "${nomRecherche}" dans l'espèce « ${especeId} » : la culture n'a pas été créée.` }
+}
+
+
 // ============================================================
 // ÉCRITURES : appel des routes d'upstream (phase 2c)
 // ============================================================
@@ -107,6 +190,22 @@ const TYPES_OBJET_JARDIN = ["allee", "passage", "bordure", "serre", "compost", "
 function lireNombre(valeur: unknown, champ: string): number | string {
   const nombre = typeof valeur === "string" && valeur.trim() === "" ? Number.NaN : Number(valeur)
   return Number.isFinite(nombre) ? nombre : `${champ} invalide : un nombre est attendu.`
+}
+
+/** Référence {id, nom} (et placeholder pour une variété) lue dans la réponse d'une route ; null si absente. */
+function lireRef(
+  valeur: unknown,
+  avecPlaceholder = false
+): { id: string; nom: string | null; placeholder?: boolean } | null {
+  if (typeof valeur !== "object" || valeur === null) return null
+  const v = valeur as { id?: unknown; nom?: unknown; isPlaceholder?: unknown }
+  if (typeof v.id !== "string") return null
+  const ref: { id: string; nom: string | null; placeholder?: boolean } = {
+    id: v.id,
+    nom: typeof v.nom === "string" ? v.nom : null,
+  }
+  if (avecPlaceholder) ref.placeholder = v.isPlaceholder === true
+  return ref
 }
 
 /**
@@ -517,7 +616,7 @@ export const outilsChat: OutilChat[] = [
   {
     name: "create_intervention",
     description:
-      "Crée une tâche / intervention dans le jardin (semis, plantation, désherbage, arrosage, récolte, taille, etc.). Utilise cet outil quand l'utilisateur demande de créer, planifier ou enregistrer une tâche ou une action à faire.",
+      "Crée une tâche / intervention dans le jardin (semis, plantation, désherbage, arrosage, récolte, taille, etc.). Utilise cet outil quand l'utilisateur demande de créer, planifier ou enregistrer une tâche ou une action à faire. L'outil ne rattache l'intervention à AUCUNE planche ni culture : n'affirme jamais à l'utilisateur un tel rattachement, mentionne la planche seulement dans la description libre.",
     parameters: {
       type: "object",
       properties: {
@@ -595,7 +694,7 @@ export const outilsChat: OutilChat[] = [
   {
     name: "create_culture",
     description:
-      "Crée une nouvelle culture (un semis ou une plantation planifié) pour une espèce donnée. Utilise cet outil quand l'utilisateur veut ajouter une culture, semer ou planter une espèce. L'espèce peut être donnée par son nom (ex: 'tomate') ou par son id.",
+      "Crée une nouvelle culture (un semis ou une plantation planifié) pour une espèce donnée. Utilise cet outil quand l'utilisateur veut ajouter une culture, semer ou planter une espèce. L'espèce peut être donnée par son nom (ex: 'tomate') ou par son id. Renseigne TOUJOURS la planche (plancheNom ou plancheId) quand l'utilisateur la mentionne, ainsi que la variété (varieteNom ou varieteId), l'ITP (itpId) et les notes s'il en donne : sans planche, aucun contrôle de rotation ni d'occupation n'a lieu. Une planche ou une variété introuvable fait échouer la création. semisFait et plantationFaite restent false pour un projet ou une date « aujourd'hui ». N'affirme JAMAIS à l'utilisateur un rattachement (planche, variété, ITP) que le résultat de l'outil ne confirme pas : le résultat indique ce qui est réellement enregistré.",
     parameters: {
       type: "object",
       properties: {
@@ -606,6 +705,30 @@ export const outilsChat: OutilChat[] = [
         especeId: {
           type: "string",
           description: "ID de l'espèce (si déjà connu). Prioritaire sur especeNom.",
+        },
+        plancheNom: {
+          type: "string",
+          description: "Nom de la planche de l'utilisateur (ex: 'A1'). Utilisé si plancheId n'est pas fourni. Introuvable ou ambigu : erreur, aucune création.",
+        },
+        plancheId: {
+          type: "string",
+          description: "ID de la planche (si déjà connu). Prioritaire sur plancheNom.",
+        },
+        varieteNom: {
+          type: "string",
+          description: "Nom de la variété, dans l'espèce choisie (ex: 'Marmande'). Utilisé si varieteId n'est pas fourni.",
+        },
+        varieteId: {
+          type: "string",
+          description: "ID de la variété (si déjà connu). Prioritaire sur varieteNom.",
+        },
+        itpId: {
+          type: "string",
+          description: "ID de l'itinéraire technique (facultatif), de la même espèce que la culture.",
+        },
+        notes: {
+          type: "string",
+          description: "Notes libres de l'utilisateur sur la culture (5000 caractères au plus).",
         },
         annee: {
           type: "number",
@@ -629,11 +752,13 @@ export const outilsChat: OutilChat[] = [
         },
         semisFait: {
           type: "boolean",
-          description: "true si le semis est déjà réalisé (défaut: false)",
+          description:
+            "true UNIQUEMENT si l'utilisateur dit explicitement que le semis est déjà FAIT (« j'ai semé », « déjà semé »). false pour un projet, une planification ou une date « aujourd'hui ». Défaut : false.",
         },
         plantationFaite: {
           type: "boolean",
-          description: "true si la plantation est déjà réalisée (défaut: false)",
+          description:
+            "true UNIQUEMENT si l'utilisateur dit explicitement que la plantation est déjà FAITE (« j'ai planté », « déjà plantée »). false pour un projet, une planification ou une date « aujourd'hui ». Défaut : false.",
         },
       },
     },
@@ -650,11 +775,30 @@ export const outilsChat: OutilChat[] = [
         especeId = resolution.especeId!
       }
 
+      // Planche : l'id prime ; un nom est résolu sur le tenant. Demandée mais
+      // introuvable : erreur, jamais une création silencieuse sans elle.
+      let plancheId = args.plancheId ? String(args.plancheId) : ""
+      if (plancheId === "" && args.plancheNom) {
+        const resolution = await resoudrePlancheParNom(String(args.plancheNom), userId)
+        if (resolution.erreur) return { erreur: resolution.erreur }
+        plancheId = resolution.plancheId!
+      }
+      let varieteId = args.varieteId ? String(args.varieteId) : ""
+      if (varieteId === "" && args.varieteNom) {
+        const resolution = await resoudreVarieteParNom(String(args.varieteNom), especeId, userId)
+        if (resolution.erreur) return { erreur: resolution.erreur }
+        varieteId = resolution.varieteId!
+      }
+
       const annee = args.annee !== undefined ? lireNombre(args.annee, "annee") : new Date().getFullYear()
       if (typeof annee === "string") return { erreur: annee }
       const corps: Record<string, unknown> = {
         especeId,
         annee,
+        ...(plancheId ? { plancheId } : {}),
+        ...(varieteId ? { varieteId } : {}),
+        ...(args.itpId ? { itpId: String(args.itpId) } : {}),
+        ...(typeof args.notes === "string" && args.notes.trim() !== "" ? { notes: args.notes } : {}),
         semisFait: args.semisFait === true,
         plantationFaite: args.plantationFaite === true,
         recolteFaite: false,
@@ -674,12 +818,27 @@ export const outilsChat: OutilChat[] = [
       if (!res.ok) return refusOutil(res)
       const d = res.donnees
       const nomEspece = (d.espece as { nom?: string } | null | undefined)?.nom ?? especeId
+      // Ce qui est RÉELLEMENT enregistré, relu de la réponse de la route.
+      const plancheEnregistree = lireRef(d.planche)
+      const varieteEnregistree = lireRef(d.variete, true)
+      const itpEnregistre = lireRef(d.itp)
+      const notesEnregistrees = typeof d.notes === "string" && d.notes !== "" ? d.notes : null
+      const messagePlanche = plancheEnregistree
+        ? `sur la planche « ${plancheEnregistree.nom ?? plancheEnregistree.id} »`
+        : "aucune planche rattachée"
       return {
         succes: true,
-        message: `Culture "${nomEspece}" créée (id ${d.id}).`,
+        message: `Culture "${nomEspece}" créée (id ${d.id}), ${messagePlanche}.`,
+        ...(plancheEnregistree
+          ? {}
+          : { aucunePlanche: "Aucune planche rattachée : ni rotation, ni occupation, ni verdict ITP n'ont été contrôlés." }),
         culture: {
           id: d.id,
           espece: nomEspece,
+          planche: plancheEnregistree,
+          variete: varieteEnregistree,
+          itp: itpEnregistre,
+          notes: notesEnregistrees,
           annee: d.annee,
           dateSemis: d.dateSemis,
           datePlantation: d.datePlantation,
