@@ -27,4 +27,13 @@ describe("contrat ChatBubble / coquille v2", () => {
     expect(sourceBulle).toContain("removeEventListener(EVENEMENT_OUVRIR_ASSISTANT")
     expect(sourceBulle).toContain('addEventListener("ouvrir-chat"')
   })
+
+  it("borne la hauteur du panneau compact par la fenêtre (≥ sm)", () => {
+    expect(sourceBulle).not.toContain("sm:h-[540px]")
+    expect(sourceBulle).toMatch(
+      /sm:h-\[min\(540px,calc\(100dvh_-_var\(--app-header-visible-h,var\(--app-header-h,0px\)\)_-_5rem_-_1rem\)\)\]/,
+    )
+    // le bottom du panneau (sm:bottom-20 = 5rem) doit rester cohérent avec la soustraction
+    expect(sourceBulle).toContain("sm:bottom-20")
+  })
 })

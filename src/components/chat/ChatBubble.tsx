@@ -112,7 +112,7 @@ export function ChatBubble() {
           className={
             isExpanded
               ? "fixed z-[70] inset-2 sm:inset-5 lg:inset-y-8 lg:left-1/2 lg:right-auto lg:w-[min(1100px,calc(100vw-4rem))] lg:-translate-x-1/2"
-              : "fixed z-50 bottom-2 left-4 right-4 h-[45vh] max-w-sm mx-auto sm:mx-0 sm:left-auto sm:bottom-20 sm:right-4 sm:h-[540px] sm:w-[400px] sm:max-w-none"
+              : "fixed z-50 bottom-2 left-4 right-4 h-[45vh] max-w-sm mx-auto sm:mx-0 sm:left-auto sm:bottom-20 sm:right-4 sm:h-[min(540px,calc(100dvh_-_var(--app-header-visible-h,var(--app-header-h,0px))_-_5rem_-_1rem))] sm:w-[400px] sm:max-w-none"
           }
         >
           <ChatPanel
