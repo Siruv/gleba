@@ -1,5 +1,7 @@
 /**
  * API Route pour la gestion du token API utilisateur
+ * Le jeton appartient à la PERSONNE (acteur), jamais au tenant : un membre
+ * ne doit pas pouvoir agir sur le compte du propriétaire.
  * GET: Vérifier si un token existe et retourner un token masqué
  * POST: Générer un nouveau token API
  * DELETE: Révoquer le token API actuel
@@ -8,6 +10,7 @@
 import { NextResponse } from "next/server"
 import prisma from "@/lib/prisma"
 import { requireAuthApi } from "@/lib/auth-utils"
+import { getActeurId } from "@/lib/exploitation/garde-session"
 import { randomBytes } from "crypto"
 
 // GET /api/user/api-token - Vérifier l'existence du token
@@ -17,7 +20,7 @@ export async function GET() {
 
   try {
     const user = await prisma.user.findUnique({
-      where: { id: session!.user.id },
+      where: { id: getActeurId(session!) },
       select: { apiToken: true },
     })
 
@@ -46,7 +49,7 @@ export async function POST() {
 
     // Mettre à jour l'utilisateur avec le nouveau token
     const user = await prisma.user.update({
-      where: { id: session!.user.id },
+      where: { id: getActeurId(session!) },
       data: { apiToken: token },
       select: { apiToken: true },
     })
@@ -70,7 +73,7 @@ export async function DELETE() {
 
   try {
     await prisma.user.update({
-      where: { id: session!.user.id },
+      where: { id: getActeurId(session!) },
       data: { apiToken: null },
     })
 
