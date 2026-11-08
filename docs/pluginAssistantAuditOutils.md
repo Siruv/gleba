@@ -284,6 +284,18 @@ Server action déclarée `"use server"` qui prend `userId` en paramètre et ne v
 
 La demande de confirmation avant suppression n'existe que dans le prompt système (`chat.ts:20`). Sur le chemin MCP il n'y en a aucune. Un contrôle serveur (jeton de confirmation à usage unique, ou refus de suppression dans le même tour que la demande) serait le seul moyen de l'imposer. À décider par le mainteneur.
 
+### 3.6 Boucle de modèle qui duplique les écritures
+
+**Constat (test réel, instance locale).** Le fournisseur `combo/combo_PI` d'OmniRoute est une cascade de 20 modèles gratuits : à chaque tour de la boucle d'outils, un modèle différent peut répondre, et certains rappellent `create_culture` au lieu de conclure. Résultat : 5 appels identiques jusqu'au plafond d'itérations (« Trop d'appels d'outils consécutifs », `chat-openai-tools.ts`) et 5 cultures en double, alors que le résultat de l'outil était clair.
+
+**Statut : corrigé (garde par requête, `src/lib/chat/gardeEcritures.ts`).**
+- Un outil d'écriture rappelé avec le même nom et les mêmes arguments (JSON à clés triées) dans la même requête n'est pas réexécuté : le modèle reçoit le résultat de la première exécution avec une consigne de conclure.
+- Plafond de `PLAFOND_ECRITURES_PAR_REQUETE` (5) écritures distinctes ; au-delà, « Limite d'opérations atteinte pour cette demande, confirmez ce qui reste à faire » sans rien exécuter.
+- Si la boucle atteint son plafond d'itérations, l'erreur liste les écritures déjà réalisées (outil et résumé).
+- L'état est créé dans `envoyerMessageChat` et passé aux quatre boucles (openai, anthropic, ollama, codex) : jamais global. `/api/mcp` n'est pas concerné.
+
+**Limite.** Cette garde ne remplace PAS la confirmation avant écriture (phase 5) : elle borne seulement les dégâts d'une boucle de modèle, elle ne demande pas l'accord de l'utilisateur.
+
 ## 4. Comment réutiliser la logique d'upstream sans modifier ses fichiers
 
 ### 4.1 Faits établis sur l'authentification hors requête
