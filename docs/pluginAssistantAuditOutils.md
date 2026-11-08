@@ -20,6 +20,21 @@ Constats classés par gravité.
 | 7 | Lectures fausses : filtre d'état de `get_cultures`, unité des récoltes, `get_planification` limité aux ITP personnels, `get_dashboard_stats` hors source de vérité KPI. | Intégrité | 2 |
 | 8 | `fetchDailyBriefing(userId)` accepte un identifiant fourni par le client, sans contrôle d'identité. | Sécurité, moyen | 3.4 |
 
+### Statut après la phase 2a
+
+| # | Constat | Statut |
+|---|---|---|
+| 1 | Jeton MCP rattaché au tenant | **Corrigé** : `getActeurId` dans `api-token/route.ts`, `/api/mcp` résout le contexte et passe en lecture seule (403 pour toute écriture), limite 200/15 min par jeton. Tests : `api/user/api-token/route.test.ts`, `api/mcp/route.test.ts` |
+| 2 | Écriture par le chat en consultation | **Corrigé** : `executerAvecDroitsChat` (route chat) et refus dans `executerOutil` ; les lectures restent permises. Tests : `chat-tools-ecriture.test.ts`, `api/chat/route.test.ts` |
+| 3 | `delete_culture` supprime les ventes | **Reste** (phase 2c) |
+| 4 | `get_especes` expose les espèces privées | **Corrigé** (`visibiliteReferentiel`, test dans `chat-tools.test.ts`). Reste : `especeId` non vérifié dans `create_culture` (phase 2c) |
+| 5 | Suppressions sans comptage | **Reste** (phase 2c) |
+| 6 | Cache KPI et irrigation | **Reste** (phase 2c) |
+| 7 | Lectures fausses | **Reste** (phase 2b) : `get_cultures`, `get_recoltes`, `get_planification`, `get_dashboard_stats` ; `get_especes` corrigé pour la visibilité |
+| 8 | `fetchDailyBriefing(userId)` | **Corrigé** : sans paramètre, identité par `requireAuth`. Test : `actions/chat-briefing.test.ts`. La clé de préférence du briefing est aussi alignée sur upstream (C09 sans avertissement) |
+
+Limite connue du refus de lecture seule : il repose sur le nom (`get_` = lecture), et sur un contexte asynchrone posé par la route chat ; un nouvel outil d'écriture nommé autrement serait traité comme écriture, un nouvel outil `get_` qui écrirait ne serait pas refusé.
+
 Recommandation : approche A (appel en processus des handlers d'upstream) pour l'écriture dans une session, complétée par l'usage direct des bibliothèques publiques d'upstream pour la lecture, avec un refus de lecture seule explicite côté plugin. Le chemin MCP par jeton ne peut pas passer par A : il passe en lecture seule tant qu'il n'est pas refondu. Détail en section 4.
 
 Corrections au contexte transmis avec la demande d'audit :

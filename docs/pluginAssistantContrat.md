@@ -135,7 +135,7 @@ export function briefingAutoActive(prefs: Record<string, unknown> | null | undef
 
 Consommateurs publics : `src/app/parametres/page.tsx:33` (écrit la clé via `PUT /api/user/preferences`, l.1643), `src/lib/briefing-prefs.test.ts:8` (fige la valeur `"briefingQuotidienAuto"`).
 
-**Écart constaté, à corriger dans le plugin** : `src/lib/chat/daily-opening.ts:14` (plugin) définit `CLE_PREF_BRIEFING_AUTO = 'briefingAuto'`. La page Paramètres écrit `briefingQuotidienAuto`, le popup du plugin lit `briefingAuto` (`DailyBriefingPopup.tsx:7,26`) : un utilisateur qui active le briefing automatique ne le voit jamais s'ouvrir. De plus, la fonction du plugin n'accepte que les booléens, alors que celle d'upstream accepte aussi `"true"` et `"false"`. Correctif préconisé pour une session ultérieure : faire réexporter ces trois symboles depuis `@/lib/briefing-prefs` par `daily-opening.ts`, ce qui supprime la duplication. Le vérificateur le signale en avertissement (C09) et en échec avec `--strict`. Aucun code du plugin n'est modifié dans la session qui a produit ce document.
+**Écart corrigé (phase 2a)** : `src/lib/chat/daily-opening.ts` réexporte désormais `CLE_PREF_BRIEFING_AUTO` (`"briefingQuotidienAuto"`), `BRIEFING_AUTO_PAR_DEFAUT` et `briefingAutoActive` depuis `@/lib/briefing-prefs` au lieu de les redéfinir, et `DailyBriefingPopup.tsx` importe directement la source d'upstream. Le vérificateur (C09) accepte la délégation par `export { … } from "@/lib/briefing-prefs"` ; si le plugin redéfinit un jour la clé, l'écart redevient un avertissement (échec avec `--strict`).
 
 Autres imports upstream vers les zones privées : `src/lib/verger/creation-arbre.ts:7` et `src/lib/__tests__/coherence-semences-plants-stock-rendements.test.ts:469-471` citent `src/lib/chat/executor-verger.ts` et `tool-executor.ts` en commentaire ou en test conditionnel (« l'absence du fichier n'est pas un échec »). Ce ne sont pas des imports. Le fichier `executor-verger.ts` n'existe pas chez nous.
 
@@ -146,8 +146,8 @@ Autres imports upstream vers les zones privées : `src/lib/verger/creation-arbre
 | `/api/chat` | POST | `requireAuthApi(request)` (rate limit IP) | `entete-mutation.ts:59` (hors exploitation) |
 | `/api/chat/status` | GET | `requireAuthApi()` | via préfixe `/api/chat` |
 | `/api/chat/test` | POST | `requireAdminApi()` | via préfixe `/api/chat` |
-| `/api/mcp` | POST | jeton porteur, pas de session | `middleware.ts:85` et `:120` (exempté de la session) ; documenté dans `api/public/elevage-openapi/route.ts:77` |
-| `/api/user/api-token` | GET, POST, DELETE | `requireAuthApi()` | `entete-mutation.ts:50` ; consommé par `parametres/page.tsx:248,261,283` |
+| `/api/mcp` | GET, POST | jeton porteur `glb_`, pas de session | `middleware.ts:85` et `:120` (exempté de la session) ; documenté dans `api/public/elevage-openapi/route.ts:77` |
+| `/api/user/api-token` | GET, POST, DELETE | `requireAuthApi()`, jeton rattaché à l'acteur (`getActeurId`) | `entete-mutation.ts:50` ; consommé par `parametres/page.tsx:248,261,283` |
 | `/api/admin/chat/models`, `codex-models`, `mistral-models` | GET | `requireAdminApi()` | `/api/admin` est une surface d'administration (`impersonation-policy.ts:27`) |
 | `/api/admin/chat/codex-login`, `codex-login/poll`, `codex-logout` | POST | `requireAdminApi()` | idem |
 
@@ -196,6 +196,30 @@ Conséquence : tout fichier du plugin sous ces chemins est ignoré par git chez 
 ### 2.9 Exclusions `tsconfig.json`
 
 Upstream exclut (`tsconfig.json:41-50`) : `node_modules`, `mcp-server`, `prisma/import-legacy-sqlite.ts`, `scripts/qa/serie-assistant-*.ts`, `scripts/banc-essai-assistant.ts`, `scripts/verif-briefing-20260814.ts`, `src/**/__tests__/**`, `vitest.config.ts`. Le plugin dépend de `mcp-server` et des tests exclus (contrôle C15). Delta du plugin : une ligne `"scripts"` (l.45) qui exclut tout le dossier ; voir 3.2.
+
+### 2.10 Contrat MCP et sécurité du jeton
+
+Sources : `docs/integrations-elevage.md` (section Authentification) et `src/app/api/public/elevage-openapi/route.ts` (entrée `/api/mcp`) sur `origin/main` ; client officiel `gleba-mcp-server` 1.0.1 (npm, AGPL-3.0), lu sans être exécuté (`dist/index.js`).
+
+| Point | Contrat public d'upstream | Client npm (`dist/index.js`) | Notre `/api/mcp` |
+|---|---|---|---|
+| Jeton | `Authorization: Bearer glb_…`, créé dans Paramètres > API | `GLEBA_TOKEN`, entête Bearer | idem ; sans préfixe `glb_` : 401 sans accès base |
+| Liste | `GET /api/mcp`, 200/401/429 | n'appelle jamais GET : ses 39 outils sont codés en dur | `GET` rend `{ tools: [{ name, description, parameters }] }`, outils `get_*` seulement (forme non précisée par le contrat public : choix du plugin) |
+| Exécution | `POST { tool, args, section? }`, 200/400/401/429 | envoie `{ tool, args, section }`, lit `data.result` et `error.error` si `!ok` | idem : `{ result }` en 200, `{ error }` sinon |
+| Limite | 200 requêtes par 15 min et par jeton | non gérée | idem, clé `mcp:` + SHA-256 du jeton ; jetons invalides comptés par IP |
+| Écriture | confirmation dans le client appelant | pas de confirmation, pas de filtre | **403** : lecture seule (voir ci-dessous) |
+
+Écarts à connaître :
+- Le client npm déclare 39 outils (`potager`, `verger`, `elevage`, `compta`) avec des paramètres propres. Notre plugin n'en implémente que 8 de lecture (`get_*` de `chat-tools.ts`), les autres répondent **400 « Outil inconnu »**, et ses 7 outils d'écriture du potager répondent 403. Les sections `verger`, `elevage`, `compta` ne sont pas servies : `section` est accepté (chaîne de 100 caractères maximum) mais ne filtre rien.
+- Le client npm suppose des arguments (`especeId` en nom, `cultureId` numérique, `plancheId`) qui ne sont pas ceux de nos outils : non aligné, à traiter en phase 2b/2c.
+- Le contrat public ne dit pas le format de la liste des outils ni le contenu des erreurs : notés ici plutôt qu'inventés.
+
+**Sécurité : jeton MCP.**
+1. Le jeton appartient à la PERSONNE (`getActeurId`), pas au tenant : `/api/user/api-token` est hors du refus par méthode (`entete-mutation.ts:50`), un membre en consultation ne doit donc jamais obtenir un jeton posé sur le compte du propriétaire.
+2. L'authentification résout ensuite le contexte avec `resoudreContexteExploitation(acteur)` : les outils reçoivent le tenant, comme dans le chat.
+3. Jeton comparé en temps constant (empreintes SHA-256), 401 unique et générique, aucun message d'exception renvoyé, jeton jamais journalisé ni utilisé en clair dans une clé.
+4. MCP en lecture seule : un outil dont le nom ne commence pas par `get_` répond 403, y compris pour un propriétaire, tant que les outils d'écriture n'appliquent pas les règles d'upstream (phase 2c).
+5. Reste : jeton stocké en clair en base (upstream hache le jeton de capteur en SHA-256, `lib/capteurs/jeton.ts`) ; limite de débit en mémoire donc par processus ; changer cela demande une migration, hors périmètre.
 
 ## 3. b) Côté plugin : inventaire des fichiers (hors tests)
 
@@ -328,7 +352,7 @@ Le champ `permissions` répond à un manque observé : aujourd'hui rien ne dit q
       { "chemin": "/api/chat", "methodes": ["POST"], "auth": "session" },
       { "chemin": "/api/chat/status", "methodes": ["GET"], "auth": "session" },
       { "chemin": "/api/chat/test", "methodes": ["POST"], "auth": "admin" },
-      { "chemin": "/api/mcp", "methodes": ["POST"], "auth": "jeton" },
+      { "chemin": "/api/mcp", "methodes": ["GET", "POST"], "auth": "jeton" },
       { "chemin": "/api/user/api-token", "methodes": ["GET", "POST", "DELETE"], "auth": "session" },
       { "chemin": "/api/admin/chat/*", "methodes": ["GET", "POST"], "auth": "admin" }
     ],
@@ -395,7 +419,7 @@ Ce que l'esquisse met en évidence : une boutique a besoin de `migrations` (tabl
 1. **Résolution des modules.** Convention de chemin figée (`src/components/<plugin>/...`) ou import dynamique piloté par un registre généré au build ? Un registre généré évite de toucher `layout.tsx` à chaque plugin, mais ajoute une étape de build.
 2. **Qui écrit les greffes.** Le noyau publie-t-il un point d'extension unique dans `layout.tsx` (`<PluginSlots name="floatingBubble" />`) ? Cela demande un changement upstream, à proposer en PR plutôt qu'à porter en fork.
 3. **`settingsRegistry` ouvert.** Le type fermé `SettingsRegistry` oblige à modifier `settings.ts`. Passer à un registre extensible par préfixe réglerait le conflit le plus probable, mais change un fichier central d'upstream.
-4. **Emplacement du jeton d'API.** `api/user/api-token` est consommée par Paramètres d'upstream. Soit elle remonte dans le noyau (avec correction du tenant, voir l'audit), soit Paramètres la masque quand le plugin est absent.
+4. **Emplacement du jeton d'API.** `api/user/api-token` est consommée par Paramètres d'upstream. Soit elle remonte dans le noyau (le correctif du rattachement à l'acteur est fait côté plugin, phase 2a), soit Paramètres la masque quand le plugin est absent.
 5. **Plusieurs bulles flottantes.** Assistant et boutique veulent-ils chacun une bulle ? Le contrat CSS actuel suppose une seule paire de libellés.
 6. **Migrations de plugin.** Dossier distinct dans `prisma/migrations` (risque d'ordre) ou schéma séparé ? Non tranché.
 7. **Version du contrat.** Faut-il un fichier `contrat.json` lisible par le script plutôt que des constantes dans `verifierContratAssistant.ts` ? Utile dès qu'un second plugin existe.
@@ -412,7 +436,7 @@ Ce que l'esquisse met en évidence : une boutique a besoin de `migrations` (tabl
 4. **Surveiller les routes que nos outils reproduisent** tant que la phase 2 n'est pas traitée : `git log --oneline HEAD..origin/main -- src/app/api/cultures src/app/api/interventions src/app/api/planches src/app/api/varietes src/lib/referentiel-communaute.ts src/lib/cultures`. Chaque commit listé est une règle métier que nos outils ne suivent pas (voir `pluginAssistantAuditOutils.md`).
 5. **Merger.** `git merge origin/main`. Conflits attendus, dans cet ordre de probabilité : `src/lib/settings.ts`, `docker-entrypoint.sh`, `src/app/admin/page.tsx`, `prisma/seed-varietes-arbres.sql`, `package.json` et `package-lock.json`, `src/app/layout.tsx`, `tsconfig.json`. Règle : en cas de doute sur un fichier de greffe, prendre la version d'upstream puis réappliquer le delta minimal décrit en 3.2.
 6. **Régénérer le verrou.** Si `package-lock.json` est en conflit : prendre celui d'upstream, puis `npm install` pour réajouter `react-markdown` et `remark-gfm`. Ne jamais éditer le verrou à la main.
-7. **Contrôle après merge.** `npm run verifier:contratAssistant -- --base origin/main`. Tout ECHEC est à corriger avant de continuer. Un AVERTISSEMENT connu (clé du briefing, 2.4) est toléré tant qu'il n'est pas corrigé ; `--strict` le transforme en échec.
+7. **Contrôle après merge.** `npm run verifier:contratAssistant -- --base origin/main`. Tout ECHEC est à corriger avant de continuer. Aucun AVERTISSEMENT connu n'est attendu depuis la phase 2a ; `--strict` transforme tout avertissement en échec.
 8. **Types et lint.** `rm -rf .next/types ; NODE_OPTIONS=--max-old-space-size=6144 npx tsc --noEmit` puis `npm run lint:ci -- --base $(git rev-parse origin/main)` (ligne de base : 5 erreurs, 9 avertissements, pas de régression).
 9. **Tests.** `npx vitest run`. Échec connu et préexistant : `growth-campaign` (RFC 8058), à ne pas corriger ici.
 10. **Si le contrat change volontairement** (upstream renomme une prop, un sélecteur, une clé) : mettre à jour ce document, les constantes en tête de `scripts/verifierContratAssistant.ts`, et incrémenter la version du contrat (mineure si ajout, majeure si rupture).
