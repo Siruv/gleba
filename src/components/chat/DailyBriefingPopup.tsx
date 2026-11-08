@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState, type ReactNode } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import { useSession } from "next-auth/react"
 import { fetchDailyBriefing } from "@/app/actions/chat-briefing"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog"
@@ -18,6 +18,7 @@ export function DailyBriefingPopup() {
   const { data: session } = useSession()
   const [briefing, setBriefing] = useState<BriefingPayload | null>(null)
   const [open, setOpen] = useState(false)
+  const contenuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (!session?.user?.id) {
@@ -59,7 +60,17 @@ export function DailyBriefingPopup() {
     <Dialog open={open} onOpenChange={setOpen}>
       {/* Marge latérale de 1 rem sur mobile (la boîte ne touche pas les bords) ;
           le contenu défile dans la boîte, le bouton reste collé en bas. */}
-      <DialogContent className="w-[calc(100%-2rem)] max-w-md rounded-lg border-lin bg-craie font-ui text-encre">
+      <DialogContent
+        ref={contenuRef}
+        // Radix donne le focus au premier élément focalisable : le popup s'ouvre
+        // sans geste de l'utilisateur, donc :focus-visible s'applique et un anneau
+        // s'affichait sur « En discuter ». Le focus va au conteneur (le titre reste
+        // annoncé via aria-labelledby, Tab atteint le bouton, Échap ferme).
+        onOpenAutoFocus={(e) => {
+          e.preventDefault()
+          contenuRef.current?.focus()
+        }}
+        className="w-[calc(100%-2rem)] max-w-md rounded-lg border-lin bg-craie font-ui text-encre focus:outline-none focus-visible:outline-none">
         <DialogHeader>
           <DialogTitle>Briefing du jour</DialogTitle>
           <DialogDescription>

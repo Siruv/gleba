@@ -93,19 +93,25 @@ export function varieteEstRedondante(especeNom: string, varieteNom: string | nul
   return espece !== "" && variete.startsWith(espece);
 }
 
-const NOM_ACTION: Record<TypeTache, string> = {
-  semis: "Semis",
-  plantation: "Plantation",
-  recolte: "Récolte",
-  irrigation: "Arrosage",
-};
+/**
+ * Verbe à l'infinitif, formulation de la page d'accueil d'upstream
+ * (`composition.server.ts` : « Semer Chou brocoli A1 »). Sa table n'est pas
+ * exportée et vit dans des fichiers d'upstream qu'on ne modifie pas : on aligne
+ * donc les libellés ici.
+ */
+const VERBE_ACTION: Record<TypeTache, string> = {
+  semis: "Semer",
+  plantation: "Planter",
+  recolte: "Récolter",
+  irrigation: "Arroser",
+}
 
-/** Libellé d'une tâche : « Semis de Chou brocoli, planche A1 ». */
+/** Libellé d'une tâche, comme l'accueil : « Semer Chou brocoli A1 ». */
 export function libelleTache(tache: Pick<TacheJour, "type" | "especeNom" | "varieteNom" | "plancheName">): string {
-  const action = NOM_ACTION[tache.type] ?? "Tâche";
-  const variete = varieteEstRedondante(tache.especeNom, tache.varieteNom) ? "" : ` (${tache.varieteNom!.trim()})`;
-  const planche = tache.plancheName?.trim() ? `, planche ${tache.plancheName.trim()}` : "";
-  return `${action} de ${tache.especeNom}${variete}${planche}`;
+  const verbe = VERBE_ACTION[tache.type] ?? "Faire"
+  const variete = varieteEstRedondante(tache.especeNom, tache.varieteNom) ? "" : ` (${tache.varieteNom!.trim()})`
+  const planche = tache.plancheName?.trim() ? ` ${tache.plancheName.trim()}` : ""
+  return `${verbe} ${tache.especeNom}${variete}${planche}`
 }
 
 /** Pluriel simple : « 1 tâche », « 3 tâches ». */

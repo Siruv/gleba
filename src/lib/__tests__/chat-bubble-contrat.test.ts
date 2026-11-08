@@ -36,4 +36,11 @@ describe("contrat ChatBubble / coquille v2", () => {
     // le bottom du panneau (sm:bottom-20 = 5rem) doit rester cohérent avec la soustraction
     expect(sourceBulle).toContain("sm:bottom-20")
   })
+
+  it("garde la bulle à 48 px (h-12 w-12) comme upstream, comme le bouton de fermeture", () => {
+    expect(sourceBulle).not.toContain("h-14 w-14")
+    const boutons = sourceBulle.match(/fixed bottom-4 right-4 [^"]*/g) ?? []
+    expect(boutons).toHaveLength(2)
+    for (const b of boutons) expect(b).toContain("h-12 w-12")
+  })
 })

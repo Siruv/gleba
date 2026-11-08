@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs"
+import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import type { AlerteUrgente, TacheJour } from "@/lib/notifications/types"
 import {
@@ -65,10 +67,10 @@ const tache = (p: Partial<TacheJour>): TacheJour => ({
 
 describe("libelleTache", () => {
   it("compose un libellé propre avec la planche", () => {
-    expect(libelleTache(tache({ varieteNom: "Chou brocoli — Non spécifiée" }))).toBe("Semis de Chou brocoli, planche A1")
+    expect(libelleTache(tache({ varieteNom: "Chou brocoli — Non spécifiée" }))).toBe("Semer Chou brocoli A1")
     expect(libelleTache(tache({ type: "recolte", especeNom: "Tomate", varieteNom: "Cœur de bœuf", plancheName: null })))
-      .toBe("Récolte de Tomate (Cœur de bœuf)")
-    expect(libelleTache(tache({ type: "plantation" }))).toBe("Plantation de Chou brocoli, planche A1")
+      .toBe("Récolter Tomate (Cœur de bœuf)")
+    expect(libelleTache(tache({ type: "plantation" }))).toBe("Planter Chou brocoli A1")
   })
 })
 
@@ -100,5 +102,15 @@ describe("dedoublonnerAlertes", () => {
   })
   it("ne touche jamais aux autres types d'alerte", () => {
     expect(dedoublonnerAlertes([tache({})], [alerte(msg, "tache-retard")])).toHaveLength(1)
+  })
+})
+
+describe("popup du briefing : focus à l'ouverture", () => {
+  const source = readFileSync(join(__dirname, "../../components/chat/DailyBriefingPopup.tsx"), "utf8")
+  it("donne le focus au conteneur, pas au bouton, sans retirer le titre", () => {
+    expect(source).toContain("onOpenAutoFocus")
+    expect(source).toContain("e.preventDefault()")
+    expect(source).toContain("contenuRef.current?.focus()")
+    expect(source).toContain("<DialogTitle>Briefing du jour</DialogTitle>")
   })
 })
