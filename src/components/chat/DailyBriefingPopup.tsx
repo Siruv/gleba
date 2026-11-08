@@ -1,12 +1,18 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useState, type ReactNode } from "react"
 import { useSession } from "next-auth/react"
 import { fetchDailyBriefing } from "@/app/actions/chat-briefing"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog"
 import { briefingAutoActive } from "@/lib/briefing-prefs"
-import { Button } from "@/components/ui/button"
-import { briefingEstVide, type BriefingPayload } from "@/lib/chat/daily-briefing"
+import { CLASSES_BOUTON_PRINCIPAL } from "@/components/accueil/boutons"
+import {
+  briefingEstVide,
+  dedoublonnerAlertes,
+  formaterDateFr,
+  libelleTache,
+  type BriefingPayload,
+} from "@/lib/chat/daily-briefing"
 
 export function DailyBriefingPopup() {
   const { data: session } = useSession()
@@ -47,50 +53,73 @@ export function DailyBriefingPopup() {
     setOpen(false)
   }
 
+  const alertes = dedoublonnerAlertes(briefing.taches, briefing.alertesUrgentes)
+
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="sm:max-w-[425px]">
+      {/* Marge latérale de 1 rem sur mobile (la boîte ne touche pas les bords) ;
+          le contenu défile dans la boîte, le bouton reste collé en bas. */}
+      <DialogContent className="w-[calc(100%-2rem)] max-w-md rounded-lg border-lin bg-craie font-ui text-encre">
         <DialogHeader>
-          <DialogTitle>☀️ Briefing du jour</DialogTitle>
+          <DialogTitle>Briefing du jour</DialogTitle>
           <DialogDescription>
             Voici un résumé de vos activités et alertes pour aujourd&apos;hui.
           </DialogDescription>
         </DialogHeader>
-        <div className="grid gap-4 py-4">
+        <div className="grid gap-5">
           {briefing.taches.length > 0 && (
-            <div>
-              <h4 className="font-semibold">Tâches du jour :</h4>
-              <ul className="list-disc pl-5">
-                {briefing.taches.map((t) => {
-                  const label = `${t.type} : ${t.especeNom}${t.varieteNom ? ' (' + t.varieteNom + ')' : ''}`
-                  return <li key={t.id}>{label} (le {t.date})</li>
-                })}
-              </ul>
-            </div>
+            <Section titre="Tâches" nombre={briefing.taches.length} classeTitre="text-sauge">
+              {briefing.taches.map((t) => (
+                <Ligne key={t.id} texte={libelleTache(t)} detail={formaterDateFr(t.date)} />
+              ))}
+            </Section>
           )}
-          {briefing.alertesUrgentes.length > 0 && (
-            <div>
-              <h4 className="font-semibold text-red-600">Alertes urgentes :</h4>
-              <ul className="list-disc pl-5">
-                {briefing.alertesUrgentes.map((a, i) => (
-                  <li key={i}>{a.message}</li>
-                ))}
-              </ul>
-            </div>
+          {alertes.length > 0 && (
+            <Section titre="Alertes urgentes" nombre={alertes.length} classeTitre="text-argile">
+              {alertes.map((a) => (
+                <Ligne key={a.key} texte={a.message} />
+              ))}
+            </Section>
           )}
           {briefing.alertesMeteo.length > 0 && (
-            <div>
-              <h4 className="font-semibold text-blue-600">Alertes météo :</h4>
-              <ul className="list-disc pl-5">
-                {briefing.alertesMeteo.map((a, i) => (
-                  <li key={i}>{a.message}</li>
-                ))}
-              </ul>
-            </div>
+            <Section titre="Météo" nombre={briefing.alertesMeteo.length} classeTitre="text-eau">
+              {briefing.alertesMeteo.map((a) => (
+                <Ligne key={a.key} texte={a.message} />
+              ))}
+            </Section>
           )}
-          <Button onClick={ouvrirChat}>En discuter avec l&apos;assistant</Button>
+          <div className="sticky bottom-0 -mb-2 bg-craie pb-2 pt-2">
+            <button type="button" onClick={ouvrirChat} className={`${CLASSES_BOUTON_PRINCIPAL} w-full`}>
+              En discuter avec l&apos;assistant
+            </button>
+          </div>
         </div>
       </DialogContent>
     </Dialog>
+  )
+}
+
+function Section({ titre, nombre, classeTitre, children }: {
+  titre: string
+  nombre: number
+  classeTitre: string
+  children: ReactNode
+}) {
+  return (
+    <section>
+      <h3 className={`mb-1 text-sm font-semibold ${classeTitre}`}>
+        {titre} <span className="font-normal text-ardoise">({nombre})</span>
+      </h3>
+      <ul className="divide-y divide-lin-doux border-y border-lin-doux">{children}</ul>
+    </section>
+  )
+}
+
+function Ligne({ texte, detail }: { texte: string; detail?: string }) {
+  return (
+    <li className="py-2 text-sm leading-snug">
+      {texte}
+      {detail ? <span className="block text-xs text-ardoise">{detail}</span> : null}
+    </li>
   )
 }
